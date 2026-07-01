@@ -63,6 +63,20 @@ ALPHA1    = 1.8          # HOCBF first-order gain
 ALPHA2    = 1.8          # HOCBF second-order gain
 ALPHA_W   = 6.0          # QP acceleration vs steering weight
 
+# Geometry gate for the CBF constraint — engage braking only when it can actually help.
+# The discriminator is the OBSTACLE VELOCITY direction relative to the ego heading ê,
+# which identifies the hazard TYPE and is stable across the whole encounter (unlike the
+# instantaneous position, which for a crosser points straight ahead at closest approach
+# — opening a position-based gate at exactly the wrong instant):
+#   • CROSSER  — |v_obs·ê|/|v_obs| small (velocity ⟂ heading): self-clearing, braking is
+#                impotent and only phase-shifts the ego INTO the crossing → SKIP.
+#   • HEAD-ON  — v_obs·ê strongly negative (closing along heading): braking opens
+#                distance → ENGAGE.
+#   • BLOCKER  — |v_obs| ≈ 0 and obstacle ahead (parked/stationary): persistent → ENGAGE.
+CBF_MOVER_MIN   = 1.0    # [m/s] below this the obstacle is a static blocker → always engage
+CBF_COS_GATE    = 0.5    # engage only if |v_obs·ê|/|v_obs| >= this (i.e. within ~60° of the
+                         #   heading axis — head-on/along-track); pure crossers fall below it
+
 # ── Realistic kinematic extensions — must match TaxiAgent.cs inspector values ─
 DRAG_COEFF        = 0.04   # aerodynamic + rolling drag [1/s]
 ACCEL_TAU         = 0.5    # thrust/brake lag time constant [s]
@@ -87,6 +101,12 @@ BIG = 300.0
 SIG_D_BYPASS  = 0.35  # wide steering noise to sample go-around rollouts
 ALPHA_W_GOAROUND = 0.2  # QP steering weight during go-around (vs ALPHA_W=6 normally)
 
+# Detection range — obstacles beyond this Euclidean distance [m] are masked from
+# MPPI and CBF, simulating finite LiDAR/sensor range. Oracle = inf (old behaviour).
+# At V_DES=8 m/s the MPPI horizon covers 20 m; a 25 m range gives the planner ~0.6 s
+# of preview beyond the horizon — reaction becomes tight for fast/late detections.
+DETECTION_RANGE = float("inf")   # default: oracle (off). Set via --detect-range.
+
 # Number of obstacles packed in the observation vector (must match TaxiAgent K_OBS)
 K_OBS    = 3
 OBS_SIZE = 4 + K_OBS * 4 + 2 + 2   # 20: ego(4) + K_OBS*4 + goal(1) + cbf_h(1) + tangent(2)
@@ -97,7 +117,7 @@ SCENARIO_STATIONARY  = 1
 SCENARIO_HEADON      = 2
 SCENARIO_HIGHSPEED   = 3
 SCENARIO_ACCELERATING= 4
-SCENARIO_NAMES = ['standard','stationary','headon','highspeed','accelerating']
+SCENARIO_NAMES = ['standard','stationary', 'headon','highspeed','accelerating'] # remove stationary for testing 
 
 V_DES_HIGH = 14.0   # high-speed scenario [m/s] (~27 knots)
 
@@ -157,6 +177,10 @@ def obs_to_state(obs: np.ndarray, prev_delta: float = 0.0, prev_accel: float = 0
         vy_obs = float(obs[base + 3])
 
         if abs(dy) > 900:   # zero-padded sentinel
+            continue
+
+        dist = np.hypot(dx, dy)
+        if dist > DETECTION_RANGE:  # outside sensor range — not observable
             continue
 
         # rel_xy: obstacle position relative to ego, regardless of frame
@@ -385,16 +409,29 @@ def cbf_qp(s, u_nom, obstacles, lat=0.0):
     C_box = np.array([[ 1., 0.], [-1., 0.], [0.,  1.], [0., -1.]]).T   # (2, 4)
     b_box = np.array([A_MIN, -A_MAX, -DELTA_LIM, -DELTA_LIM])
 
-    if obstacles:
-        cbf_rows = []  # obstacles is list of (rel_xy, obs_v)
-        cbf_rhs  = []
-        for obs_xy, obs_v in obstacles:
-            row, rhs = hocbf_constraint(s, u_nom, obs_xy, obs_v)
-            cbf_rows.append(row)
-            cbf_rhs.append(rhs)
-        C_cbf = np.array(cbf_rows).T          # (2, n_obs)
+    th   = float(s[2])
+    ehat = np.array([np.cos(th), np.sin(th)])   # ego heading unit vector
+
+    cbf_rows = []  # obstacles is list of (rel_xy, obs_v)
+    cbf_rhs  = []
+    for obs_xy, obs_v in obstacles:
+        # Velocity-based geometry gate (see CBF_MOVER_MIN / CBF_COS_GATE note).
+        # Static blockers always engage; movers engage only when their velocity is
+        # aligned with the heading axis (head-on/along-track), not for pure crossers.
+        v_obs = np.asarray(obs_v, dtype=float)
+        speed = float(np.hypot(v_obs[0], v_obs[1]))
+        if speed >= CBF_MOVER_MIN:
+            cos_align = abs(float(v_obs @ ehat)) / speed
+            if cos_align < CBF_COS_GATE:
+                continue   # perpendicular crosser — braking is impotent, skip
+        row, rhs = hocbf_constraint(s, u_nom, obs_xy, obs_v)
+        cbf_rows.append(row)
+        cbf_rhs.append(rhs)
+
+    if cbf_rows:
+        C_cbf = np.array(cbf_rows).T          # (2, n_active)
         b_cbf = np.array(cbf_rhs)
-        C = np.hstack([C_cbf, C_box])          # (2, n_obs + 4)
+        C = np.hstack([C_cbf, C_box])          # (2, n_active + 4)
         b = np.concatenate([b_cbf, b_box])
     else:
         C = C_box
@@ -445,11 +482,21 @@ def identify_bicycle_model(env, behavior_name, n_steps=200):
 
 # ── Scenario sweep ────────────────────────────────────────────────────────────
 
-DT_SPAN        = 3.0
+DT_SPAN        = 0.8    # was 3.0 — episodes with |Δt|>~1.3s are self-clearing (the
+                        # crosser vacates the conflict point before the ego arrives) and
+                        # can never collide regardless of controller. Narrowing to ±0.8s
+                        # concentrates the sweep on the timing window where genuine
+                        # conflicts live, shrinking the "dud" tail that dilutes the rate.
 JITTER_DT      = 0.15
 SPEED_JIT      = 0.10
 BASE_SEED      = 1234
 CONFLICT_Z_MAX = 20.0   # max Z shift of conflict point along taxiway [m]
+
+# An episode is a "dud" (no genuine conflict) if no obstacle ever came within this
+# distance of the ego — the paths never intersected in space/time, so a collision
+# was physically impossible and the episode only dilutes the reported rate. The
+# conditional rate (collisions / genuine-conflict episodes) is the meaningful metric.
+DUD_DIST = 30.0   # [m] — min_dist above this ⇒ episode excluded from conditional rate
 
 # Lever 1 — speed scales with difficulty ONLY for head-on (longitudinal) conflicts,
 # where higher closing speed genuinely compresses the reaction window. For
@@ -466,7 +513,16 @@ SPEED_HEADON_MAX   = 12.0   # head-on closing speed at difficulty 1 [m/s]
 # A power-warped grid keeps the full [-DT_SPAN, DT_SPAN] coverage at the
 # extremes but packs most episodes near Δt=0 where genuine conflicts live,
 # raising difficulty density and shrinking the no-conflict "dud" tail.
-DT_CONCENTRATION = 2.0  # >1 concentrates toward 0; 1.0 = uniform (old behaviour)
+DT_CONCENTRATION = 1.0  # with the narrowed ±0.8s span the whole grid is already in
+                        # the conflict window, so no extra warping is needed (1.0=uniform)
+
+# Fix A — episode reach: agents are placed so they arrive at the conflict point
+# within egoTtc + dtOffset seconds. Reducing reach shrinks how far ahead
+# Unity searches for intersections, so agents spawn CLOSE to the conflict
+# (short upstream arc) and actually arrive during the episode.
+# At V_DES=8 m/s, 20 s caps intersections to ~160 m ahead — agents at most
+# 100-120 m upstream at spd=5 m/s, arriving in ~20-24 s well within timeout.
+EPISODE_REACH_SECONDS = 20.0   # pushed to Unity as "episode_reach_seconds" each episode
 
 
 def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_difficulty=1.0,
@@ -498,7 +554,10 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
         difficulty = float(r.uniform(min_difficulty, max_difficulty))
         # Scenario type: forced when scenario_type >= 0, else drawn per-episode
         # across all five types ("mixed" mode, scenario_type = -1).
-        stype = float(scenario_type) if scenario_type >= 0 else float(r.integers(0, 5))
+        # Mixed mode draws from the active scenario list (stationary excluded by user).
+        _active_types = [SCENARIO_STANDARD, SCENARIO_HEADON,
+                         SCENARIO_HIGHSPEED, SCENARIO_ACCELERATING]
+        stype = float(scenario_type) if scenario_type >= 0 else float(r.choice(_active_types))
         desired_spd = V_DES_HIGH if stype == SCENARIO_HIGHSPEED else -1.0
         # Lever 1: only head-on closing speed ramps with difficulty; perpendicular
         # crossers stay slow (so they linger in the conflict zone). Stationary mode
@@ -517,7 +576,8 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
             "cross_dir_sign":    float(r.choice([-1.0, 1.0])),
             "scenario_type":     stype,
             "desired_speed":     desired_spd,
-            "head_on_prob":      0.3 if stype == SCENARIO_HEADON else 0.0,
+            "head_on_prob":           0.3 if stype == SCENARIO_HEADON else 0.0,
+            "episode_reach_seconds":  EPISODE_REACH_SECONDS,
         })
     return scenarios
 
@@ -526,8 +586,13 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 
 def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         min_difficulty=0.0, max_difficulty=1.0,
-        noise_std=0.0, scenario_type=SCENARIO_STANDARD, no_cbf=False):
+        noise_std=0.0, scenario_type=SCENARIO_STANDARD, no_cbf=False,
+        detect_range=float("inf")):
+    global DETECTION_RANGE
+    DETECTION_RANGE = detect_range
     print(f"[Controller] Connecting to Unity on port {port} ...")
+    if detect_range < float("inf"):
+        print(f"[Controller] Detection range : {detect_range:.1f} m  (obstacles beyond masked)")
     env_params = EnvironmentParametersChannel()
     env = UnityEnvironment(
         file_name=unity_exec_path,
@@ -686,6 +751,18 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
     col = sum(1 for e in episode_stats if e["collided"])
     dists = [e["min_dist"] for e in episode_stats]
     print(f"Collision rate : {col}/{n} = {col/n:.1%}")
+
+    # ── Conditional rate: exclude duds (paths never intersected) ───────────────
+    genuine = [e for e in episode_stats if e["min_dist"] <= DUD_DIST]
+    n_gen   = len(genuine)
+    col_gen = sum(1 for e in genuine if e["collided"])
+    n_dud   = n - n_gen
+    if n_gen:
+        print(f"Conditional    : {col_gen}/{n_gen} = {col_gen/n_gen:.1%}  "
+              f"(genuine conflicts only; {n_dud} duds with min_dist>{DUD_DIST:.0f}m excluded)")
+    else:
+        print(f"Conditional    : n/a (all {n} episodes were duds, min_dist>{DUD_DIST:.0f}m)")
+
     print(f"Mean min_dist  : {np.mean(dists):.2f} m  "
           f"(median {np.median(dists):.2f} m — use median; no-conflict duds skew the mean)")
     print(f"Worst min_dist : {np.min(dists):.2f} m "
@@ -694,14 +771,18 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
           "(target >= 0)")
 
     # ── Per-scenario-type breakdown ───────────────────────────────────────────
-    print("\n  scenario      episodes  collisions   rate   median min_dist[m]")
+    print("\n  scenario      episodes  collisions   rate    genuine  cond.rate   median min_dist[m]")
     for name in SCENARIO_NAMES:
         grp = [e for e in episode_stats if e["scenario"] == name]
         if not grp:
             continue
-        g_col = sum(1 for e in grp if e["collided"])
-        g_med = np.median([e["min_dist"] for e in grp])
-        print(f"  {name:<12s}  {len(grp):8d}  {g_col:10d}   {g_col/len(grp):5.1%}   {g_med:14.2f}")
+        g_col   = sum(1 for e in grp if e["collided"])
+        g_med   = np.median([e["min_dist"] for e in grp])
+        grp_gen = [e for e in grp if e["min_dist"] <= DUD_DIST]
+        gc_col  = sum(1 for e in grp_gen if e["collided"])
+        cond    = f"{gc_col/len(grp_gen):5.1%}" if grp_gen else "  n/a"
+        print(f"  {name:<12s}  {len(grp):8d}  {g_col:10d}   {g_col/len(grp):5.1%}   "
+              f"{len(grp_gen):7d}    {cond}   {g_med:14.2f}")
 
     print("\n  Δt[s]  scenario      diff  min_dist[m]   min_h     result")
     for e in sorted(episode_stats, key=lambda d: d["incursion_dt"]):
@@ -728,6 +809,10 @@ if __name__ == "__main__":
     p.add_argument("--no-cbf",         action="store_true",
                    help="Disable the HOCBF-QP safety filter (MPPI only). "
                         "Use for ablation baseline.")
+    p.add_argument("--detect-range",   default=float("inf"), type=float,
+                   help="Euclidean detection range [m]. Obstacles beyond this distance "
+                        "are masked from MPPI and CBF, simulating finite sensor range. "
+                        "Default=inf (oracle). Try 25 for a tight reaction window.")
     args = p.parse_args()
 
     sc_int = -1 if args.scenario == "mixed" else SCENARIO_NAMES.index(args.scenario)
@@ -739,4 +824,5 @@ if __name__ == "__main__":
         max_difficulty=args.max_difficulty,
         noise_std=args.noise_std,
         scenario_type=sc_int,
-        no_cbf=args.no_cbf)
+        no_cbf=args.no_cbf,
+        detect_range=args.detect_range)

@@ -175,6 +175,11 @@ public class TaxiAgent : Unity.MLAgents.Agent
             float episodeSeed = ep.GetWithDefault("episode_seed", -1f);
             if (episodeSeed >= 0f) Random.InitState(Mathf.RoundToInt(episodeSeed));
 
+            // Fix B: allow Python to shrink the reachable arc each episode so
+            // agents spawn close to the conflict point and arrive during the episode.
+            float reachSecs = ep.GetWithDefault("episode_reach_seconds", -1f);
+            if (reachSecs > 0f) scenarioManager.episodeReachSeconds = reachSecs;
+
             scenarioManager.ResetEpisode(
                 difficulty,
                 episodeSpeed > 0f ? episodeSpeed : desiredSpeed,

@@ -69,9 +69,10 @@ public class TaxiScenarioManager : MonoBehaviour
     [Tooltip("Never spawn an obstacle closer than this [m] to the ego at episode start.")]
     public float minObstacleSpawnDist = 15f;
     [Tooltip("How far ahead (in seconds of ego travel) a conflict point may be and still " +
-             "be reachable within the episode. Obstacles are only assigned to intersections " +
-             "the ego can actually reach in time — keep slightly below TaxiAgent.maxEpisodeSeconds.")]
-    public float episodeReachSeconds = 55f;
+             "be reachable within the episode. Lower values force agents to spawn close " +
+             "to the ego so they actually arrive during the episode. Overridden per-episode " +
+             "by Python via the 'episode_reach_seconds' side-channel parameter.")]
+    public float episodeReachSeconds = 20f;
 
     // ── public read-only ───────────────────────────────────────────────────────
     public IReadOnlyList<IncursionAgentController> ActiveAgents => _active;
@@ -282,7 +283,25 @@ public class TaxiScenarioManager : MonoBehaviour
             Vector3 conflictPt;
             float   egoArcConflict;
 
-            if (i < candidatePaths.Count)
+            bool compound = compoundConflicts && difficulty >= compoundDifficulty;
+
+            if (compound && i > 0 && candidatePaths.Count > 0)
+            {
+                // Lever 2 co-location: secondary arrives at the PRIMARY conflict point,
+                // timed within ±compoundDtWindow so the ego can't resolve both sequentially.
+                //
+                // Fix C — head-on special case: for a head-on primary, candidatePaths[0]
+                // is the counterflow (same-axis) path. A second head-on agent is a convoy,
+                // not a trap — the ego clears both at once. Instead, prefer candidatePaths[1]
+                // (a LATERAL crossing path, different axis through the same conflict point)
+                // so evading the oncoming agent steers the ego into a crosser.
+                bool isHeadOn = (ScenarioType)scenarioType == ScenarioType.HeadOn;
+                if (isHeadOn && candidatePaths.Count > 1)
+                    (obsPath, conflictPt, egoArcConflict) = candidatePaths[1];
+                else
+                    (obsPath, conflictPt, egoArcConflict) = candidatePaths[0];
+            }
+            else if (i < candidatePaths.Count)
             {
                 (obsPath, conflictPt, egoArcConflict) = candidatePaths[i];
             }
