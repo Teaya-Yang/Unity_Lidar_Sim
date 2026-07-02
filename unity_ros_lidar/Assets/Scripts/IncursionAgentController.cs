@@ -60,6 +60,27 @@ public class IncursionAgentController : MonoBehaviour
              "path), instead of the centreline. Head-on traffic uses this to hold its own side " +
              "of the taxiway so the ego can pass. 0 = follow the centreline.")]
     public float pathLateralOffset = 0f;
+    [Tooltip("Park at the final waypoint instead of driving straight off the end. The follow-" +
+             "vehicle task uses this so the lead vehicle stops at the SHARED goal (path end) and " +
+             "the ego arrives behind it, rather than the lead clearing out of the scene.")]
+    public bool stopAtPathEnd = false;
+
+    [Header("FollowVehicle stochastic events (Task 5)")]
+    [Tooltip("While following its path, randomly STOP (brake) or ACCELERATE (speed burst). " +
+             "The follow-vehicle scenario enables this so the ego's MPPI must adapt to a lead " +
+             "that unpredictably slows or speeds up. Off = plain constant-speed FollowPath.")]
+    public bool  stochasticFollow      = false;
+    [Tooltip("Per-decision probability [0..1] of triggering a stop/accelerate event. Set from " +
+             "difficulty by TaxiScenarioManager — harder episodes make the lead act up more often.")]
+    public float followEventProbability = 0f;
+    [Tooltip("Seconds between event rolls while cruising.")]
+    public float followEventInterval    = 2f;
+    [Tooltip("How long a stop (brake) event holds the lead at zero speed [s].")]
+    public float followStopDuration      = 2.5f;
+    [Tooltip("Speed multiplier applied to the base follow speed during an accelerate burst.")]
+    public float followAccelFactor       = 2.5f;
+    [Tooltip("How long an accelerate burst lasts [s].")]
+    public float followAccelDuration     = 2f;
 
     // ── private ────────────────────────────────────────────────────────────────
 
@@ -79,14 +100,36 @@ public class IncursionAgentController : MonoBehaviour
     // FollowPath
     int _pathWpIndex;
 
+    // FollowVehicle stochastic events
+    enum FollowState { Cruise, Stopped, Accel }
+    FollowState _followState;
+    float       _followTimer;      // time accumulated toward the next event roll
+    float       _followStateTimer; // remaining duration of the active stop/accel event
+    float       _followEffSpeed;   // speed actually applied this frame (reported to observers)
+    bool        _followParked;     // reached the end of its path (stopAtPathEnd) and holding there
+
     // ── public API ─────────────────────────────────────────────────────────────
+
+    /// True once a stopAtPathEnd agent (the follow-vehicle lead) has reached the end of its
+    /// path and parked at the shared goal. Lets the ego count "arrived safely behind the lead"
+    /// as episode success instead of deadlocking the final few metres to the goal.
+    public bool ReachedPathEnd => _followParked;
 
     public Vector3 CrossDirectionNormalized =>
         crossDirection.sqrMagnitude > 1e-6f ? crossDirection.normalized : Vector3.right;
 
-    public Vector3 Velocity => (_moving && !_stopped)
-        ? _dir * (_speed + _erraticSpeedOffset)
-        : Vector3.zero;
+    public Vector3 Velocity
+    {
+        get
+        {
+            if (!_moving) return Vector3.zero;
+            // Follow vehicle: report the effective (possibly braked/boosted) speed so the ego's
+            // CBF/MPPI sees the lead actually stop or accelerate.
+            if (trajectoryMode == TrajectoryMode.FollowPath && stochasticFollow)
+                return _dir * _followEffSpeed;
+            return _stopped ? Vector3.zero : _dir * (_speed + _erraticSpeedOffset);
+        }
+    }
 
     public void ResetCrossing(Vector3 startPos, float speed = -1f)
     {
@@ -101,6 +144,11 @@ public class IncursionAgentController : MonoBehaviour
         _erraticTimer       = 0f;
         _erraticSpeedOffset = 0f;
         _pathWpIndex        = 0;
+        _followState        = FollowState.Cruise;
+        _followTimer        = 0f;
+        _followStateTimer   = 0f;
+        _followEffSpeed     = _speed;
+        _followParked       = false;
 
         if (trajectoryMode == TrajectoryMode.FollowPath && assignedPath != null
             && assignedPath.Waypoints.Count > 0)
@@ -210,10 +258,17 @@ public class IncursionAgentController : MonoBehaviour
         var wps = assignedPath.Waypoints;
         int step = followReverse ? -1 : +1;   // travel direction along the waypoint list
 
-        // Ran off the end of the path (start end when reversing): keep driving straight in the
-        // current heading so the agent CLEARS the area. Parking here (the old behaviour) left a
-        // permanent phantom blocker that stops the ego and deadlocks it at v=0.
-        if (PastPathEnd(wps.Count)) { DriveStraight(); return; }
+        // Ran off the end of the path (start end when reversing):
+        //  • Follow vehicle (stopAtPathEnd): PARK at the shared goal so the ego arrives behind it.
+        //  • Everyone else: keep driving straight in the current heading so the agent CLEARS the
+        //    area. Parking here (the old default) left a permanent phantom blocker that stops the
+        //    ego and deadlocks it at v=0.
+        if (PastPathEnd(wps.Count))
+        {
+            if (stopAtPathEnd) { _followParked = true; _followEffSpeed = 0f; return; }
+            DriveStraight();
+            return;
+        }
 
         // Aim at the waypoint shifted sideways by pathLateralOffset, so the agent tracks a
         // line PARALLEL to the path (its own side of the taxiway) rather than the centreline.
@@ -224,17 +279,68 @@ public class IncursionAgentController : MonoBehaviour
         if (toTarget.sqrMagnitude < pathWaypointRadius * pathWaypointRadius)
         {
             _pathWpIndex += step;
-            if (PastPathEnd(wps.Count)) { DriveStraight(); return; }
+            if (PastPathEnd(wps.Count))
+            {
+                if (stopAtPathEnd) { _followParked = true; _followEffSpeed = 0f; return; }
+                DriveStraight();
+                return;
+            }
             toTarget = OffsetTarget(wps[_pathWpIndex]) - transform.position;
             toTarget.y = 0f;
         }
 
         if (toTarget.sqrMagnitude > 1e-6f) _dir = toTarget.normalized;
 
-        transform.position += _dir * (_speed * Time.fixedDeltaTime);
+        // Stochastic stop/accelerate modulation for the follow-vehicle task. Plain FollowPath
+        // (head-on, intersection) leaves _followEffSpeed == _speed.
+        float eff = FollowEffectiveSpeed();
+        transform.position += _dir * (eff * Time.fixedDeltaTime);
 
         if (faceTravelDirection && _dir.sqrMagnitude > 1e-6f)
             transform.rotation = Quaternion.LookRotation(frontIsNegativeZ ? -_dir : _dir, Vector3.up);
+    }
+
+    // Effective follow speed with random stop (brake) / accelerate (burst) events. Probability
+    // per roll and durations are configured by TaxiScenarioManager from episode difficulty.
+    // Returns _speed unchanged when stochasticFollow is off.
+    float FollowEffectiveSpeed()
+    {
+        if (!stochasticFollow) { _followEffSpeed = _speed; return _speed; }
+
+        switch (_followState)
+        {
+            case FollowState.Stopped:
+                _followStateTimer -= Time.fixedDeltaTime;
+                if (_followStateTimer <= 0f) _followState = FollowState.Cruise;
+                _followEffSpeed = 0f;
+                break;
+
+            case FollowState.Accel:
+                _followStateTimer -= Time.fixedDeltaTime;
+                if (_followStateTimer <= 0f) _followState = FollowState.Cruise;
+                _followEffSpeed = _speed * followAccelFactor;
+                break;
+
+            default: // Cruise
+                _followTimer += Time.fixedDeltaTime;
+                if (_followTimer >= followEventInterval)
+                {
+                    _followTimer = 0f;
+                    if (Random.value < followEventProbability)
+                    {
+                        // 50/50 stop vs accelerate — the ego can't predict which.
+                        if (Random.value < 0.5f)
+                        { _followState = FollowState.Stopped; _followStateTimer = followStopDuration; }
+                        else
+                        { _followState = FollowState.Accel;   _followStateTimer = followAccelDuration; }
+                    }
+                }
+                _followEffSpeed = _followState == FollowState.Stopped ? 0f
+                                : _followState == FollowState.Accel   ? _speed * followAccelFactor
+                                : _speed;
+                break;
+        }
+        return _followEffSpeed;
     }
 
     // Shift a centreline waypoint sideways (perpendicular to the current heading) by

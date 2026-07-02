@@ -763,6 +763,13 @@ MonoBehaviour:
   pathWaypointRadius: 3
   followReverse: 0
   pathLateralOffset: 0
+  stopAtPathEnd: 0
+  stochasticFollow: 0
+  followEventProbability: 0
+  followEventInterval: 2
+  followStopDuration: 2.5
+  followAccelFactor: 2.5
+  followAccelDuration: 2
 --- !u!54 &985866012
 Rigidbody:
   m_ObjectHideFlags: 0
@@ -1051,10 +1058,12 @@ MonoBehaviour:
   maxSteerRate: 0.6
   steerRolloffSpeed: 15
   steerRolloffMin: 0.25
-  simulationTimeScale: 1
+  simulationTimeScale: 10
   goalMarker: {fileID: 35649850}
   taxiwayHalfWidth: 10
-  dSafe: 6
+  dSafe: 10
+  followArriveMargin: 3
+  followArriveSpeed: 0.5
   spawnLateralRange: 0
   spawnHeadingRange: 0
   scenarioManager: {fileID: 1820338496}
@@ -1426,9 +1435,16 @@ MonoBehaviour:
   minObstacleSpawnDist: 15
   episodeReachSeconds: 20
   headOnApproachGap: 50
-  headOnLateralOffset: 3.5
-  leadVehicleGap: 40
-  leadVehicleSpeed: 2
+  headOnLateralOffsetEasy: 4.5
+  headOnLateralOffsetHard: 1.5
+  followVehicleGap: 40
+  followVehicleSpeed: 2
+  followEventProbEasy: 0.1
+  followEventProbHard: 0.5
+  followEventInterval: 2
+  followStopDuration: 2.5
+  followAccelFactor: 2.5
+  followAccelDuration: 2
   recoveryLateralRange: 8
   recoveryHeadingRangeDeg: 25
 --- !u!4 &1820338497

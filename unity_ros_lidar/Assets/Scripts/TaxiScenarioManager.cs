@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 /// <summary>
 /// Scenario types pushed by Python via "scenario_type" side channel.
@@ -12,7 +13,7 @@ public enum ScenarioType
     HeadOn      = 2,   // agents travel along taxiway axis (±Z) toward airplane
     HighSpeed   = 3,   // standard layout, airplane desired_speed pushed separately
     Accelerating= 4,   // agents start slow and accelerate into the conflict zone
-    LeadVehicle = 5,   // slow vehicle on the ego's OWN path ahead — follow/overtake
+    FollowVehicle = 5, // follow a vehicle to the SAME goal; the lead randomly stops/accelerates (difficulty-scaled)
     EgoRecovery = 6,   // no obstacle; ego is spawned off-centre & off-heading to recover
     BlindCorner = 7,   // perpendicular crosser occluded by a building until it clears LOS
     Intersection= 8,   // ego on one taxiway branch, ONE agent on the crossing branch — meet at the node
@@ -91,12 +92,31 @@ public class TaxiScenarioManager : MonoBehaviour
              "offset is lerped between Easy and Hard by difficulty.")]
     public float headOnLateralOffsetHard = 1.5f;
 
-    [Header("Task 5 — Lead Vehicle (follow / overtake)")]
-    [Tooltip("Gap ahead of the ego, along the EGO path, where the slow lead vehicle spawns [m].")]
-    public float leadVehicleGap   = 40f;
-    [Tooltip("Speed of the lead vehicle [m/s]. Kept below the ego's taxi speed so the ego " +
-             "catches up and must follow or overtake (generates overtaking data).")]
-    public float leadVehicleSpeed = 2f;
+    [Header("Task 5 — Follow Vehicle (follow a lead to the SAME goal)")]
+    [Tooltip("Gap ahead of the ego, along the EGO path, where the lead vehicle spawns [m].")]
+    [FormerlySerializedAs("leadVehicleGap")]
+    public float followVehicleGap   = 40f;
+    [Tooltip("Cruising speed of the lead vehicle [m/s]. Kept below the ego's taxi speed so the " +
+             "ego catches up and must maintain a safe following gap.")]
+    [FormerlySerializedAs("leadVehicleSpeed")]
+    public float followVehicleSpeed = 4f;
+    [Tooltip("Probability [0..1] per event roll that the lead stops or accelerates, at difficulty 0 " +
+             "(EASY): the lead mostly cruises steadily.")]
+    public float followEventProbEasy = 0.05f;
+    [Tooltip("Probability [0..1] per event roll at difficulty 1 (HARD): the lead frequently brakes " +
+             "or lurches forward, so the ego's MPPI must constantly adapt its following distance. " +
+             "Kept below 0.5 so the lead still makes net progress and the ego never stalls out.")]
+    public float followEventProbHard = 0.45f;
+    [Tooltip("Seconds between the lead's stop/accelerate decisions. MUST exceed followStopDuration " +
+             "so every stop is followed by a moving window — otherwise stops chain and the lead " +
+             "(and the ego behind it) never progresses.")]
+    public float followEventInterval = 2.5f;
+    [Tooltip("How long a lead stop (brake) event lasts [s]. Keep < followEventInterval.")]
+    public float followStopDuration  = 1.2f;
+    [Tooltip("Speed multiplier during a lead accelerate burst.")]
+    public float followAccelFactor   = 2.0f;
+    [Tooltip("How long a lead accelerate burst lasts [s].")]
+    public float followAccelDuration = 1.5f;
 
     [Header("Task 6 — Ego Recovery (bad spawn)")]
     [Tooltip("Max lateral offset injected into the ego spawn for the recovery task [m]. " +
@@ -331,17 +351,18 @@ public class TaxiScenarioManager : MonoBehaviour
             float   egoArcConflict;
 
             bool compound = compoundConflicts && difficulty >= compoundDifficulty;
-            bool isLead   = (ScenarioType)scenarioType == ScenarioType.LeadVehicle;
+            bool isFollow = (ScenarioType)scenarioType == ScenarioType.FollowVehicle;
             bool isXsn    = (ScenarioType)scenarioType == ScenarioType.Intersection;
             bool isHeadOn = (ScenarioType)scenarioType == ScenarioType.HeadOn;
 
-            if (isLead)
+            if (isFollow)
             {
-                // Task 5: the "conflict" is a slow vehicle on the ego's OWN path, ahead.
-                // No intersecting path is involved — spawn it leadVehicleGap metres up the
-                // ego route and let it drive forward (FollowPath) so the ego overtakes.
+                // Task 5: the lead is a vehicle on the ego's OWN path, ahead, heading to the SAME
+                // goal (the path end). No intersecting path is involved — spawn it followVehicleGap
+                // metres up the ego route and let it drive forward (FollowPath) so the ego catches
+                // up and must keep a safe following gap as the lead randomly stops/accelerates.
                 obsPath        = EgoPath;
-                egoArcConflict = egoArcStart + leadVehicleGap;
+                egoArcConflict = egoArcStart + followVehicleGap;
                 conflictPt     = ArcToWorldPosition(EgoPath, egoArcConflict);
             }
             else if (isHeadOn)
@@ -391,20 +412,20 @@ public class TaxiScenarioManager : MonoBehaviour
                 (egoArcConflict - egoArcStart) / Mathf.Max(1f, aircraftSpeed));
 
             float dtOffset = CompoundDtOffset(baseDt, i, difficulty);
-            float spd      = isLead
-                ? leadVehicleSpeed                       // slow lead vehicle (overtake task)
+            float spd      = isFollow
+                ? followVehicleSpeed                     // lead vehicle cruise speed (follow task)
                 : ambulanceSpeed * (1f + i * speedVariation);
 
             PathState obsState = network.GetRelativeState(conflictPt, Vector3.forward, obsPath);
 
             // Where to place the obstacle along its own path (arc-length).
             float obsArc;
-            if (modes[i] == TrajectoryMode.Stationary || isLead)
+            if (modes[i] == TrajectoryMode.Stationary || isFollow)
                 // Place the obstacle AT the conflict point rather than upstream of it.
                 //  • Stationary: a disabled vehicle / FOD parked on the ego's taxiway, so
                 //    the ego must detect it and stop (not stranded off on a side taxiway).
-                //  • Lead vehicle (FollowPath, Task 5): spawn it leadVehicleGap ahead on the
-                //    ego's own path, then it drives forward and the ego catches up / overtakes.
+                //  • Follow vehicle (FollowPath, Task 5): spawn it followVehicleGap ahead on the
+                //    ego's own path, then it drives forward to the shared goal and the ego follows.
                 obsArc = obsState.s;
             else if (isHeadOn)
                 // Head-on: spawn AHEAD of the meet point (higher arc) so that, driving BACK
@@ -456,6 +477,21 @@ public class TaxiScenarioManager : MonoBehaviour
             // forward. Set explicitly every episode so a pooled agent never keeps a stale flag.
             agent.followReverse     = isHeadOn;
             agent.pathLateralOffset = lateralOff;
+
+            // Follow-vehicle task: the lead shares the ego's goal (parks at path end) and randomly
+            // stops/accelerates with a probability that ramps with difficulty. Reset the flags every
+            // episode (agents are pooled) so a non-follow agent never inherits stale event state.
+            agent.stochasticFollow = isFollow;
+            agent.stopAtPathEnd    = isFollow;
+            if (isFollow)
+            {
+                agent.followEventProbability = Mathf.Lerp(followEventProbEasy, followEventProbHard, difficulty);
+                agent.followEventInterval    = followEventInterval;
+                agent.followStopDuration     = followStopDuration;
+                agent.followAccelFactor      = followAccelFactor;
+                agent.followAccelDuration    = followAccelDuration;
+            }
+
             agent.ResetCrossing(spawnPos, spd);
             _active.Add(agent);
 
@@ -590,9 +626,10 @@ public class TaxiScenarioManager : MonoBehaviour
                     : new[] { TrajectoryMode.Accelerating, TrajectoryMode.Straight };
                 break;
 
-            case ScenarioType.LeadVehicle:
-                // One slow vehicle on the ego's OWN path ahead. FollowPath makes it drive
-                // along the (ego) path so the ego catches up and must follow or overtake.
+            case ScenarioType.FollowVehicle:
+                // One lead vehicle on the ego's OWN path ahead, heading to the SAME goal.
+                // FollowPath drives it along the (ego) path; the stochastic stop/accelerate
+                // behaviour (configured per-episode from difficulty) forces the ego to adapt.
                 nActive = 1;
                 modes   = new[] { TrajectoryMode.FollowPath };
                 break;

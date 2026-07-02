@@ -73,6 +73,14 @@ public class TaxiAgent : Unity.MLAgents.Agent
     public float taxiwayHalfWidth = 10f;
     public float dSafe            = 6.0f;
 
+    [Header("Follow-vehicle arrival (Task 5)")]
+    [Tooltip("Extra slack beyond dSafe within which the ego counts as 'arrived' when parked " +
+             "behind a lead that has itself reached the shared goal. Prevents a deadlock where " +
+             "the lead occupies the goal and the ego can never close the final dSafe metres.")]
+    public float followArriveMargin = 3.0f;
+    [Tooltip("Ego must be slower than this [m/s] to be considered settled behind the parked lead.")]
+    public float followArriveSpeed  = 0.5f;
+
     [Header("Spawn randomisation (set ranges to 0 to disable)")]
     public float spawnLateralRange = 0.0f;
     public float spawnHeadingRange = 0.0f;
@@ -406,6 +414,19 @@ public class TaxiAgent : Unity.MLAgents.Agent
         float lateralErr = LaneLateralError();
 
         bool reached = goal_dx < 2.0f;
+
+        // Follow-vehicle: the lead parks ON the shared goal, so the ego settles ~dSafe behind it
+        // and goal_dx never reaches the 2 m threshold — a false timeout. Count arrival when the
+        // ego has stopped a safe gap behind a lead that has itself reached the goal.
+        if (!reached && _scenarioType == (int)ScenarioType.FollowVehicle && scenarioManager != null)
+        {
+            var agents = scenarioManager.ActiveAgents;
+            if (agents.Count > 0 && agents[0] != null && agents[0].ReachedPathEnd
+                && goal_dx < dSafe + followArriveMargin
+                && _speed < followArriveSpeed)
+                reached = true;
+        }
+
         bool timeout = _episodeTime >= maxEpisodeSeconds;
         bool offRoad = Mathf.Abs(lateralErr) > taxiwayHalfWidth + 2f;
 

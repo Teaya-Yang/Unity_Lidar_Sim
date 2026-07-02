@@ -52,10 +52,10 @@ import quadprog
 # ── Parameters — keep in sync with TaxiAgent.cs inspector fields ─────────────
 DT        = 0.1          # Fixed Timestep in Unity (Project Settings → Time)
 L         = 6.0          # wheelbase [m]
-V_DES     = 8.0          # desired taxi speed [m/s]
+V_DES     = 8.0          # desired taxi speed [m/s] 
 W_HALF    = 10.0         # taxiway half-width [m]
-D_SAFE    = 6.0          # keep-out radius [m]
-D_INFL    = 10.0         # MPPI obstacle influence radius [m]
+D_SAFE    = 14.0          # keep-out radius [m]
+D_INFL    = 16.0         # MPPI obstacle influence radius [m]
 A_MIN     = -4.0
 A_MAX     =  1.5
 DELTA_LIM = 0.5
@@ -120,12 +120,12 @@ SCENARIO_STATIONARY  = 1
 SCENARIO_HEADON      = 2
 SCENARIO_HIGHSPEED   = 3
 SCENARIO_ACCELERATING= 4
-SCENARIO_LEAD        = 5   # lead/overtake: slow vehicle on the ego's own path ahead
+SCENARIO_FOLLOW      = 5   # follow a lead vehicle to the same goal; lead randomly stops/accelerates
 SCENARIO_RECOVERY    = 6   # bad-spawn: ego injected with lateral/heading error, no obstacle
 SCENARIO_BLIND       = 7   # occluded crosser revealed late (building blocks line-of-sight)
 SCENARIO_INTERSECTION= 8   # ego on one taxiway branch, one crosser on the other — meet at node
 SCENARIO_NAMES = ['standard', 'stationary', 'headon', 'highspeed', 'accelerating',
-                  'lead_veh', 'recovery', 'blind_corner', 'intersection']
+                  'follow_vehicle', 'recovery', 'blind_corner', 'intersection']
 
 V_DES_HIGH = 14.0   # high-speed scenario [m/s] (~27 knots)
 
@@ -613,12 +613,12 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
         # Scenario type: forced when scenario_type >= 0, else drawn per-episode
         # across all five types ("mixed" mode, scenario_type = -1).
         # Mixed mode draws from the active scenario list (stationary excluded by user).
-        # Tasks 5-7 (lead/recovery/blind) are included so the offline-RL dataset covers
+        # Tasks 5-7 (follow/recovery/blind) are included so the offline-RL dataset covers
         # all behaviours; drop them from this list if you only want the crossing-conflict
         # scenarios for a CBF vs no-CBF collision-rate comparison.
         _active_types = [SCENARIO_STANDARD, SCENARIO_HEADON,
                          SCENARIO_HIGHSPEED, SCENARIO_ACCELERATING,
-                         SCENARIO_LEAD, SCENARIO_RECOVERY, SCENARIO_BLIND]
+                         SCENARIO_FOLLOW, SCENARIO_RECOVERY, SCENARIO_BLIND]
         stype = float(scenario_type) if scenario_type >= 0 else float(r.choice(_active_types))
         desired_spd = V_DES_HIGH if stype == SCENARIO_HIGHSPEED else -1.0
         # Lever 1: only head-on closing speed ramps with difficulty; perpendicular
