@@ -12,6 +12,10 @@ public enum ScenarioType
     HeadOn      = 2,   // agents travel along taxiway axis (±Z) toward airplane
     HighSpeed   = 3,   // standard layout, airplane desired_speed pushed separately
     Accelerating= 4,   // agents start slow and accelerate into the conflict zone
+    LeadVehicle = 5,   // slow vehicle on the ego's OWN path ahead — follow/overtake
+    EgoRecovery = 6,   // no obstacle; ego is spawned off-centre & off-heading to recover
+    BlindCorner = 7,   // perpendicular crosser occluded by a building until it clears LOS
+    Intersection= 8,   // ego on one taxiway branch, ONE agent on the crossing branch — meet at the node
 }
 
 /// <summary>
@@ -73,6 +77,33 @@ public class TaxiScenarioManager : MonoBehaviour
              "to the ego so they actually arrive during the episode. Overridden per-episode " +
              "by Python via the 'episode_reach_seconds' side-channel parameter.")]
     public float episodeReachSeconds = 20f;
+
+    [Header("Head-on (oncoming traffic on the ego's own taxiway)")]
+    [Tooltip("Meet point ahead of the ego, along the EGO path, where an oncoming head-on agent " +
+             "is timed to converge with the ego [m]. Must be within reachable arc this episode.")]
+    public float headOnApproachGap = 50f;
+    [Tooltip("Lateral offset [m] the oncoming head-on agent holds to ITS side of the taxiway at " +
+             "difficulty 0 (EASY): wide, generous clearance so the ego passes comfortably. Above " +
+             "~half of dSafe, ego + agent both holding their side clears the safety distance.")]
+    public float headOnLateralOffsetEasy = 4.5f;
+    [Tooltip("Lateral offset [m] at difficulty 1 (HARD): tight — approaches a dead-centre head-on " +
+             "where the pass barely clears (or fails), forcing decisive avoidance. The per-episode " +
+             "offset is lerped between Easy and Hard by difficulty.")]
+    public float headOnLateralOffsetHard = 1.5f;
+
+    [Header("Task 5 — Lead Vehicle (follow / overtake)")]
+    [Tooltip("Gap ahead of the ego, along the EGO path, where the slow lead vehicle spawns [m].")]
+    public float leadVehicleGap   = 40f;
+    [Tooltip("Speed of the lead vehicle [m/s]. Kept below the ego's taxi speed so the ego " +
+             "catches up and must follow or overtake (generates overtaking data).")]
+    public float leadVehicleSpeed = 2f;
+
+    [Header("Task 6 — Ego Recovery (bad spawn)")]
+    [Tooltip("Max lateral offset injected into the ego spawn for the recovery task [m]. " +
+             "Applied by TaxiAgent after the map places the ego on the centreline.")]
+    public float recoveryLateralRange    = 8f;
+    [Tooltip("Max heading error injected into the ego spawn for the recovery task [deg].")]
+    public float recoveryHeadingRangeDeg = 25f;
 
     // ── public read-only ───────────────────────────────────────────────────────
     public IReadOnlyList<IncursionAgentController> ActiveAgents => _active;
@@ -144,7 +175,7 @@ public class TaxiScenarioManager : MonoBehaviour
         // ── Layout from scenario type ──────────────────────────────────────────
         int              nActive;
         TrajectoryMode[] modes;
-        ResolveLayout((ScenarioType)scenarioType, difficulty, _pool.Count, out nActive, out modes);
+        ResolveLayout((ScenarioType)scenarioType, difficulty, _pool.Count, false, out nActive, out modes);
 
         for (int i = 0; i < nActive; i++)
         {
@@ -226,9 +257,18 @@ public class TaxiScenarioManager : MonoBehaviour
                 paths[pi].TotalLength >= minEgoPathLength)
                 navigable.Add(pi);
 
-        int egoPathIdx = navigable.Count > 0
-            ? navigable[Random.Range(0, navigable.Count)]
-            : Random.Range(0, paths.Count);   // fallback: nothing qualifies
+        // Ego path selection. The dedicated Intersection scenario uses intersection-first
+        // selection — an ego path guaranteed to cross another taxiway within reach, so the
+        // agent lands on the other branch and a real crossing conflict is certain. All other
+        // scenarios keep the plain random-navigable pick (their obstacle logic differs).
+        bool intersectionScenario = (ScenarioType)scenarioType == ScenarioType.Intersection;
+        int  egoPathIdx;
+        if (navigable.Count == 0)
+            egoPathIdx = Random.Range(0, paths.Count);          // fallback: nothing qualifies
+        else if (intersectionScenario)
+            egoPathIdx = SelectEgoPathWithIntersection(navigable, aircraftSpeed);
+        else
+            egoPathIdx = navigable[Random.Range(0, navigable.Count)];
         EgoPath = paths[egoPathIdx];
         var egoWps = EgoPath.Waypoints;
         if (egoWps.Count > 0)
@@ -244,7 +284,7 @@ public class TaxiScenarioManager : MonoBehaviour
         // Determine how many obstacle agents to activate
         int nActive;
         TrajectoryMode[] modes;
-        ResolveLayout((ScenarioType)scenarioType, difficulty, _pool.Count, out nActive, out modes);
+        ResolveLayout((ScenarioType)scenarioType, difficulty, _pool.Count, true, out nActive, out modes);
 
         // Ego's current arc position and how far it can travel this episode.
         float egoArcStart  = network.GetRelativeState(
@@ -253,10 +293,17 @@ public class TaxiScenarioManager : MonoBehaviour
 
         // Collect candidate intersecting paths (exclude the ego's own path), keeping the
         // ego-arc of each conflict point so we can reject ones the ego can't reach in time.
+        // For the Intersection scenario the crosser must be on ANOTHER TAXIWAY: a FollowPath
+        // agent assigned to a runway (a 3.6 km straight) or an apron (a closed polygon
+        // outline) would trace that wrong geometry instead of crossing the taxiway, producing
+        // a nonsensical path and no real conflict. (Other scenarios keep any intersecting
+        // feature — their agents cross straight and don't follow the path.)
+        bool xsnScenario = (ScenarioType)scenarioType == ScenarioType.Intersection;
         var candidatePaths = new List<(TaxiwayPath path, Vector3 intersection, float egoArc)>();
         for (int pi = 0; pi < paths.Count; pi++)
         {
             if (pi == egoPathIdx) continue;
+            if (xsnScenario && !paths[pi].IsTaxiway) continue;   // crosser must be a taxiway
             if (!network.TryFindIntersection(EgoPath, paths[pi], out Vector3 ix)) continue;
 
             float egoArc  = network.GetRelativeState(ix, Vector3.forward, EgoPath).s;
@@ -284,22 +331,44 @@ public class TaxiScenarioManager : MonoBehaviour
             float   egoArcConflict;
 
             bool compound = compoundConflicts && difficulty >= compoundDifficulty;
+            bool isLead   = (ScenarioType)scenarioType == ScenarioType.LeadVehicle;
+            bool isXsn    = (ScenarioType)scenarioType == ScenarioType.Intersection;
+            bool isHeadOn = (ScenarioType)scenarioType == ScenarioType.HeadOn;
 
-            if (compound && i > 0 && candidatePaths.Count > 0)
+            if (isLead)
+            {
+                // Task 5: the "conflict" is a slow vehicle on the ego's OWN path, ahead.
+                // No intersecting path is involved — spawn it leadVehicleGap metres up the
+                // ego route and let it drive forward (FollowPath) so the ego overtakes.
+                obsPath        = EgoPath;
+                egoArcConflict = egoArcStart + leadVehicleGap;
+                conflictPt     = ArcToWorldPosition(EgoPath, egoArcConflict);
+            }
+            else if (isHeadOn)
+            {
+                // Head-on: oncoming traffic on the EGO's OWN path. The meet point is
+                // headOnApproachGap ahead of the ego; the agent is spawned FURTHER ahead
+                // (below) and drives back along the path (FollowPath reverse) toward the ego.
+                obsPath        = EgoPath;
+                egoArcConflict = egoArcStart + headOnApproachGap;
+                conflictPt     = ArcToWorldPosition(EgoPath, egoArcConflict);
+            }
+            else if (isXsn && candidatePaths.Count > 0)
+            {
+                // Intersection: give each agent a DISTINCT crossing branch when the ego route
+                // has several reachable ones (cross traffic from multiple directions); once the
+                // branches run out, stack the extras on the primary node so the intersection
+                // just gets busier with difficulty — never a random-path dud.
+                int idx = Mathf.Min(i, candidatePaths.Count - 1);
+                (obsPath, conflictPt, egoArcConflict) = candidatePaths[idx];
+            }
+            else if (compound && i > 0 && candidatePaths.Count > 0)
             {
                 // Lever 2 co-location: secondary arrives at the PRIMARY conflict point,
                 // timed within ±compoundDtWindow so the ego can't resolve both sequentially.
-                //
-                // Fix C — head-on special case: for a head-on primary, candidatePaths[0]
-                // is the counterflow (same-axis) path. A second head-on agent is a convoy,
-                // not a trap — the ego clears both at once. Instead, prefer candidatePaths[1]
-                // (a LATERAL crossing path, different axis through the same conflict point)
-                // so evading the oncoming agent steers the ego into a crosser.
-                bool isHeadOn = (ScenarioType)scenarioType == ScenarioType.HeadOn;
-                if (isHeadOn && candidatePaths.Count > 1)
-                    (obsPath, conflictPt, egoArcConflict) = candidatePaths[1];
-                else
-                    (obsPath, conflictPt, egoArcConflict) = candidatePaths[0];
+                // (Head-on is handled earlier — oncoming traffic on the ego path — so it never
+                // reaches here.)
+                (obsPath, conflictPt, egoArcConflict) = candidatePaths[0];
             }
             else if (i < candidatePaths.Count)
             {
@@ -322,21 +391,29 @@ public class TaxiScenarioManager : MonoBehaviour
                 (egoArcConflict - egoArcStart) / Mathf.Max(1f, aircraftSpeed));
 
             float dtOffset = CompoundDtOffset(baseDt, i, difficulty);
-            float spd      = ambulanceSpeed * (1f + i * speedVariation);
+            float spd      = isLead
+                ? leadVehicleSpeed                       // slow lead vehicle (overtake task)
+                : ambulanceSpeed * (1f + i * speedVariation);
 
             PathState obsState = network.GetRelativeState(conflictPt, Vector3.forward, obsPath);
 
             // Where to place the obstacle along its own path (arc-length).
             float obsArc;
-            if (modes[i] == TrajectoryMode.Stationary)
-                // Disabled vehicle / FOD blocking the ego's taxiway: park it ON the
-                // conflict point (which lies on the EGO path) so the ego must detect
-                // it and stop — not off on a side taxiway, where the upstream offset
-                // below would otherwise strand a never-moving obstacle.
+            if (modes[i] == TrajectoryMode.Stationary || isLead)
+                // Place the obstacle AT the conflict point rather than upstream of it.
+                //  • Stationary: a disabled vehicle / FOD parked on the ego's taxiway, so
+                //    the ego must detect it and stop (not stranded off on a side taxiway).
+                //  • Lead vehicle (FollowPath, Task 5): spawn it leadVehicleGap ahead on the
+                //    ego's own path, then it drives forward and the ego catches up / overtakes.
                 obsArc = obsState.s;
+            else if (isHeadOn)
+                // Head-on: spawn AHEAD of the meet point (higher arc) so that, driving BACK
+                // toward the ego at spd, it reaches the meet point exactly when the ego does.
+                obsArc = obsState.s + spd * (egoTtc + dtOffset);
             else
-                // Moving obstacle: place UPSTREAM so it reaches the conflict point at
-                // the same time as the ego (offset by dtOffset for staggering).
+                // Moving obstacle (incl. an Intersection FollowPath crosser, which then drives
+                // FORWARD along the crossing taxiway to the node): place UPSTREAM so it reaches
+                // the conflict point when the ego does (offset by dtOffset for staggering).
                 obsArc = obsState.s - spd * (egoTtc + dtOffset);
             obsArc = Mathf.Clamp(obsArc, 0f, obsPath.TotalLength);
 
@@ -357,9 +434,28 @@ public class TaxiScenarioManager : MonoBehaviour
                 }
             }
 
-            agent.assignedPath   = obsPath;
-            agent.trajectoryMode = modes[i];
-            agent.crossDirection  = obsState.tangent;
+            // Head-on agents hold their own side of the taxiway: track a line offset laterally
+            // from the centreline (persisted via pathLateralOffset), and spawn already on that
+            // side so the offset doesn't have to be "steered into". Everyone else follows the
+            // centreline. The offset shrinks with difficulty (wide/easy pass at diff 0 → tight,
+            // near-centre head-on at diff 1). Set explicitly every episode (no stale state).
+            float lateralOff = isHeadOn
+                ? Mathf.Lerp(headOnLateralOffsetEasy, headOnLateralOffsetHard, difficulty)
+                : 0f;
+            if (isHeadOn && Mathf.Abs(lateralOff) > 1e-3f)
+            {
+                Vector3 travelDir = -obsState.tangent;                       // reverse travel
+                Vector3 perp = Vector3.Cross(Vector3.up, travelDir).normalized; // right of travel
+                spawnPos += perp * lateralOff;
+            }
+
+            agent.assignedPath      = obsPath;
+            agent.trajectoryMode    = modes[i];
+            agent.crossDirection    = obsState.tangent;
+            // Head-on agents traverse the ego path in reverse (toward the ego); everyone else
+            // forward. Set explicitly every episode so a pooled agent never keeps a stale flag.
+            agent.followReverse     = isHeadOn;
+            agent.pathLateralOffset = lateralOff;
             agent.ResetCrossing(spawnPos, spd);
             _active.Add(agent);
 
@@ -368,6 +464,50 @@ public class TaxiScenarioManager : MonoBehaviour
         }
 
         Debug.Log($"[TaxiScenarioManager] (map) reset egoPath={egoPathIdx} n={nActive}");
+    }
+
+    // ── Intersection-first ego path selection ─────────────────────────────────
+    //
+    // Picks an ego path that genuinely crosses another taxiway within reach this episode,
+    // so the crossing agent can be placed on the OTHER branch of that intersection and a
+    // real conflict is guaranteed. Navigable paths are tried in random order and the first
+    // with a reachable taxiway crossing is returned; if none qualify (rare — a taxiway with
+    // no reachable neighbour), it falls back to a random navigable path.
+    int SelectEgoPathWithIntersection(List<int> navigable, float aircraftSpeed)
+    {
+        var   paths        = network.Paths;
+        float reachableArc = aircraftSpeed * episodeReachSeconds;
+
+        // Fisher–Yates shuffle (Unity RNG, so it honours the per-episode seed).
+        var order = new List<int>(navigable);
+        for (int k = order.Count - 1; k > 0; k--)
+        {
+            int j   = Random.Range(0, k + 1);
+            int tmp = order[k]; order[k] = order[j]; order[j] = tmp;
+        }
+
+        foreach (int egoIdx in order)
+        {
+            TaxiwayPath ego = paths[egoIdx];
+            if (ego.Waypoints.Count == 0) continue;
+            float startArc = network.GetRelativeState(ego.Waypoints[0], Vector3.forward, ego).s;
+
+            for (int pi = 0; pi < paths.Count; pi++)
+            {
+                if (pi == egoIdx) continue;
+                if (!paths[pi].IsTaxiway) continue;   // crosser must be another taxiway "street"
+                if (!network.TryFindIntersection(ego, paths[pi], out Vector3 ix)) continue;
+
+                float ahead = network.GetRelativeState(ix, Vector3.forward, ego).s - startArc;
+                if (ahead >= minObstacleSpawnDist && ahead <= reachableArc)
+                    return egoIdx;                    // genuine reachable intersection found
+            }
+        }
+
+        // Nothing had a reachable crossing — keep the episode alive with a random navigable path.
+        Debug.Log("[TaxiScenarioManager] (map) no ego path with a reachable intersection — " +
+                  "falling back to a random navigable path (episode may be a dud).");
+        return navigable[Random.Range(0, navigable.Count)];
     }
 
     // Returns the world position at a given arc-length along a path.
@@ -409,7 +549,7 @@ public class TaxiScenarioManager : MonoBehaviour
 
     // ── layout table ──────────────────────────────────────────────────────────
 
-    static void ResolveLayout(ScenarioType type, float d, int poolSize,
+    static void ResolveLayout(ScenarioType type, float d, int poolSize, bool networkMode,
                               out int nActive, out TrajectoryMode[] modes)
     {
         switch (type)
@@ -432,18 +572,15 @@ public class TaxiScenarioManager : MonoBehaviour
                 break;
 
             case ScenarioType.HeadOn:
-                // Lever 2: head-on blocker plus a crosser at the same window at high difficulty,
-                // so sidestepping the oncoming agent steers into a crossing conflict.
-                if (d >= 0.7f)
-                {
-                    nActive = 2;
-                    modes   = new[] { TrajectoryMode.Straight, TrajectoryMode.Straight };
-                }
-                else
-                {
-                    nActive = 1;
-                    modes   = new[] { TrajectoryMode.Straight };
-                }
+                // Oncoming traffic on the EGO's OWN taxiway: agents follow the ego path in
+                // REVERSE (driving toward the ego). More oncoming agents at higher difficulty.
+                // FollowPath (network) tracks the real taxiway; legacy mode falls back to a
+                // Straight agent driving along the taxiway axis.
+                TrajectoryMode hoMode = networkMode ? TrajectoryMode.FollowPath
+                                                    : TrajectoryMode.Straight;
+                nActive = d >= 0.7f ? 2 : 1;
+                modes   = new TrajectoryMode[nActive];
+                for (int k = 0; k < nActive; k++) modes[k] = hoMode;
                 break;
 
             case ScenarioType.Accelerating:
@@ -451,6 +588,45 @@ public class TaxiScenarioManager : MonoBehaviour
                 modes   = nActive == 1
                     ? new[] { TrajectoryMode.Accelerating }
                     : new[] { TrajectoryMode.Accelerating, TrajectoryMode.Straight };
+                break;
+
+            case ScenarioType.LeadVehicle:
+                // One slow vehicle on the ego's OWN path ahead. FollowPath makes it drive
+                // along the (ego) path so the ego catches up and must follow or overtake.
+                nActive = 1;
+                modes   = new[] { TrajectoryMode.FollowPath };
+                break;
+
+            case ScenarioType.EgoRecovery:
+                // No obstacle — the challenge is the ego's own off-centre/off-heading spawn,
+                // injected in TaxiAgent. The controller must steer back to the centreline.
+                nActive = 0;
+                modes   = new TrajectoryMode[0];
+                break;
+
+            case ScenarioType.BlindCorner:
+                // A perpendicular crosser, same as Standard's baseline, but TaxiAgent masks
+                // it from the observation while a building blocks line-of-sight, so it "pops
+                // out" late and forces an emergency stop.
+                nActive = 1;
+                modes   = new[] { TrajectoryMode.Straight };
+                break;
+
+            case ScenarioType.Intersection:
+                // The ego path is chosen (intersection-first) to guarantee a crossing branch
+                // exists. Agent count ramps with difficulty (like Standard) so the node gets
+                // busier — richer, more general crossing conflicts. Every agent FOLLOWS the
+                // crossing taxiway through the node (tracks the real, possibly curved geometry).
+                // In legacy conflict-point mode there is no path to follow, so fall back to a
+                // straight crossing there.
+                if      (d < 0.33f) nActive = 1;
+                else if (d < 0.66f) nActive = 2;
+                else                nActive = 3;
+
+                TrajectoryMode xsnMode = networkMode ? TrajectoryMode.FollowPath
+                                                     : TrajectoryMode.Straight;
+                modes = new TrajectoryMode[nActive];
+                for (int k = 0; k < nActive; k++) modes[k] = xsnMode;
                 break;
 
             case ScenarioType.HighSpeed:

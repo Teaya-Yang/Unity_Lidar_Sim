@@ -111,17 +111,75 @@ DETECTION_RANGE = float("inf")   # default: oracle (off). Set via --detect-range
 K_OBS    = 3
 OBS_SIZE = 4 + K_OBS * 4 + 2 + 2   # 20: ego(4) + K_OBS*4 + goal(1) + cbf_h(1) + tangent(2)
 
-# Scenario types — int value pushed as 'scenario_type' side channel
+# Scenario types — int value pushed as 'scenario_type' side channel. Also used as the
+# RL task_id in the recorded dataset. IDs 0-4 are the original scenarios (shared with
+# Unity's ScenarioType enum); 5-7 are appended tasks whose Unity behaviours are added
+# in a follow-up (the Python plumbing here is forward-compatible with the append plan).
 SCENARIO_STANDARD    = 0
 SCENARIO_STATIONARY  = 1
 SCENARIO_HEADON      = 2
 SCENARIO_HIGHSPEED   = 3
 SCENARIO_ACCELERATING= 4
-SCENARIO_NAMES = ['standard','stationary', 'headon','highspeed','accelerating'] # remove stationary for testing 
+SCENARIO_LEAD        = 5   # lead/overtake: slow vehicle on the ego's own path ahead
+SCENARIO_RECOVERY    = 6   # bad-spawn: ego injected with lateral/heading error, no obstacle
+SCENARIO_BLIND       = 7   # occluded crosser revealed late (building blocks line-of-sight)
+SCENARIO_INTERSECTION= 8   # ego on one taxiway branch, one crosser on the other — meet at node
+SCENARIO_NAMES = ['standard', 'stationary', 'headon', 'highspeed', 'accelerating',
+                  'lead_veh', 'recovery', 'blind_corner', 'intersection']
 
 V_DES_HIGH = 14.0   # high-speed scenario [m/s] (~27 knots)
 
 rng = np.random.default_rng(42)
+
+
+# ── Offline-RL dataset recorder ───────────────────────────────────────────────
+
+class RLDataRecorder:
+    """
+    Accumulates (obs, action, reward, next_obs, done, task_id) transitions across all
+    episodes and writes them to a single compressed .npz for offline RL / TD-MPC2.
+
+    The MPPI+CBF controller is the expert policy; every control step it takes is one
+    recorded transition. Rewards are a light shaping signal (progress per step, plus a
+    terminal bonus/penalty) — downstream training can ignore or overwrite them since the
+    dataset is primarily behaviour-cloning / model-learning fodder.
+    """
+
+    def __init__(self):
+        self.obs, self.actions, self.rewards = [], [], []
+        self.next_obs, self.terminals, self.task_ids = [], [], []
+
+    def store_step(self, obs, action, reward, next_obs, done, task_id):
+        self.obs.append(np.asarray(obs, dtype=np.float32).copy())
+        self.actions.append(np.asarray(action, dtype=np.float32).copy())
+        self.rewards.append(float(reward))
+        self.next_obs.append(np.asarray(next_obs, dtype=np.float32).copy())
+        self.terminals.append(bool(done))
+        self.task_ids.append(int(task_id))
+
+    def __len__(self):
+        return len(self.obs)
+
+    def save(self, filename="taxi_expert_data.npz"):
+        if not self.obs:
+            print("[Recorder] No transitions collected — nothing to save.")
+            return
+        print(f"[Recorder] Saving {len(self.obs)} transitions to {filename} ...")
+        np.savez_compressed(
+            filename,
+            observations=np.array(self.obs,      dtype=np.float32),
+            actions=np.array(self.actions,       dtype=np.float32),
+            rewards=np.array(self.rewards,       dtype=np.float32),
+            next_observations=np.array(self.next_obs, dtype=np.float32),
+            terminals=np.array(self.terminals,   dtype=bool),
+            task_ids=np.array(self.task_ids,     dtype=np.int32),
+        )
+        # Per-task transition counts help spot under-represented tasks in the dataset.
+        uniq, counts = np.unique(self.task_ids, return_counts=True)
+        summary = ", ".join(
+            f"{SCENARIO_NAMES[t] if t < len(SCENARIO_NAMES) else t}={c}"
+            for t, c in zip(uniq, counts))
+        print(f"[Recorder] Per-task transitions: {summary}")
 
 
 # ── Observation unpacking ────────────────────────────────────────────────────
@@ -555,8 +613,12 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
         # Scenario type: forced when scenario_type >= 0, else drawn per-episode
         # across all five types ("mixed" mode, scenario_type = -1).
         # Mixed mode draws from the active scenario list (stationary excluded by user).
+        # Tasks 5-7 (lead/recovery/blind) are included so the offline-RL dataset covers
+        # all behaviours; drop them from this list if you only want the crossing-conflict
+        # scenarios for a CBF vs no-CBF collision-rate comparison.
         _active_types = [SCENARIO_STANDARD, SCENARIO_HEADON,
-                         SCENARIO_HIGHSPEED, SCENARIO_ACCELERATING]
+                         SCENARIO_HIGHSPEED, SCENARIO_ACCELERATING,
+                         SCENARIO_LEAD, SCENARIO_RECOVERY, SCENARIO_BLIND]
         stype = float(scenario_type) if scenario_type >= 0 else float(r.choice(_active_types))
         desired_spd = V_DES_HIGH if stype == SCENARIO_HIGHSPEED else -1.0
         # Lever 1: only head-on closing speed ramps with difficulty; perpendicular
@@ -587,7 +649,7 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         min_difficulty=0.0, max_difficulty=1.0,
         noise_std=0.0, scenario_type=SCENARIO_STANDARD, no_cbf=False,
-        detect_range=float("inf")):
+        detect_range=float("inf"), dataset_path=None):
     global DETECTION_RANGE
     DETECTION_RANGE = detect_range
     print(f"[Controller] Connecting to Unity on port {port} ...")
@@ -628,15 +690,21 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                                               max_difficulty=max_difficulty,
                                               scenario_type=scenario_type)
     episode_stats = []
+    recorder      = RLDataRecorder()   # accumulates (s,a,r,s') transitions for offline RL
 
     for ep in range(n_episodes):
         mean   = np.zeros((H_MPPI, 2))
         sc     = scenarios[ep]
+        task_id = int(sc["scenario_type"])
         ep_log = {"min_h": np.inf, "min_dist": np.inf,
                   "collided": False, "reached": False, "steps": 0,
                   "incursion_dt": sc["incursion_dt"],
                   "difficulty": sc["difficulty"],
-                  "scenario": SCENARIO_NAMES[int(sc["scenario_type"])]}
+                  "scenario": SCENARIO_NAMES[task_id]}
+        # RL transition bookkeeping: hold the previous (obs, action) until the next
+        # obs arrives, so we can emit a complete (obs, action, reward, next_obs) tuple.
+        prev_obs = None
+        prev_act = None
 
         for key, val in sc.items():
             env_params.set_float_parameter(key, val)
@@ -665,6 +733,12 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             if len(terminal_steps) > 0:
                 ep_log["collided"] = ep_log["min_h"] < 0.
                 ep_log["reached"]  = not terminal_steps.interrupted[0] and not ep_log["collided"]
+                # Close out the final transition with the terminal obs + terminal reward.
+                if prev_obs is not None:
+                    term_reward = -20.0 if ep_log["collided"] else 10.0
+                    final_obs   = terminal_steps.obs[0][0]
+                    recorder.store_step(prev_obs, prev_act, term_reward,
+                                        final_obs, True, task_id)
                 episode_done = True
                 break
 
@@ -678,6 +752,14 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
 
             obs_n = inject_sensor_noise(obs, noise_std, rng)
             s, obstacles, goal, frenet_mode, tangent = obs_to_state(obs_n, delta_actual, accel_actual)
+
+            # Emit the previous transition now that its next_obs (obs_n) is available.
+            # Reward: light progress shaping (forward speed); terminal bonus is added at
+            # episode end. Downstream RL can ignore/overwrite this — it's mainly BC data.
+            if prev_obs is not None:
+                step_reward = 0.05 * float(s[3])   # s[3] = current forward speed
+                recorder.store_step(prev_obs, prev_act, step_reward,
+                                    obs_n, False, task_id)
 
             if ep_steps % 20 == 0:
                 mode_str = f"[Frenet tan=({tangent[0]:.2f},{tangent[1]:.2f})]" if frenet_mode else "[global]"
@@ -732,6 +814,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             action = ActionTuple(
                 continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)
             )
+            # Stash this (obs, action) so the next iteration can close the transition.
+            prev_obs = obs_n.copy()
+            prev_act = np.array([a_cmd, delta_cmd], dtype=np.float32)
+
             env.set_actions(behavior_name, action)
             env.step()
             decision_steps, terminal_steps = env.get_steps(behavior_name)
@@ -789,6 +875,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         print(f"  {e['incursion_dt']:+5.2f}  {e['scenario']:<12s}  {e['difficulty']:.2f}  "
               f"{e['min_dist']:8.2f}   {e['min_h']:8.2f}   "
               f"{'COLLISION' if e['collided'] else 'safe'}")
+
+    # ── Persist the offline-RL dataset ────────────────────────────────────────
+    if dataset_path:
+        recorder.save(dataset_path)
+
     return episode_stats
 
 
@@ -813,6 +904,9 @@ if __name__ == "__main__":
                    help="Euclidean detection range [m]. Obstacles beyond this distance "
                         "are masked from MPPI and CBF, simulating finite sensor range. "
                         "Default=inf (oracle). Try 25 for a tight reaction window.")
+    p.add_argument("--dataset",        default=None,
+                   help="Path to save the recorded offline-RL dataset (.npz). "
+                        "Omit to skip saving (e.g. for quick ablation runs).")
     args = p.parse_args()
 
     sc_int = -1 if args.scenario == "mixed" else SCENARIO_NAMES.index(args.scenario)
@@ -825,4 +919,5 @@ if __name__ == "__main__":
         noise_std=args.noise_std,
         scenario_type=sc_int,
         no_cbf=args.no_cbf,
-        detect_range=args.detect_range)
+        detect_range=args.detect_range,
+        dataset_path=args.dataset)

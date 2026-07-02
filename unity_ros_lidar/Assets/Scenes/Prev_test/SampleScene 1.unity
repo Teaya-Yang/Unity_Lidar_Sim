@@ -732,8 +732,8 @@ BoxCollider:
   m_ProvidesContacts: 0
   m_Enabled: 1
   serializedVersion: 3
-  m_Size: {x: 1, y: 1, z: 1}
-  m_Center: {x: 0, y: 0, z: 0}
+  m_Size: {x: 3, y: 2.8, z: 6}
+  m_Center: {x: 0, y: 1.3, z: 0.5}
 --- !u!114 &985866011
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -761,6 +761,8 @@ MonoBehaviour:
   accelStartFraction: 0.2
   accelRate: 1
   pathWaypointRadius: 3
+  followReverse: 0
+  pathLateralOffset: 0
 --- !u!54 &985866012
 Rigidbody:
   m_ObjectHideFlags: 0
@@ -1049,7 +1051,7 @@ MonoBehaviour:
   maxSteerRate: 0.6
   steerRolloffSpeed: 15
   steerRolloffMin: 0.25
-  simulationTimeScale: 10
+  simulationTimeScale: 1
   goalMarker: {fileID: 35649850}
   taxiwayHalfWidth: 10
   dSafe: 6
@@ -1057,6 +1059,11 @@ MonoBehaviour:
   spawnHeadingRange: 0
   scenarioManager: {fileID: 1820338496}
   network: {fileID: 1651804279}
+  occlusionMask:
+    serializedVersion: 2
+    m_Bits: 4294967295
+  occlusionEyeHeight: 1.5
+  occlusionRevealDist: 18
   incursionController: {fileID: 985866011}
   incursionAgent: {fileID: 985866009}
   conflictPoint: {fileID: 351830360}
@@ -1410,10 +1417,20 @@ MonoBehaviour:
   randomiseCrossDirection: 1
   lateralSpread: 3
   speedVariation: 0.05
+  compoundConflicts: 1
+  compoundDifficulty: 0.7
+  compoundDtWindow: 0.6
   network: {fileID: 1651804279}
   maxEgoTurnDeg: 35
   minEgoPathLength: 60
   minObstacleSpawnDist: 15
+  episodeReachSeconds: 20
+  headOnApproachGap: 50
+  headOnLateralOffset: 3.5
+  leadVehicleGap: 40
+  leadVehicleSpeed: 2
+  recoveryLateralRange: 8
+  recoveryHeadingRangeDeg: 25
 --- !u!4 &1820338497
 Transform:
   m_ObjectHideFlags: 0

@@ -89,6 +89,21 @@ public class TaxiAgent : Unity.MLAgents.Agent
              "BehaviorParameters must be set to 20 continuous observations.")]
     public TaxiwayNetwork network;
 
+    [Header("Task 7 — Blind Corner (occlusion)")]
+    [Tooltip("Layers that block line-of-sight to obstacles (e.g. Terminal buildings). In the " +
+             "BlindCorner scenario an obstacle is masked from the observation while a linecast " +
+             "from the ego to it hits one of these layers, so it 'pops out' late. Leave as " +
+             "Nothing to disable occlusion (obstacles always visible).")]
+    public LayerMask occlusionMask = 0;
+    [Tooltip("Eye/sensor height used for the line-of-sight check [m].")]
+    public float occlusionEyeHeight = 1.5f;
+    [Tooltip("Reveal-range floor [m]: obstacles closer than this are ALWAYS visible, even " +
+             "if a building blocks the linecast. Guarantees a bounded reaction window so the " +
+             "crosser is 'revealed late' (≈dist/egoSpeed seconds out) rather than never — " +
+             "otherwise a permanent occluder hides the threat until contact and the recorded " +
+             "expert has no evasive action. At 8 m/s, 18 m ≈ 2.25 s of warning.")]
+    public float occlusionRevealDist = 18f;
+
     // ── Legacy single-agent fields (kept for backward compatibility) ───────────
 
     [Header("Legacy single-agent (used only when scenarioManager is null)")]
@@ -121,6 +136,10 @@ public class TaxiAgent : Unity.MLAgents.Agent
     // Legacy single-agent velocity estimation
     Vector3 _obsPosPrev;
     Vector3 _obsVel;
+
+    // Current scenario type (from the side channel) — needed in CollectObservations
+    // for the BlindCorner occlusion mask.
+    int _scenarioType;
 
     // ── Unity / ML-Agents lifecycle ────────────────────────────────────────────
 
@@ -164,6 +183,7 @@ public class TaxiAgent : Unity.MLAgents.Agent
             float conflictZOffset = ep.GetWithDefault("conflict_z_offset", float.NaN);
             float crossDirSign    = ep.GetWithDefault("cross_dir_sign",    0f);
             int   scenarioType    = (int)ep.GetWithDefault("scenario_type",  0f);
+            _scenarioType         = scenarioType;
             float headOnProb      = ep.GetWithDefault("head_on_prob",       0f);
             float episodeSpeed    = ep.GetWithDefault("desired_speed",      -1f);
             if (episodeSpeed > 0f) _speed = episodeSpeed;
@@ -185,6 +205,15 @@ public class TaxiAgent : Unity.MLAgents.Agent
                 episodeSpeed > 0f ? episodeSpeed : desiredSpeed,
                 transform, incursionDt, ambulanceSpeed,
                 conflictZOffset, crossDirSign, scenarioType, headOnProb);
+
+            // ── Task 6: Ego Recovery bad-spawn ─────────────────────────────────
+            // ResetEpisode has just placed the ego on the path centreline. For the
+            // recovery task, inject a lateral offset (along the path normal) and a
+            // heading error so the controller has to steer back to the centreline —
+            // recording recovery transitions. Applied here (not in the manager) so it
+            // overrides the clean placement without touching the crossing scenarios.
+            if (scenarioType == (int)ScenarioType.EgoRecovery)
+                ApplyRecoveryBadSpawn();
         }
         // ── Legacy single-agent path ──────────────────────────────────────────
         else if (incursionController != null && conflictPoint != null)
@@ -204,6 +233,42 @@ public class TaxiAgent : Unity.MLAgents.Agent
         if (incursionAgent != null) { _obsPosPrev = incursionAgent.position; _obsVel = Vector3.zero; }
 
         _episodeIndex++;
+    }
+
+    // ── Task 6: Ego Recovery bad-spawn ─────────────────────────────────────────
+    // Shift the ego off the centreline (along the local path normal) and rotate it
+    // off the path tangent, within the manager's configured ranges. In map mode the
+    // normal/tangent come from the Frenet state; otherwise fall back to world axes.
+    void ApplyRecoveryBadSpawn()
+    {
+        float latRange = scenarioManager != null ? scenarioManager.recoveryLateralRange    : 8f;
+        float hdgRange = scenarioManager != null ? scenarioManager.recoveryHeadingRangeDeg : 25f;
+
+        float latOff = Random.Range(-latRange, latRange);
+        float hdgOff = Random.Range(-hdgRange, hdgRange);   // degrees
+
+        TaxiwayPath egoPath = scenarioManager != null ? scenarioManager.EgoPath : null;
+        if (network != null && egoPath != null)
+        {
+            PathState ps    = network.GetRelativeState(transform.position, transform.forward, egoPath);
+            Vector3   tan   = ps.tangent; tan.y = 0f;
+            if (tan.sqrMagnitude < 1e-6f) tan = transform.forward;
+            tan.Normalize();
+            Vector3   normal = Vector3.Cross(Vector3.up, tan).normalized;  // left of travel
+
+            transform.position += normal * latOff;
+            // Face along the tangent, then rotate off it by the heading error.
+            transform.rotation  = Quaternion.LookRotation(tan, Vector3.up)
+                                * Quaternion.Euler(0f, hdgOff, 0f);
+        }
+        else
+        {
+            // Global-frame fallback: lateral = world X, heading = yaw about up.
+            transform.position += new Vector3(latOff, 0f, 0f);
+            transform.Rotate(Vector3.up, hdgOff);
+        }
+
+        Debug.Log($"[TaxiAgent] Recovery bad-spawn: latOff={latOff:F2}m hdgOff={hdgOff:F1}deg");
     }
 
     // ── Observations (20 floats) ───────────────────────────────────────────────
@@ -249,9 +314,30 @@ public class TaxiAgent : Unity.MLAgents.Agent
 
         if (scenarioManager != null)
         {
+            bool blindCorner = _scenarioType == (int)ScenarioType.BlindCorner
+                               && occlusionMask.value != 0;
             foreach (var a in scenarioManager.ActiveAgents)
             {
                 Vector3 pos = a.transform.position;
+
+                // Task 7: skip obstacles whose line-of-sight to the ego is blocked by a
+                // building (occlusionMask). The obstacle only enters the observation once
+                // it clears the corner, so the controller reacts late (emergency stop).
+                // A reveal-range floor keeps close obstacles always visible, so a permanent
+                // occluder can't hide the threat until contact (which would record an
+                // expert that never reacts). See occlusionRevealDist.
+                if (blindCorner)
+                {
+                    float d2 = (pos - transform.position).sqrMagnitude;
+                    if (d2 > occlusionRevealDist * occlusionRevealDist)
+                    {
+                        Vector3 eye = transform.position + Vector3.up * occlusionEyeHeight;
+                        Vector3 tgt = pos               + Vector3.up * occlusionEyeHeight;
+                        if (Physics.Linecast(eye, tgt, occlusionMask.value))
+                            continue;   // occluded and still far — not yet visible to the ego
+                    }
+                }
+
                 float   dx  = pos.z - transform.position.z;  // global delta
                 float   dy  = pos.x - transform.position.x;
                 Vector3 vel = a.Velocity;

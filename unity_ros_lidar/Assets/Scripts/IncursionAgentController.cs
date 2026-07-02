@@ -53,6 +53,13 @@ public class IncursionAgentController : MonoBehaviour
     public TaxiwayPath assignedPath;
     [Tooltip("Waypoint-reached radius [m].")]
     public float pathWaypointRadius = 3f;
+    [Tooltip("Follow the assigned path in REVERSE waypoint order. Used by the head-on scenario " +
+             "so an agent placed ahead on the EGO's own path drives back TOWARD the ego.")]
+    public bool followReverse = false;
+    [Tooltip("Track a line offset this many metres to the RIGHT of travel (perpendicular to the " +
+             "path), instead of the centreline. Head-on traffic uses this to hold its own side " +
+             "of the taxiway so the ego can pass. 0 = follow the centreline.")]
+    public float pathLateralOffset = 0f;
 
     // ── private ────────────────────────────────────────────────────────────────
 
@@ -98,8 +105,11 @@ public class IncursionAgentController : MonoBehaviour
         if (trajectoryMode == TrajectoryMode.FollowPath && assignedPath != null
             && assignedPath.Waypoints.Count > 0)
         {
-            // Start direction is toward the first waypoint ahead of startPos
-            _pathWpIndex = FindNearestWaypointAhead(startPos);
+            // Start toward the next waypoint in the travel direction: forward (increasing
+            // index) normally, or backward (decreasing index) for a reverse head-on agent.
+            _pathWpIndex = followReverse
+                ? FindNearestWaypointBehind(startPos)
+                : FindNearestWaypointAhead(startPos);
             Vector3 toNext = assignedPath.Waypoints[_pathWpIndex] - startPos;
             toNext.y = 0f;
             _dir = toNext.sqrMagnitude > 1e-6f ? toNext.normalized : Vector3.forward;
@@ -198,17 +208,24 @@ public class IncursionAgentController : MonoBehaviour
         if (assignedPath == null || assignedPath.Waypoints.Count == 0) return;
 
         var wps = assignedPath.Waypoints;
-        if (_pathWpIndex >= wps.Count) { _moving = false; return; }
+        int step = followReverse ? -1 : +1;   // travel direction along the waypoint list
 
-        Vector3 target = wps[_pathWpIndex];
+        // Ran off the end of the path (start end when reversing): keep driving straight in the
+        // current heading so the agent CLEARS the area. Parking here (the old behaviour) left a
+        // permanent phantom blocker that stops the ego and deadlocks it at v=0.
+        if (PastPathEnd(wps.Count)) { DriveStraight(); return; }
+
+        // Aim at the waypoint shifted sideways by pathLateralOffset, so the agent tracks a
+        // line PARALLEL to the path (its own side of the taxiway) rather than the centreline.
+        Vector3 target = OffsetTarget(wps[_pathWpIndex]);
         Vector3 toTarget = target - transform.position;
         toTarget.y = 0f;
 
         if (toTarget.sqrMagnitude < pathWaypointRadius * pathWaypointRadius)
         {
-            _pathWpIndex++;
-            if (_pathWpIndex >= wps.Count) { _moving = false; return; }
-            toTarget = wps[_pathWpIndex] - transform.position;
+            _pathWpIndex += step;
+            if (PastPathEnd(wps.Count)) { DriveStraight(); return; }
+            toTarget = OffsetTarget(wps[_pathWpIndex]) - transform.position;
             toTarget.y = 0f;
         }
 
@@ -220,9 +237,42 @@ public class IncursionAgentController : MonoBehaviour
             transform.rotation = Quaternion.LookRotation(frontIsNegativeZ ? -_dir : _dir, Vector3.up);
     }
 
-    // Returns the index of the waypoint nearest to pos that is still ahead
-    // (or 0 if the path has just started).
+    // Shift a centreline waypoint sideways (perpendicular to the current heading) by
+    // pathLateralOffset, so FollowPath tracks a line parallel to the path.
+    Vector3 OffsetTarget(Vector3 wp)
+    {
+        if (Mathf.Abs(pathLateralOffset) < 1e-3f) return wp;
+        Vector3 perp = Vector3.Cross(Vector3.up, _dir).normalized;   // right of travel
+        return wp + perp * pathLateralOffset;
+    }
+
+    // Continue in the last heading (used once a FollowPath agent runs off the end of its
+    // path — it keeps moving out of the conflict zone instead of parking as a blocker).
+    void DriveStraight()
+    {
+        transform.position += _dir * (_speed * Time.fixedDeltaTime);
+    }
+
+    // True when _pathWpIndex has walked off the travel end of the path (past the last
+    // waypoint going forward, or before the first going reverse).
+    bool PastPathEnd(int count) =>
+        followReverse ? _pathWpIndex < 0 : _pathWpIndex >= count;
+
+    // Index of the waypoint nearest to pos, stepped one ahead (forward travel).
     int FindNearestWaypointAhead(Vector3 pos)
+    {
+        int idx = NearestWaypoint(pos);
+        return Mathf.Min(idx + 1, assignedPath.Waypoints.Count - 1);
+    }
+
+    // Index of the waypoint nearest to pos, stepped one back (reverse travel).
+    int FindNearestWaypointBehind(Vector3 pos)
+    {
+        int idx = NearestWaypoint(pos);
+        return Mathf.Max(idx - 1, 0);
+    }
+
+    int NearestWaypoint(Vector3 pos)
     {
         if (assignedPath == null || assignedPath.Waypoints.Count == 0) return 0;
         float best = float.MaxValue;
@@ -233,7 +283,7 @@ public class IncursionAgentController : MonoBehaviour
             float d = Vector3.Distance(pos, wps[i]);
             if (d < best) { best = d; idx = i; }
         }
-        return Mathf.Min(idx + 1, wps.Count - 1);
+        return idx;
     }
 
     // ── Gizmo ─────────────────────────────────────────────────────────────────
