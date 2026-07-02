@@ -6,17 +6,16 @@ using UnityEngine.Serialization;
 /// <summary>
 /// Scenario types pushed by Python via "scenario_type" side channel.
 /// </summary>
+// Kept in sync with Python's SCENARIO_* ids in taxi_controller.py (pushed via the
+// 'scenario_type' side channel). IDs are contiguous; removed scenarios (stationary,
+// highspeed, accelerating, recovery, blind-corner) will be rebuilt with new ids later.
 public enum ScenarioType
 {
-    Standard    = 0,   // difficulty-based layout, perpendicular crossing
-    Stationary  = 1,   // one agent placed on the taxiway, never moves
-    HeadOn      = 2,   // agents travel along taxiway axis (±Z) toward airplane
-    HighSpeed   = 3,   // standard layout, airplane desired_speed pushed separately
-    Accelerating= 4,   // agents start slow and accelerate into the conflict zone
-    FollowVehicle = 5, // follow a vehicle to the SAME goal; the lead randomly stops/accelerates (difficulty-scaled)
-    EgoRecovery = 6,   // no obstacle; ego is spawned off-centre & off-heading to recover
-    BlindCorner = 7,   // perpendicular crosser occluded by a building until it clears LOS
-    Intersection= 8,   // ego on one taxiway branch, ONE agent on the crossing branch — meet at the node
+    Standard        = 0,   // difficulty-based layout, perpendicular crossing
+    HeadOn          = 1,   // agents travel along the taxiway axis toward the airplane
+    FollowVehicle   = 2,   // follow a vehicle to the SAME goal; the lead randomly stops/accelerates (difficulty-scaled)
+    Intersection    = 3,   // ego on one taxiway branch, ONE agent on the crossing branch — meet at the node
+    RunwayIncursion = 4,   // ego drives ON a runway toward a goal; a vehicle holds short on a crossing taxiway and may incur
 }
 
 /// <summary>
@@ -118,18 +117,37 @@ public class TaxiScenarioManager : MonoBehaviour
     [Tooltip("How long a lead accelerate burst lasts [s].")]
     public float followAccelDuration = 1.5f;
 
-    [Header("Task 6 — Ego Recovery (bad spawn)")]
-    [Tooltip("Max lateral offset injected into the ego spawn for the recovery task [m]. " +
-             "Applied by TaxiAgent after the map places the ego on the centreline.")]
-    public float recoveryLateralRange    = 8f;
-    [Tooltip("Max heading error injected into the ego spawn for the recovery task [deg].")]
-    public float recoveryHeadingRangeDeg = 25f;
+    [Header("Task 9 — Runway Incursion")]
+    [Tooltip("Probability the holding vehicle commits an incursion (drives onto the runway) at " +
+             "difficulty 0 (EASY). Otherwise it holds short correctly and the ego passes safely.")]
+    public float incursionProbEasy   = 0.15f;
+    [Tooltip("Incursion probability at difficulty 1 (HARD). Ramped with difficulty so harder " +
+             "episodes are more likely to force the ego to react to a runway incursion.")]
+    public float incursionProbHard   = 0.85f;
+    [Tooltip("Speed of the incursion vehicle once it leaves the holding position [m/s].")]
+    public float incursionSpeed      = 6f;
+    [Tooltip("Ego proximity [m] that triggers the incursion (the hold is released).")]
+    public float incursionTriggerDist = 40f;
+    [Tooltip("How far back along the taxiway from the runway the vehicle holds [m]. Should keep it " +
+             "clear of the runway so a non-incurring hold never blocks the ego. Larger = more " +
+             "lateral clearance for oblique (high-speed-exit) taxiways.")]
+    public float holdShortBackoff    = 25f;
+    [Tooltip("Distance the ego spawns before the runway crossing [m]. Sets the reaction window.")]
+    public float runwayApproachGap   = 55f;
+    [Tooltip("How far past the crossing, along the runway, the ego's goal sits [m]. Bounds the " +
+             "episode so the ego doesn't have to taxi the whole (km-long) runway.")]
+    public float runwayGoalPastCrossing = 35f;
 
     // ── public read-only ───────────────────────────────────────────────────────
     public IReadOnlyList<IncursionAgentController> ActiveAgents => _active;
 
     // The path assigned to the ego this episode (null when network is not used).
     public TaxiwayPath EgoPath { get; private set; }
+
+    // Arc-length along EgoPath where the ego's goal sits. Normally the path end; the runway-
+    // incursion scenario sets it just past the crossing so the episode is bounded on a long
+    // runway. TaxiAgent reads this for the goal observation and the reached-goal test.
+    public float EgoGoalS { get; private set; }
 
     // ── internal ───────────────────────────────────────────────────────────────
     readonly List<IncursionAgentController> _pool   = new List<IncursionAgentController>();
@@ -265,6 +283,14 @@ public class TaxiScenarioManager : MonoBehaviour
     {
         var paths = network.Paths;
 
+        // Runway incursion is geometrically distinct (ego ON a runway, one hold-short vehicle on a
+        // crossing taxiway) — handle it in a dedicated routine rather than the shared crosser loop.
+        if ((ScenarioType)scenarioType == ScenarioType.RunwayIncursion)
+        {
+            SetupRunwayIncursion(difficulty, aircraftSpeed, aircraftTransform);
+            return;
+        }
+
         // Pick a random NAVIGABLE path for the ego. Constraints:
         //   • must be a taxiway (not a runway or apron — those are wrong geometry/scale
         //     for a 8 m/s taxi sim: runways are 3.6 km straights, aprons are area perimeters);
@@ -289,7 +315,8 @@ public class TaxiScenarioManager : MonoBehaviour
             egoPathIdx = SelectEgoPathWithIntersection(navigable, aircraftSpeed);
         else
             egoPathIdx = navigable[Random.Range(0, navigable.Count)];
-        EgoPath = paths[egoPathIdx];
+        EgoPath  = paths[egoPathIdx];
+        EgoGoalS = EgoPath.TotalLength;          // goal at the path end (runway incursion overrides)
         var egoWps = EgoPath.Waypoints;
         if (egoWps.Count > 0)
         {
@@ -502,6 +529,116 @@ public class TaxiScenarioManager : MonoBehaviour
         Debug.Log($"[TaxiScenarioManager] (map) reset egoPath={egoPathIdx} n={nActive}");
     }
 
+    // ── Runway incursion (Task 9) ─────────────────────────────────────────────
+    //
+    // The ego drives ALONG a runway toward a goal just past a taxiway crossing. A single vehicle
+    // waits at the holding position on that crossing taxiway; with a difficulty-scaled probability
+    // it commits an incursion — driving across the runway as the ego approaches — otherwise it
+    // holds short and the ego passes safely.
+    void SetupRunwayIncursion(float difficulty, float aircraftSpeed, Transform aircraftTransform)
+    {
+        var paths = network.Paths;
+
+        // Collect every (runway, crossing-taxiway, intersection) triple where the crossing sits far
+        // enough from the runway start to spawn the ego before it, and far enough from the end to
+        // place the goal past it. Runways must be long enough to hold the whole approach+goal span.
+        float minRunwayLen = runwayApproachGap + runwayGoalPastCrossing + minObstacleSpawnDist + 20f;
+        var candidates = new List<(int runwayIdx, int taxiIdx, Vector3 ix, float ixArc)>();
+        for (int ri = 0; ri < paths.Count; ri++)
+        {
+            if (!paths[ri].IsRunway || paths[ri].TotalLength < minRunwayLen) continue;
+            for (int ti = 0; ti < paths.Count; ti++)
+            {
+                if (ti == ri || !paths[ti].IsTaxiway) continue;
+                if (!network.TryFindIntersection(paths[ri], paths[ti], out Vector3 ix)) continue;
+                float ixArc = network.GetRelativeState(ix, Vector3.forward, paths[ri]).s;
+                if (ixArc < runwayApproachGap + minObstacleSpawnDist) continue;
+                if (ixArc > paths[ri].TotalLength - runwayGoalPastCrossing) continue;
+                candidates.Add((ri, ti, ix, ixArc));
+            }
+        }
+
+        if (candidates.Count == 0)
+        {
+            Debug.LogWarning("[TaxiScenarioManager] (runway incursion) no runway with a reachable " +
+                             "taxiway crossing found — placing ego on a runway with no incursion.");
+            int rIdx = 0;
+            for (int ri = 0; ri < paths.Count; ri++) if (paths[ri].IsRunway) { rIdx = ri; break; }
+            EgoPath  = paths[rIdx];
+            EgoGoalS = EgoPath.TotalLength;
+            PlaceEgoOnPath(aircraftTransform, EgoPath, 0f);
+            return;
+        }
+
+        var pick    = candidates[Random.Range(0, candidates.Count)];
+        var runway  = paths[pick.runwayIdx];
+        var taxiway = paths[pick.taxiIdx];
+
+        // Ego: spawn on the runway runwayApproachGap before the crossing, heading toward it, with
+        // the goal a short way past the crossing so the episode is bounded on a km-long runway.
+        EgoPath  = runway;
+        float egoStartArc = Mathf.Max(0f, pick.ixArc - runwayApproachGap);
+        EgoGoalS = Mathf.Min(runway.TotalLength, pick.ixArc + runwayGoalPastCrossing);
+        PlaceEgoOnPath(aircraftTransform, runway, egoStartArc);
+
+        // Holding position on the taxiway, short of the runway. Prefer a real holding-position
+        // marker near the crossing (snapped to the taxiway centreline); else back off geometrically.
+        float ixTaxiArc = network.GetRelativeState(pick.ix, Vector3.forward, taxiway).s;
+        float holdArc;
+        if (network.TryNearestHoldingPosition(pick.ix, holdShortBackoff * 2.5f, out HoldingPosition hp))
+        {
+            PathState hs = network.GetRelativeState(hp.Position, Vector3.forward, taxiway);
+            // Only trust the marker if it actually lies on this taxiway and short of the runway.
+            holdArc = (Mathf.Abs(hs.d) < 12f && Mathf.Abs(hs.s - ixTaxiArc) > 3f)
+                ? hs.s
+                : (ixTaxiArc >= holdShortBackoff ? ixTaxiArc - holdShortBackoff : ixTaxiArc + holdShortBackoff);
+        }
+        else
+        {
+            holdArc = ixTaxiArc >= holdShortBackoff ? ixTaxiArc - holdShortBackoff
+                                                    : ixTaxiArc + holdShortBackoff;
+        }
+        holdArc = Mathf.Clamp(holdArc, 0f, taxiway.TotalLength);
+        // Travel forward (increasing waypoint index) crosses the runway when the hold is on the
+        // low-arc side; hold beyond the crossing → drive in reverse to cross back over it.
+        bool    reverse  = holdArc > ixTaxiArc;
+        Vector3 spawnPos = ArcToWorldPosition(taxiway, holdArc);
+
+        if (_pool.Count == 0)
+        {
+            Debug.LogWarning("[TaxiScenarioManager] (runway incursion) no agent in pool — ego placed, no incursion.");
+            return;
+        }
+
+        var agent = _pool[0];
+        agent.gameObject.SetActive(true);
+        agent.assignedPath         = taxiway;
+        agent.trajectoryMode       = TrajectoryMode.HoldShort;
+        agent.followReverse        = reverse;
+        agent.pathLateralOffset    = 0f;
+        agent.stochasticFollow     = false;
+        agent.stopAtPathEnd        = false;
+        agent.willIncur            = Random.value < Mathf.Lerp(incursionProbEasy, incursionProbHard, difficulty);
+        agent.incursionTrigger     = aircraftTransform;
+        agent.incursionTriggerDist = incursionTriggerDist;
+        agent.crossDirection       = network.GetRelativeState(pick.ix, Vector3.forward, taxiway).tangent;
+        agent.ResetCrossing(spawnPos, incursionSpeed);
+        _active.Add(agent);
+
+        Debug.Log($"[TaxiScenarioManager] (runway incursion) runway='{runway.Ref}' " +
+                  $"taxiway='{taxiway.Ref}' ixArc={pick.ixArc:F0} willIncur={agent.willIncur} " +
+                  $"holdArc={holdArc:F0} reverse={reverse}");
+    }
+
+    // Place the ego at a given arc-length along a path, headed toward increasing arc.
+    void PlaceEgoOnPath(Transform ego, TaxiwayPath path, float arc)
+    {
+        ego.position = ArcToWorldPosition(path, arc);
+        Vector3 tan = network.GetRelativeState(ego.position, Vector3.forward, path).tangent;
+        if (tan.sqrMagnitude > 1e-6f)
+            ego.rotation = Quaternion.LookRotation(tan, Vector3.up);
+    }
+
     // ── Intersection-first ego path selection ─────────────────────────────────
     //
     // Picks an ego path that genuinely crosses another taxiway within reach this episode,
@@ -590,23 +727,6 @@ public class TaxiScenarioManager : MonoBehaviour
     {
         switch (type)
         {
-            case ScenarioType.Stationary:
-                // Lever 2: at high difficulty, pair the parked blockage with a crosser.
-                // The ego's go-around swerve around the stationary obstacle then has to
-                // contend with a moving agent crossing the swerve path — the compound
-                // "avoid A forces you toward B" dilemma.
-                if (d >= 0.7f)
-                {
-                    nActive = 2;
-                    modes   = new[] { TrajectoryMode.Stationary, TrajectoryMode.Straight };
-                }
-                else
-                {
-                    nActive = 1;
-                    modes   = new[] { TrajectoryMode.Stationary };
-                }
-                break;
-
             case ScenarioType.HeadOn:
                 // Oncoming traffic on the EGO's OWN taxiway: agents follow the ego path in
                 // REVERSE (driving toward the ego). More oncoming agents at higher difficulty.
@@ -619,34 +739,12 @@ public class TaxiScenarioManager : MonoBehaviour
                 for (int k = 0; k < nActive; k++) modes[k] = hoMode;
                 break;
 
-            case ScenarioType.Accelerating:
-                nActive = d < 0.5f ? 1 : 2;
-                modes   = nActive == 1
-                    ? new[] { TrajectoryMode.Accelerating }
-                    : new[] { TrajectoryMode.Accelerating, TrajectoryMode.Straight };
-                break;
-
             case ScenarioType.FollowVehicle:
                 // One lead vehicle on the ego's OWN path ahead, heading to the SAME goal.
                 // FollowPath drives it along the (ego) path; the stochastic stop/accelerate
                 // behaviour (configured per-episode from difficulty) forces the ego to adapt.
                 nActive = 1;
                 modes   = new[] { TrajectoryMode.FollowPath };
-                break;
-
-            case ScenarioType.EgoRecovery:
-                // No obstacle — the challenge is the ego's own off-centre/off-heading spawn,
-                // injected in TaxiAgent. The controller must steer back to the centreline.
-                nActive = 0;
-                modes   = new TrajectoryMode[0];
-                break;
-
-            case ScenarioType.BlindCorner:
-                // A perpendicular crosser, same as Standard's baseline, but TaxiAgent masks
-                // it from the observation while a building blocks line-of-sight, so it "pops
-                // out" late and forces an emergency stop.
-                nActive = 1;
-                modes   = new[] { TrajectoryMode.Straight };
                 break;
 
             case ScenarioType.Intersection:
@@ -666,7 +764,6 @@ public class TaxiScenarioManager : MonoBehaviour
                 for (int k = 0; k < nActive; k++) modes[k] = xsnMode;
                 break;
 
-            case ScenarioType.HighSpeed:
             case ScenarioType.Standard:
             default:
                 // Standard difficulty ramp

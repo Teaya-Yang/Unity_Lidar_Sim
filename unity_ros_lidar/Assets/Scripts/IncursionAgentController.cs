@@ -12,6 +12,7 @@ public enum TrajectoryMode
     Stationary,  // placed on taxiway and never moves (parked vehicle / FOD)
     Accelerating,// starts slow, accelerates toward conflict point
     FollowPath,  // drive along an assigned TaxiwayPath (GeoJSON map-based scenario)
+    HoldShort,   // hold at a runway holding position; if willIncur, drive across when the ego nears
 }
 
 /// <summary>
@@ -82,6 +83,18 @@ public class IncursionAgentController : MonoBehaviour
     [Tooltip("How long an accelerate burst lasts [s].")]
     public float followAccelDuration     = 2f;
 
+    [Header("HoldShort / runway incursion (Task 9)")]
+    [Tooltip("If true, this agent commits a runway incursion: it holds at its spawn (the holding " +
+             "position) and then drives forward across the runway once the ego comes within " +
+             "incursionTriggerDist. If false it holds indefinitely (correct hold-short — the ego " +
+             "passes safely). Set per-episode by TaxiScenarioManager from the incursion probability.")]
+    public bool      willIncur           = false;
+    [Tooltip("The ego transform. When willIncur, the hold is released once the ego is within " +
+             "incursionTriggerDist of this agent, so the incursion is timed to the ego's approach.")]
+    public Transform incursionTrigger    = null;
+    [Tooltip("Ego proximity [m] that releases the hold and starts the incursion.")]
+    public float     incursionTriggerDist = 35f;
+
     // ── private ────────────────────────────────────────────────────────────────
 
     bool    _moving;
@@ -108,6 +121,9 @@ public class IncursionAgentController : MonoBehaviour
     float       _followEffSpeed;   // speed actually applied this frame (reported to observers)
     bool        _followParked;     // reached the end of its path (stopAtPathEnd) and holding there
 
+    // HoldShort
+    bool        _released;         // incursion started (agent has left the holding position)
+
     // ── public API ─────────────────────────────────────────────────────────────
 
     /// True once a stopAtPathEnd agent (the follow-vehicle lead) has reached the end of its
@@ -127,6 +143,10 @@ public class IncursionAgentController : MonoBehaviour
             // CBF/MPPI sees the lead actually stop or accelerate.
             if (trajectoryMode == TrajectoryMode.FollowPath && stochasticFollow)
                 return _dir * _followEffSpeed;
+            // HoldShort: zero while holding at the marker (off the runway), real speed once the
+            // incursion is released — so the ego only "sees" motion when the vehicle intrudes.
+            if (trajectoryMode == TrajectoryMode.HoldShort)
+                return _released ? _dir * _speed : Vector3.zero;
             return _stopped ? Vector3.zero : _dir * (_speed + _erraticSpeedOffset);
         }
     }
@@ -149,8 +169,10 @@ public class IncursionAgentController : MonoBehaviour
         _followStateTimer   = 0f;
         _followEffSpeed     = _speed;
         _followParked       = false;
+        _released           = false;
 
-        if (trajectoryMode == TrajectoryMode.FollowPath && assignedPath != null
+        if ((trajectoryMode == TrajectoryMode.FollowPath || trajectoryMode == TrajectoryMode.HoldShort)
+            && assignedPath != null
             && assignedPath.Waypoints.Count > 0)
         {
             // Start toward the next waypoint in the travel direction: forward (increasing
@@ -190,7 +212,26 @@ public class IncursionAgentController : MonoBehaviour
             case TrajectoryMode.Stationary:                       break; // intentionally idle
             case TrajectoryMode.Accelerating: StepAccelerating(); break;
             case TrajectoryMode.FollowPath:   StepFollowPath();   break;
+            case TrajectoryMode.HoldShort:    StepHoldShort();    break;
         }
+    }
+
+    // Hold at the runway holding position until released, then drive across the runway.
+    // Release condition: willIncur AND the ego is within incursionTriggerDist. A non-incurring
+    // agent never releases — it holds short correctly and the ego passes on the runway safely.
+    void StepHoldShort()
+    {
+        if (!_released)
+        {
+            if (!willIncur || incursionTrigger == null) return;   // hold indefinitely
+            Vector3 d = incursionTrigger.position - transform.position; d.y = 0f;
+            if (d.sqrMagnitude <= incursionTriggerDist * incursionTriggerDist)
+                _released = true;
+            else
+                return;
+        }
+        // Released: cross the runway by following the assigned taxiway through the intersection.
+        StepFollowPath();
     }
 
     // ── modes ──────────────────────────────────────────────────────────────────

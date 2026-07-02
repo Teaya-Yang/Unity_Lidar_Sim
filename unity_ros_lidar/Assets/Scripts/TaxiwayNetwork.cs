@@ -38,6 +38,9 @@ public class TaxiwayPath
     // True only for paths the ego may be assigned to (linear taxi routes).
     public bool IsTaxiway => AerowayType == "taxiway";
 
+    // True for runway centrelines (the ego drives ON one in the runway-incursion scenario).
+    public bool IsRunway => AerowayType == "runway";
+
     // Sharpest turn between consecutive segments [deg]. Used to skip un-navigable
     // paths (corners tighter than the aircraft's steering can follow).
     public float MaxTurnDeg { get; private set; }
@@ -60,6 +63,18 @@ public class TaxiwayPath
             if (ang > MaxTurnDeg) MaxTurnDeg = ang;
         }
     }
+}
+
+/// <summary>
+/// A runway-holding position parsed from a GeoJSON Point (OSM aeroway=holding_position).
+/// Marks where a taxiing vehicle must stop short of a runway. The runway-incursion scenario
+/// spawns the incursion vehicle here so it either HOLDS (safe) or drives past (incursion).
+/// </summary>
+public struct HoldingPosition
+{
+    public Vector3 Position;
+    public string  Ref;          // taxiway/runway designation from the "ref" property
+    public bool    IsRunwayHold; // holding_position:type == "runway" (vs ILS/intermediate)
 }
 
 /// <summary>
@@ -101,6 +116,9 @@ public class TaxiwayNetwork : MonoBehaviour
     public IReadOnlyList<TaxiwayPath> Paths => _paths;
     readonly List<TaxiwayPath> _paths = new List<TaxiwayPath>();
 
+    public IReadOnlyList<HoldingPosition> HoldingPositions => _holds;
+    readonly List<HoldingPosition> _holds = new List<HoldingPosition>();
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     void Awake()
@@ -114,6 +132,7 @@ public class TaxiwayNetwork : MonoBehaviour
     public void LoadMapData()
     {
         _paths.Clear();
+        _holds.Clear();
         string filePath = Path.Combine(Application.streamingAssetsPath, geoJsonFileName);
 
         if (!File.Exists(filePath))
@@ -141,6 +160,25 @@ public class TaxiwayNetwork : MonoBehaviour
             if (geom == null) continue;
 
             string geomType = (string)geom["type"];
+            var props = feature?["properties"];
+
+            // Point features carry holding positions (aeroway=holding_position) — parked
+            // stop-short markers, not drivable paths. Collect them separately.
+            if (geomType == "Point")
+            {
+                if (props != null && (string)props["aeroway"] == "holding_position")
+                {
+                    var c = geom["coordinates"] as JArray;
+                    if (c != null && c.Count >= 2)
+                        _holds.Add(new HoldingPosition {
+                            Position     = LatLonToUnity((double)c[1], (double)c[0]),
+                            Ref          = (string)props["ref"] ?? "",
+                            IsRunwayHold = (string)props["holding_position:type"] == "runway",
+                        });
+                }
+                continue;
+            }
+
             JArray rawCoords = null;
 
             if (geomType == "LineString")
@@ -152,7 +190,6 @@ public class TaxiwayNetwork : MonoBehaviour
             if (path == null) continue;
 
             // Attach OSM aeroway metadata from the feature's properties.
-            var props = feature?["properties"];
             if (props != null)
             {
                 path.AerowayType = (string)props["aeroway"] ?? "";
@@ -178,7 +215,26 @@ public class TaxiwayNetwork : MonoBehaviour
         }
         Debug.Log($"[TaxiwayNetwork] Types: {nTaxi} taxiway, {nApron} apron, {nRunway} runway.", this);
 
-        Debug.Log($"[TaxiwayNetwork] Loaded {_paths.Count} path(s) from '{geoJsonFileName}'.", this);
+        Debug.Log($"[TaxiwayNetwork] Loaded {_paths.Count} path(s) and {_holds.Count} holding " +
+                  $"position(s) from '{geoJsonFileName}'.", this);
+    }
+
+    /// <summary>
+    /// Nearest holding position to a world point, within maxDist metres. Returns false if none
+    /// qualifies. Used to snap the runway-incursion vehicle's spawn onto a real hold-short marker.
+    /// </summary>
+    public bool TryNearestHoldingPosition(Vector3 near, float maxDist, out HoldingPosition hold)
+    {
+        hold = default;
+        float best = maxDist;
+        bool  found = false;
+        for (int i = 0; i < _holds.Count; i++)
+        {
+            float dxz = Vector2.Distance(new Vector2(near.x, near.z),
+                                         new Vector2(_holds[i].Position.x, _holds[i].Position.z));
+            if (dxz < best) { best = dxz; hold = _holds[i]; found = true; }
+        }
+        return found;
     }
 
     /// <summary>

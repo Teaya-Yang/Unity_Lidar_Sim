@@ -115,19 +115,13 @@ OBS_SIZE = 4 + K_OBS * 4 + 2 + 2   # 20: ego(4) + K_OBS*4 + goal(1) + cbf_h(1) +
 # RL task_id in the recorded dataset. IDs 0-4 are the original scenarios (shared with
 # Unity's ScenarioType enum); 5-7 are appended tasks whose Unity behaviours are added
 # in a follow-up (the Python plumbing here is forward-compatible with the append plan).
-SCENARIO_STANDARD    = 0
-SCENARIO_STATIONARY  = 1
-SCENARIO_HEADON      = 2
-SCENARIO_HIGHSPEED   = 3
-SCENARIO_ACCELERATING= 4
-SCENARIO_FOLLOW      = 5   # follow a lead vehicle to the same goal; lead randomly stops/accelerates
-SCENARIO_RECOVERY    = 6   # bad-spawn: ego injected with lateral/heading error, no obstacle
-SCENARIO_BLIND       = 7   # occluded crosser revealed late (building blocks line-of-sight)
-SCENARIO_INTERSECTION= 8   # ego on one taxiway branch, one crosser on the other — meet at node
-SCENARIO_NAMES = ['standard', 'stationary', 'headon', 'highspeed', 'accelerating',
-                  'follow_vehicle', 'recovery', 'blind_corner', 'intersection']
-
-V_DES_HIGH = 14.0   # high-speed scenario [m/s] (~27 knots)
+SCENARIO_STANDARD         = 0   # difficulty-based perpendicular crossing conflict
+SCENARIO_HEADON           = 1   # oncoming traffic on the ego's own taxiway
+SCENARIO_FOLLOW           = 2   # follow a lead vehicle to the same goal; lead randomly stops/accelerates
+SCENARIO_INTERSECTION     = 3   # ego on one taxiway branch, crosser on the other — meet at node
+SCENARIO_RUNWAY_INCURSION = 4   # ego drives on a runway; a vehicle holds short and may incur onto it
+SCENARIO_NAMES = ['standard', 'headon', 'follow_vehicle', 'intersection',
+                  'runway_incursion']
 
 rng = np.random.default_rng(42)
 
@@ -558,11 +552,11 @@ DUD_DIST = 30.0   # [m] — min_dist above this ⇒ episode excluded from condit
 
 # Lever 1 — speed scales with difficulty ONLY for head-on (longitudinal) conflicts,
 # where higher closing speed genuinely compresses the reaction window. For
-# PERPENDICULAR crossers (standard/highspeed) a faster mover spends LESS time in
+# PERPENDICULAR crossers (standard) a faster mover spends LESS time in
 # the conflict zone (t_window ~ vehicle_size / speed), so speed scaling makes
 # crossings EASIER, not harder — confirmed empirically. Crossers stay slow so they
 # linger in the conflict zone; difficulty is raised via Lever 2 (compound conflicts)
-# instead. Stationary ignores speed entirely (parked).
+# instead.
 SPEED_CROSS_BASE   = 5.0    # perpendicular crosser speed [m/s] — kept low on purpose
 SPEED_HEADON_MIN   = 5.0    # head-on closing speed at difficulty 0 [m/s]
 SPEED_HEADON_MAX   = 12.0   # head-on closing speed at difficulty 1 [m/s]
@@ -610,21 +604,16 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
         # it impossible to attribute a failure to timing vs. scenario complexity.)
         # The Δt grid still spans [-DT_SPAN, DT_SPAN] for full timing coverage.
         difficulty = float(r.uniform(min_difficulty, max_difficulty))
-        # Scenario type: forced when scenario_type >= 0, else drawn per-episode
-        # across all five types ("mixed" mode, scenario_type = -1).
-        # Mixed mode draws from the active scenario list (stationary excluded by user).
-        # Tasks 5-7 (follow/recovery/blind) are included so the offline-RL dataset covers
-        # all behaviours; drop them from this list if you only want the crossing-conflict
-        # scenarios for a CBF vs no-CBF collision-rate comparison.
+        # Scenario type: forced when scenario_type >= 0, else drawn per-episode from the
+        # active list ("mixed" mode, scenario_type = -1). Runway incursion is excluded from
+        # mixed mode — it needs runway geometry that only some episodes can place — so run it
+        # explicitly via --scenario runway_incursion.
         _active_types = [SCENARIO_STANDARD, SCENARIO_HEADON,
-                         SCENARIO_HIGHSPEED, SCENARIO_ACCELERATING,
-                         SCENARIO_FOLLOW, SCENARIO_RECOVERY, SCENARIO_BLIND]
+                         SCENARIO_FOLLOW, SCENARIO_INTERSECTION]
         stype = float(scenario_type) if scenario_type >= 0 else float(r.choice(_active_types))
-        desired_spd = V_DES_HIGH if stype == SCENARIO_HIGHSPEED else -1.0
+        desired_spd = -1.0
         # Lever 1: only head-on closing speed ramps with difficulty; perpendicular
-        # crossers stay slow (so they linger in the conflict zone). Stationary mode
-        # ignores this Unity-side; the MPPI bypass keys on the observed velocity, so
-        # a parked obstacle stays parked regardless.
+        # crossers stay slow (so they linger in the conflict zone).
         if stype == SCENARIO_HEADON:
             spd_base = SPEED_HEADON_MIN + (SPEED_HEADON_MAX - SPEED_HEADON_MIN) * difficulty
         else:
@@ -896,7 +885,8 @@ if __name__ == "__main__":
     p.add_argument("--scenario",       default="standard",
                    choices=SCENARIO_NAMES + ["mixed"],
                    help="Force a specific scenario type for all episodes, or "
-                        "'mixed' to randomise across all five types per episode.")
+                        "'mixed' to randomise across the active crossing-conflict types "
+                        "(standard, headon, follow_vehicle, intersection) per episode.")
     p.add_argument("--no-cbf",         action="store_true",
                    help="Disable the HOCBF-QP safety filter (MPPI only). "
                         "Use for ablation baseline.")
