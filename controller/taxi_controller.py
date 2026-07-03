@@ -63,16 +63,7 @@ ALPHA1    = 1.8          # HOCBF first-order gain
 ALPHA2    = 1.8          # HOCBF second-order gain
 ALPHA_W   = 6.0          # QP acceleration vs steering weight
 
-# Geometry gate for the CBF constraint — engage braking only when it can actually help.
-# The discriminator is the OBSTACLE VELOCITY direction relative to the ego heading ê,
-# which identifies the hazard TYPE and is stable across the whole encounter (unlike the
-# instantaneous position, which for a crosser points straight ahead at closest approach
-# — opening a position-based gate at exactly the wrong instant):
-#   • CROSSER  — |v_obs·ê|/|v_obs| small (velocity ⟂ heading): self-clearing, braking is
-#                impotent and only phase-shifts the ego INTO the crossing → SKIP.
-#   • HEAD-ON  — v_obs·ê strongly negative (closing along heading): braking opens
-#                distance → ENGAGE.
-#   • BLOCKER  — |v_obs| ≈ 0 and obstacle ahead (parked/stationary): persistent → ENGAGE.
+# CBF Constraint
 CBF_MOVER_MIN   = 1.0    # [m/s] below this the obstacle is a static blocker → always engage
 CBF_COS_GATE    = 0.5    # engage only if |v_obs·ê|/|v_obs| >= this (i.e. within ~60° of the
                          #   heading axis — head-on/along-track); pure crossers fall below it
@@ -93,7 +84,7 @@ SIG_D     = 0.35         # noise std for steering samples
 # MPPI stage costs
 W_LAT, W_HEAD, W_V, W_CTRL = 3.0, 6.0, 1.2, 0.05
 W_OBS, W_OFF, W_PROG        = 12.0, 2.0, 0.4
-W_OFF_BYPASS = 2.0    # relaxed lane penalty when a blocking obstacle is ahead
+W_OFF_BYPASS = 3.0    # relaxed lane penalty when a blocking obstacle is ahead
 D_BYPASS     = 35.0   # trigger range: on-lane obstacle within this distance [m]
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
 BIG = 300.0
@@ -386,6 +377,7 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None):
     else:
         cost += W_PROG * (goal - (st[:, 0] - s0_fwd))
 
+    # Leave -cost.min() to avoid underflow
     w   = np.exp(-(cost - cost.min()) / LAMBDA)
     w  /= w.sum()
     opt = (w[:, None, None] * na).sum(axis=0)

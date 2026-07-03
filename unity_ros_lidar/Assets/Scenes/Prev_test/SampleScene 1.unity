@@ -770,6 +770,9 @@ MonoBehaviour:
   followStopDuration: 2.5
   followAccelFactor: 2.5
   followAccelDuration: 2
+  willIncur: 0
+  incursionTrigger: {fileID: 0}
+  incursionTriggerDist: 35
 --- !u!54 &985866012
 Rigidbody:
   m_ObjectHideFlags: 0
@@ -971,6 +974,7 @@ GameObject:
   - component: {fileID: 1218424478}
   - component: {fileID: 1218424476}
   - component: {fileID: 1218424475}
+  - component: {fileID: 1218424481}
   m_Layer: 0
   m_Name: Airplane (1)
   m_TagString: Untagged
@@ -1013,7 +1017,7 @@ BoxCollider:
   m_LayerOverridePriority: 0
   m_IsTrigger: 1
   m_ProvidesContacts: 0
-  m_Enabled: 1
+  m_Enabled: 0
   serializedVersion: 3
   m_Size: {x: 1, y: 1, z: 1}
   m_Center: {x: 0, y: 0, z: 0}
@@ -1058,7 +1062,7 @@ MonoBehaviour:
   maxSteerRate: 0.6
   steerRolloffSpeed: 15
   steerRolloffMin: 0.25
-  simulationTimeScale: 10
+  simulationTimeScale: 2
   goalMarker: {fileID: 35649850}
   taxiwayHalfWidth: 10
   dSafe: 10
@@ -1068,11 +1072,6 @@ MonoBehaviour:
   spawnHeadingRange: 0
   scenarioManager: {fileID: 1820338496}
   network: {fileID: 1651804279}
-  occlusionMask:
-    serializedVersion: 2
-    m_Bits: 4294967295
-  occlusionEyeHeight: 1.5
-  occlusionRevealDist: 18
   incursionController: {fileID: 985866011}
   incursionAgent: {fileID: 985866009}
   conflictPoint: {fileID: 351830360}
@@ -1136,6 +1135,28 @@ Rigidbody:
   m_Interpolate: 0
   m_Constraints: 0
   m_CollisionDetection: 0
+--- !u!64 &1218424481
+MeshCollider:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1218424472}
+  m_Material: {fileID: 0}
+  m_IncludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_ExcludeLayers:
+    serializedVersion: 2
+    m_Bits: 0
+  m_LayerOverridePriority: 0
+  m_IsTrigger: 1
+  m_ProvidesContacts: 0
+  m_Enabled: 1
+  serializedVersion: 5
+  m_Convex: 1
+  m_CookingOptions: 30
+  m_Mesh: {fileID: 0}
 --- !u!1 &1256893185
 GameObject:
   m_ObjectHideFlags: 0
@@ -1445,8 +1466,13 @@ MonoBehaviour:
   followStopDuration: 2.5
   followAccelFactor: 2.5
   followAccelDuration: 2
-  recoveryLateralRange: 8
-  recoveryHeadingRangeDeg: 25
+  incursionProbEasy: 0.15
+  incursionProbHard: 0.85
+  incursionSpeed: 6
+  incursionTriggerDist: 40
+  holdShortBackoff: 25
+  runwayApproachGap: 55
+  runwayGoalPastCrossing: 35
 --- !u!4 &1820338497
 Transform:
   m_ObjectHideFlags: 0
