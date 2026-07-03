@@ -120,6 +120,25 @@ CVAR_ALPHA       = 0.2                # CVaR tail fraction: worst 20% of scenari
 W_INFO           = 0.0               # weight on uncertainty-caution term (0 = off)
 INFO_RANGE       = 25.0              # only apply the caution term to obstacles within this range [m]
 
+# ── Route-intent belief (live prior for the scenarios above) ──────────────────
+# ROUTE_PRIOR is only the belief at first sighting. As we watch an obstacle we
+# Bayes-update a per-obstacle posterior over {straight, branch-L, branch-R} from
+# its observed yaw rate (turning left/right ⇒ weight shifts to that branch), and
+# feed THAT posterior — not the fixed prior — into _sample_obstacle_scenarios.
+# Effect: an obstacle whose intent is still ambiguous keeps a spread-out, high-
+# entropy belief ⇒ scenarios fan out ⇒ CVaR stays cautious; once it commits to a
+# branch the belief sharpens ⇒ scenarios concentrate ⇒ the planner stops over-
+# braking. Belief entropy also drives the W_INFO caution term.
+# Obstacles are sorted nearest-first in the observation (TaxiAgent.cs), so slots
+# are NOT stable identities — a tiny nearest-neighbour tracker associates
+# obstacles across steps to carry each belief. Active info-gathering (the ego
+# MOVING to reduce entropy) still needs the environment to hide intent; this is
+# the passive half: observe → belief → prediction → risk.
+TURN_RATE_NOM = 0.20   # [rad/s] yaw rate a branching agent exhibits (vs ~0 for straight)
+SIG_OMEGA     = 0.15   # [rad/s] likelihood noise on the observed yaw-rate estimate
+BELIEF_FORGET = 0.05   # per-step relaxation of the posterior back toward the prior (stay adaptive)
+TRACK_GATE    = 6.0    # [m] max rel-position jump to associate an obstacle with a track across steps
+
 # Detection range — obstacles beyond this Euclidean distance [m] are masked from
 # MPPI and CBF, simulating finite LiDAR/sensor range. Oracle = inf (old behaviour).
 # At V_DES=8 m/s the MPPI horizon covers 20 m; a 25 m range gives the planner ~0.6 s
@@ -315,13 +334,95 @@ def _rollout_step(st, a_cmd, delta_cmd):
     return st_new
 
 
-def _sample_obstacle_scenarios(obs_v):
+def _entropy(b):
+    """Shannon entropy [nats] of a belief vector; 0 = certain, log(n) = uniform."""
+    b = np.clip(np.asarray(b, dtype=float), 1e-9, 1.0)
+    return float(-(b * np.log(b)).sum())
+
+
+class ObstacleTracker:
+    """
+    Associates obstacles across control steps and maintains a per-obstacle route
+    belief over {straight, branch-L, branch-R}.
+
+    Obstacles arrive nearest-first (unstable slot order), so we associate by
+    greedy nearest-neighbour on the ego-relative position (gate = TRACK_GATE);
+    the small per-step drift from ego motion stays well inside the gate. A missed
+    association just starts a fresh track at ROUTE_PRIOR — graceful degradation.
+
+    The belief is updated from the obstacle's observed yaw rate (change of its
+    velocity heading), which is frame-independent, so association is the only part
+    that needs the relative position.
+    """
+
+    def __init__(self):
+        self.tracks = []   # each: {'rel': (2,), 'belief': (3,), 'head': float|None}
+
+    def reset(self):
+        self.tracks = []
+
+    def update(self, obstacles):
+        """Return a list of belief vectors aligned with `obstacles`."""
+        prior      = np.asarray(ROUTE_PRIOR, dtype=float)
+        used       = [False] * len(self.tracks)
+        beliefs    = []
+        new_tracks = []
+        for rel_xy, obs_v in obstacles:
+            best, best_d = -1, TRACK_GATE
+            for j, tr in enumerate(self.tracks):
+                if used[j]:
+                    continue
+                d = float(np.hypot(rel_xy[0] - tr['rel'][0], rel_xy[1] - tr['rel'][1]))
+                if d < best_d:
+                    best, best_d = j, d
+            if best >= 0:
+                tr = self.tracks[best]
+                used[best] = True
+            else:
+                tr = {'belief': prior.copy(), 'head': None}
+            b = self._update_belief(tr, obs_v)
+            tr['rel'] = np.asarray(rel_xy, dtype=float)
+            beliefs.append(b)
+            new_tracks.append(tr)
+        self.tracks = new_tracks
+        return beliefs
+
+    @staticmethod
+    def _update_belief(tr, obs_v):
+        prior = np.asarray(ROUTE_PRIOR, dtype=float)
+        b     = tr['belief']
+        speed = float(np.hypot(obs_v[0], obs_v[1]))
+        if speed > CBF_MOVER_MIN:
+            psi = float(np.arctan2(obs_v[1], obs_v[0]))   # observed heading
+            if tr['head'] is not None:
+                # wrapped heading change → yaw-rate estimate
+                dpsi  = float(np.arctan2(np.sin(psi - tr['head']), np.cos(psi - tr['head'])))
+                omega = dpsi / DT
+                omega_hyp = np.array([0.0, TURN_RATE_NOM, -TURN_RATE_NOM])
+                like = np.exp(-0.5 * ((omega - omega_hyp) / SIG_OMEGA) ** 2)  # Gaussian likelihood
+                b    = b * like
+                ssum = b.sum()
+                b    = b / ssum if ssum > 1e-12 else prior.copy()
+                # forget slightly toward the prior so the belief stays adaptive
+                b    = (1.0 - BELIEF_FORGET) * b + BELIEF_FORGET * prior
+                b   /= b.sum()
+            tr['head'] = psi
+        tr['belief'] = b
+        return b
+
+
+# Module-level tracker; reset per episode in run().
+_tracker = ObstacleTracker()
+
+
+def _sample_obstacle_scenarios(obs_v, route_prior=None):
     """
     Sample N_SCEN future velocity realizations for one obstacle, representing
     (route hypotheses × speed distribution):
 
-      route  — draw a heading offset from ROUTE_HYPOTHESES (prob ROUTE_PRIOR) and
-               rotate the observed velocity by it (a branch choice at the next node).
+      route  — draw a heading offset from ROUTE_HYPOTHESES and rotate the observed
+               velocity by it (a branch choice at the next node). The draw uses the
+               live route belief `route_prior` when given (else the fixed ROUTE_PRIOR).
       speed  — multiply the speed by (1 + N(0, SIG_OBS_SPD)) (timing/speed spread).
 
     For a (near-)stationary obstacle the rotation and speed noise both act on a
@@ -330,7 +431,8 @@ def _sample_obstacle_scenarios(obs_v):
 
     Returns (ovx, ovy), each shape (N_SCEN,): the per-scenario constant velocity.
     """
-    idx  = rng.choice(len(ROUTE_HYPOTHESES), size=N_SCEN, p=ROUTE_PRIOR)
+    p    = ROUTE_PRIOR if route_prior is None else route_prior
+    idx  = rng.choice(len(ROUTE_HYPOTHESES), size=N_SCEN, p=p)
     offs = np.asarray(ROUTE_HYPOTHESES)[idx]
     fac  = 1.0 + rng.normal(0.0, SIG_OBS_SPD, N_SCEN)
     c, s = np.cos(offs), np.sin(offs)
@@ -352,7 +454,7 @@ def _cvar(cost_kn, alpha):
     return worst.mean(axis=1)
 
 
-def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None):
+def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=None):
     """
     Sample K_MPPI rollouts with realistic 6D state dynamics.
 
@@ -410,7 +512,13 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None):
     # Uncertainty mode: sample per-obstacle future scenarios once, and accumulate
     # obstacle cost per (rollout, scenario) so it can be aggregated with CVaR below.
     if UNCERTAINTY and obstacles:
-        scen          = [_sample_obstacle_scenarios(ov) for _, ov in obstacles]
+        # Per-obstacle route belief (live posterior) drives both the scenario draw
+        # and the entropy used by the caution term. Falls back to the fixed prior.
+        if beliefs is None:
+            beliefs = [None] * len(obstacles)
+        scen          = [_sample_obstacle_scenarios(ov, bp) for (_, ov), bp in zip(obstacles, beliefs)]
+        ent           = [_entropy(bp) if bp is not None else np.log(len(ROUTE_HYPOTHESES))
+                         for bp in beliefs]
         cost_obs_scen = np.zeros((K_MPPI, N_SCEN))
     else:
         scen = None
@@ -438,7 +546,7 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None):
         t_elapsed = (k + 1) * DT
         if scen is not None:
             # Scenario-based prediction: each obstacle has N_SCEN sampled futures.
-            for (rel_xy, _ov), (ovx, ovy) in zip(obstacles, scen):
+            for (rel_xy, _ov), (ovx, ovy), ent_b in zip(obstacles, scen, ent):
                 oz = s0_fwd + rel_xy[0] + ovx * t_elapsed        # (N_SCEN,)
                 ox = s0_lat + rel_xy[1] + ovy * t_elapsed        # (N_SCEN,)
                 d_obs = np.hypot(fwd[:, None] - oz[None, :],
@@ -446,13 +554,12 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None):
                 cost_obs_scen += np.where(d_obs < D_INFL, W_OBS * (D_INFL - d_obs)**2, 0.)
                 cost_obs_scen += np.where(d_obs < D_SAFE, BIG, 0.)
                 # Uncertainty-caution term: slow down when approaching an obstacle
-                # whose predicted future is spread out (ambiguous route/timing).
-                if W_INFO > 0.:
+                # whose route intent is still ambiguous (high belief entropy).
+                if W_INFO > 0. and ent_b > 1e-3:
                     mz, mx = oz.mean(), ox.mean()
-                    sig    = np.sqrt(((oz - mz)**2 + (ox - mx)**2).mean())  # position spread [m]
-                    d_mean = np.hypot(fwd - mz, lat - mx)                    # (K,)
-                    prox   = np.maximum(0., 1. - d_mean / INFO_RANGE)        # (K,)
-                    cost  += W_INFO * sig * prox * vv**2
+                    d_mean = np.hypot(fwd - mz, lat - mx)             # (K,)
+                    prox   = np.maximum(0., 1. - d_mean / INFO_RANGE)  # (K,)
+                    cost  += W_INFO * ent_b * prox * vv**2
         else:
             for rel_xy, obs_v in obstacles:
                 obs_z = s0_fwd + rel_xy[0] + obs_v[0] * t_elapsed
@@ -779,6 +886,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
 
     for ep in range(n_episodes):
         mean   = np.zeros((H_MPPI, 2))
+        _tracker.reset()   # clear per-obstacle route beliefs at episode start
         sc     = scenarios[ep]
         task_id = int(sc["scenario_type"])
         ep_log = {"min_h": np.inf, "min_dist": np.inf,
@@ -852,7 +960,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                       f"th={s[2]:.3f} v={s[3]:.2f} δ={s[4]:.3f} a_act={s[5]:.2f}  "
                       f"{len(obstacles)} obs  goal={goal:.1f}")
 
-            u_nom, mean = mppi(s, mean, obstacles, goal, frenet_mode, tangent)
+            # Update the per-obstacle route belief from this step's observations,
+            # then feed the live posteriors into MPPI's scenario prediction.
+            # beliefs is update at each timestamp, remember the MPPI account for one timestamp at time for that single episode.
+            beliefs = _tracker.update(obstacles) if UNCERTAINTY else None
+            u_nom, mean = mppi(s, mean, obstacles, goal, frenet_mode, tangent, beliefs)
 
             if no_cbf:
                 u_cmd      = u_nom
