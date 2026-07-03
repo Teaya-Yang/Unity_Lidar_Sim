@@ -92,6 +92,34 @@ BIG = 300.0
 SIG_D_BYPASS  = 0.35  # wide steering noise to sample go-around rollouts
 ALPHA_W_GOAROUND = 0.2  # QP steering weight during go-around (vs ALPHA_W=6 normally)
 
+# ── Uncertainty-aware MPPI (scenario-based prediction + CVaR) ─────────────────
+# Off by default (UNCERTAINTY=False) so existing benchmarks are unchanged. When
+# enabled (--uncertainty) each MPPI call predicts every obstacle's future as a
+# DISTRIBUTION rather than a single constant-velocity ray:
+#
+#   route hypotheses × speed distribution  →  N_SCEN sampled futures per obstacle
+#
+# The obstacle cost is then aggregated with CVaR (mean of the worst CVAR_ALPHA
+# fraction of scenarios) instead of a single deterministic value, so the planner
+# is driven by the tail (a plausible bad branch/timing), not the average — the
+# right risk posture for aviation where rare conflicts, not typical ones, matter.
+#
+# Note on "planning to increase information": in this sim the ego observes full
+# state every step and its motion does NOT change other agents' scripted intent,
+# so there is no partial observability for the ego to *actively* resolve. The
+# honest analogue we implement is passive: W_INFO makes the ego slow down when it
+# is approaching an obstacle whose predicted future is spread out (ambiguous
+# route/timing), buying observation time before committing at a node. Set W_INFO>0
+# to enable; it is a cost term on approach speed scaled by prediction spread.
+UNCERTAINTY      = True              # master switch (set by --uncertainty)
+N_SCEN           = 8                  # obstacle future scenarios per MPPI call
+SIG_OBS_SPD      = 0.35               # relative std of obstacle speed (speed distribution)
+ROUTE_HYPOTHESES = (0.0, 0.45, -0.45) # heading offsets [rad]: straight / branch-L / branch-R
+ROUTE_PRIOR      = (0.6, 0.2, 0.2)    # prior prob of each route hypothesis (sums to 1)
+CVAR_ALPHA       = 0.2                # CVaR tail fraction: worst 20% of scenarios drive the cost
+W_INFO           = 0.0               # weight on uncertainty-caution term (0 = off)
+INFO_RANGE       = 25.0              # only apply the caution term to obstacles within this range [m]
+
 # Detection range — obstacles beyond this Euclidean distance [m] are masked from
 # MPPI and CBF, simulating finite LiDAR/sensor range. Oracle = inf (old behaviour).
 # At V_DES=8 m/s the MPPI horizon covers 20 m; a 25 m range gives the planner ~0.6 s
@@ -287,6 +315,43 @@ def _rollout_step(st, a_cmd, delta_cmd):
     return st_new
 
 
+def _sample_obstacle_scenarios(obs_v):
+    """
+    Sample N_SCEN future velocity realizations for one obstacle, representing
+    (route hypotheses × speed distribution):
+
+      route  — draw a heading offset from ROUTE_HYPOTHESES (prob ROUTE_PRIOR) and
+               rotate the observed velocity by it (a branch choice at the next node).
+      speed  — multiply the speed by (1 + N(0, SIG_OBS_SPD)) (timing/speed spread).
+
+    For a (near-)stationary obstacle the rotation and speed noise both act on a
+    ~zero vector, so the scenarios collapse to "stays put" — a parked blocker
+    correctly carries no intent uncertainty.
+
+    Returns (ovx, ovy), each shape (N_SCEN,): the per-scenario constant velocity.
+    """
+    idx  = rng.choice(len(ROUTE_HYPOTHESES), size=N_SCEN, p=ROUTE_PRIOR)
+    offs = np.asarray(ROUTE_HYPOTHESES)[idx]
+    fac  = 1.0 + rng.normal(0.0, SIG_OBS_SPD, N_SCEN)
+    c, s = np.cos(offs), np.sin(offs)
+    vx, vy = float(obs_v[0]), float(obs_v[1])
+    ovx = (c * vx - s * vy) * fac
+    ovy = (s * vx + c * vy) * fac
+    return ovx, ovy
+
+
+def _cvar(cost_kn, alpha):
+    """
+    CVaR_alpha of a per-rollout scenario-cost matrix (K, N_SCEN): for each rollout,
+    the mean of its worst ceil(alpha*N) scenario costs. alpha→0 is the single worst
+    case (robust); alpha→1 is the plain mean (risk-neutral).
+    """
+    n = cost_kn.shape[1]
+    k = max(1, int(np.ceil(alpha * n)))
+    worst = np.sort(cost_kn, axis=1)[:, -k:]   # k largest costs per rollout
+    return worst.mean(axis=1)
+
+
 def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None):
     """
     Sample K_MPPI rollouts with realistic 6D state dynamics.
@@ -342,6 +407,14 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None):
         s0_fwd = s0[0]
         s0_lat = s0[1]
 
+    # Uncertainty mode: sample per-obstacle future scenarios once, and accumulate
+    # obstacle cost per (rollout, scenario) so it can be aggregated with CVaR below.
+    if UNCERTAINTY and obstacles:
+        scen          = [_sample_obstacle_scenarios(ov) for _, ov in obstacles]
+        cost_obs_scen = np.zeros((K_MPPI, N_SCEN))
+    else:
+        scen = None
+
     for k in range(H_MPPI):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
@@ -363,12 +436,35 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None):
 
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
         t_elapsed = (k + 1) * DT
-        for rel_xy, obs_v in obstacles:
-            obs_z = s0_fwd + rel_xy[0] + obs_v[0] * t_elapsed
-            obs_x = s0_lat + rel_xy[1] + obs_v[1] * t_elapsed
-            d_obs = np.hypot(fwd - obs_z, lat - obs_x)
-            cost += np.where(d_obs < D_INFL, W_OBS * (D_INFL - d_obs)**2, 0.)
-            cost += np.where(d_obs < D_SAFE, BIG, 0.)
+        if scen is not None:
+            # Scenario-based prediction: each obstacle has N_SCEN sampled futures.
+            for (rel_xy, _ov), (ovx, ovy) in zip(obstacles, scen):
+                oz = s0_fwd + rel_xy[0] + ovx * t_elapsed        # (N_SCEN,)
+                ox = s0_lat + rel_xy[1] + ovy * t_elapsed        # (N_SCEN,)
+                d_obs = np.hypot(fwd[:, None] - oz[None, :],
+                                 lat[:, None] - ox[None, :])      # (K, N_SCEN)
+                cost_obs_scen += np.where(d_obs < D_INFL, W_OBS * (D_INFL - d_obs)**2, 0.)
+                cost_obs_scen += np.where(d_obs < D_SAFE, BIG, 0.)
+                # Uncertainty-caution term: slow down when approaching an obstacle
+                # whose predicted future is spread out (ambiguous route/timing).
+                if W_INFO > 0.:
+                    mz, mx = oz.mean(), ox.mean()
+                    sig    = np.sqrt(((oz - mz)**2 + (ox - mx)**2).mean())  # position spread [m]
+                    d_mean = np.hypot(fwd - mz, lat - mx)                    # (K,)
+                    prox   = np.maximum(0., 1. - d_mean / INFO_RANGE)        # (K,)
+                    cost  += W_INFO * sig * prox * vv**2
+        else:
+            for rel_xy, obs_v in obstacles:
+                obs_z = s0_fwd + rel_xy[0] + obs_v[0] * t_elapsed
+                obs_x = s0_lat + rel_xy[1] + obs_v[1] * t_elapsed
+                d_obs = np.hypot(fwd - obs_z, lat - obs_x)
+                cost += np.where(d_obs < D_INFL, W_OBS * (D_INFL - d_obs)**2, 0.)
+                cost += np.where(d_obs < D_SAFE, BIG, 0.)
+
+    # Risk-aware obstacle cost: aggregate the sampled futures with CVaR (tail-mean)
+    # rather than the mean, so a plausible bad branch/timing dominates the score.
+    if scen is not None:
+        cost += _cvar(cost_obs_scen, CVAR_ALPHA)
 
     # Progress
     if frenet_mode:
@@ -630,12 +726,20 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         min_difficulty=0.0, max_difficulty=1.0,
         noise_std=0.0, scenario_type=SCENARIO_STANDARD, no_cbf=False,
-        detect_range=float("inf"), dataset_path=None):
-    global DETECTION_RANGE
+        detect_range=float("inf"), dataset_path=None,
+        uncertainty=False, cvar_alpha=CVAR_ALPHA, n_scenarios=N_SCEN, w_info=W_INFO):
+    global DETECTION_RANGE, UNCERTAINTY, CVAR_ALPHA, N_SCEN, W_INFO
     DETECTION_RANGE = detect_range
+    UNCERTAINTY     = uncertainty
+    CVAR_ALPHA      = cvar_alpha
+    N_SCEN          = n_scenarios
+    W_INFO          = w_info
     print(f"[Controller] Connecting to Unity on port {port} ...")
     if detect_range < float("inf"):
         print(f"[Controller] Detection range : {detect_range:.1f} m  (obstacles beyond masked)")
+    if uncertainty:
+        print(f"[Controller] Uncertainty    : ON  (N_SCEN={n_scenarios}, CVaR α={cvar_alpha}, "
+              f"W_INFO={w_info})  scenario-based prediction + CVaR obstacle cost")
     env_params = EnvironmentParametersChannel()
     env = UnityEnvironment(
         file_name=unity_exec_path,
@@ -889,6 +993,18 @@ if __name__ == "__main__":
     p.add_argument("--dataset",        default=None,
                    help="Path to save the recorded offline-RL dataset (.npz). "
                         "Omit to skip saving (e.g. for quick ablation runs).")
+    p.add_argument("--uncertainty",    action="store_true",
+                   help="Enable uncertainty-aware MPPI: predict each obstacle's future as "
+                        "route-hypotheses × speed-distribution scenarios and score the "
+                        "obstacle cost with CVaR instead of a single deterministic value.")
+    p.add_argument("--cvar-alpha",     default=CVAR_ALPHA, type=float,
+                   help="CVaR tail fraction for obstacle cost (0→worst-case robust, "
+                        "1→risk-neutral mean). Only used with --uncertainty.")
+    p.add_argument("--n-scenarios",    default=N_SCEN, type=int,
+                   help="Number of sampled obstacle futures per MPPI call. Only used with --uncertainty.")
+    p.add_argument("--w-info",         default=W_INFO, type=float,
+                   help="Weight on the uncertainty-caution term (slow down when approaching an "
+                        "obstacle with an ambiguous predicted future). 0=off. Only used with --uncertainty.")
     args = p.parse_args()
 
     sc_int = -1 if args.scenario == "mixed" else SCENARIO_NAMES.index(args.scenario)
@@ -902,4 +1018,8 @@ if __name__ == "__main__":
         scenario_type=sc_int,
         no_cbf=args.no_cbf,
         detect_range=args.detect_range,
-        dataset_path=args.dataset)
+        dataset_path=args.dataset,
+        uncertainty=args.uncertainty,
+        cvar_alpha=args.cvar_alpha,
+        n_scenarios=args.n_scenarios,
+        w_info=args.w_info)
