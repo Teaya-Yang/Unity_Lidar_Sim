@@ -27,6 +27,8 @@ unity_ros_lidar/Assets/Scenarios/SCENARIOS.md.meta
 # Remove bags
 bags/*
 nuscenes*
+*.npz
+
 
 # Remove venv
 venv/
