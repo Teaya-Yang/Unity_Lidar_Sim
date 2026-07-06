@@ -646,9 +646,7 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
                     cost  += W_INFO * ent_b * prox * vv**2
         else:
             # Prediction-time uncertainty: the constant-velocity forecast degrades with t, so the
-            # soft ring inflates (ring + UNC_GROWTH·t, capped) — far-future encounters demand wide
-            # clearance, making the ego commit to its lateral offset EARLY. The hard keep-out ds
-            # stays fixed: inflating BIG would re-create the "everything is fatal → freeze" problem.
+            # soft ring inflates (ring + UNC_GROWTH·t, capped)
             infl_t = min(UNC_GROWTH * t_elapsed, UNC_GROWTH_MAX)
             for oi, (rel_xy, obs_v) in enumerate(obstacles):
                 di, ds = d_infl_arr[oi] + infl_t, d_safe_arr[oi]

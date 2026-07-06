@@ -773,9 +773,12 @@ MonoBehaviour:
   willIncur: 0
   incursionTrigger: {fileID: 0}
   incursionTriggerDist: 35
-  homingTarget: {fileID: 0}
-  homingTurnRateDeg: 45
-  homingStopDist: 2
+  convergeTarget: {fileID: 0}
+  convergeJinkDist: 25
+  convergeHeadingJitter: 0.3
+  convergeSpeedJitter: 0.8
+  convergeUpdateInterval: 0.4
+  convergeBaseJitter: 0.25
 --- !u!54 &985866012
 Rigidbody:
   m_ObjectHideFlags: 0
@@ -1065,7 +1068,7 @@ MonoBehaviour:
   maxSteerRate: 0.6
   steerRolloffSpeed: 15
   steerRolloffMin: 0.25
-  simulationTimeScale: 1
+  simulationTimeScale: 10
   goalMarker: {fileID: 35649850}
   taxiwayHalfWidth: 10
   dSafe: 10
@@ -1456,6 +1459,7 @@ MonoBehaviour:
   network: {fileID: 1651804279}
   maxEgoTurnDeg: 35
   minEgoPathLength: 60
+  maxEgoGoalDist: 180
   minObstacleSpawnDist: 15
   episodeReachSeconds: 20
   headOnApproachGap: 50
@@ -1478,7 +1482,7 @@ MonoBehaviour:
   runwayGoalPastCrossing: 35
   convergeSpawnDist: 70
   convergeSpeed: 5
-  convergeTurnRateDeg: 45
+  convergeJinkDist: 25
 --- !u!4 &1820338497
 Transform:
   m_ObjectHideFlags: 0
