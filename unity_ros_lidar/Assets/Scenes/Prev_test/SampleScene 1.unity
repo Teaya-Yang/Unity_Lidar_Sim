@@ -227,7 +227,7 @@ Transform:
   serializedVersion: 2
   m_LocalRotation: {x: -0, y: -0, z: -0, w: 1}
   m_LocalPosition: {x: 0, y: 0, z: 0}
-  m_LocalScale: {x: 100, y: 1, z: 100}
+  m_LocalScale: {x: 1000, y: 1, z: 1000}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 31629467}
@@ -917,7 +917,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1156722709}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 76110e0b8ff74966d8519833a2fb7d36, type: 3}
   m_Name: 
@@ -926,7 +926,7 @@ MonoBehaviour:
   m_GlobalFrameIds:
   - map
   - odom
-  m_RootGameObject: {fileID: 0}
+  m_RootGameObject: {fileID: 1218424472}
 --- !u!114 &1156722711
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -934,7 +934,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1156722709}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 04bdebad427f85cfa983188702c5b9d6, type: 3}
   m_Name: 
@@ -1068,7 +1068,7 @@ MonoBehaviour:
   maxSteerRate: 0.6
   steerRolloffSpeed: 15
   steerRolloffMin: 0.25
-  simulationTimeScale: 10
+  simulationTimeScale: 1
   goalMarker: {fileID: 35649850}
   taxiwayHalfWidth: 10
   dSafe: 10
@@ -1752,7 +1752,7 @@ Transform:
   m_GameObject: {fileID: 1875189583}
   serializedVersion: 2
   m_LocalRotation: {x: -0, y: -0, z: -0, w: 1}
-  m_LocalPosition: {x: -174.57, y: 56.75, z: -162.74}
+  m_LocalPosition: {x: -0.07, y: 3.56, z: 13.93}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
