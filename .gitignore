@@ -29,6 +29,8 @@ bags/*
 nuscenes*
 *.npz
 
+# Remove logging
+logs/*
 
 # Remove venv
 venv/
