@@ -13,6 +13,7 @@ public enum TrajectoryMode
     Accelerating,// starts slow, accelerates toward conflict point
     FollowPath,  // drive along an assigned TaxiwayPath (GeoJSON map-based scenario)
     HoldShort,   // hold at a runway holding position; if willIncur, drive across when the ego nears
+    Converging,  // long-range approach toward the ego that jinks (heading/speed) more as it nears
 }
 
 /// <summary>
@@ -94,6 +95,24 @@ public class IncursionAgentController : MonoBehaviour
     public Transform incursionTrigger    = null;
     [Tooltip("Ego proximity [m] that releases the hold and starts the incursion.")]
     public float     incursionTriggerDist = 35f;
+
+    [Header("Converging (long-range approach with proximity jink)")]
+    [Tooltip("The ego transform, used ONLY to measure proximity so the agent jinks harder as it " +
+             "nears the airplane. It is NOT steered onto — the heading is never locked to the live " +
+             "ego position, so the agent is an evolving collision course, not a guaranteed-hit pursuer.")]
+    public Transform convergeTarget;
+    [Tooltip("Within this range of the airplane [m] the heading/speed perturbations ramp up, so the " +
+             "approach turns unpredictable near the ego instead of a straight, easily-predicted line.")]
+    public float     convergeJinkDist       = 25f;
+    [Tooltip("Max heading change per update [rad]; scaled up by proximity to the airplane.")]
+    public float     convergeHeadingJitter  = 0.30f;
+    [Tooltip("Max speed change per update [m/s]; scaled up by proximity to the airplane.")]
+    public float     convergeSpeedJitter    = 0.8f;
+    [Tooltip("Seconds between heading/speed perturbation updates.")]
+    public float     convergeUpdateInterval = 0.4f;
+    [Tooltip("Fraction of the jitter applied even far from the airplane (keeps the far approach " +
+             "from being a dead-straight line). 0 = perfectly straight until inside convergeJinkDist.")]
+    public float     convergeBaseJitter     = 0.25f;
 
     // ── private ────────────────────────────────────────────────────────────────
 
@@ -213,7 +232,36 @@ public class IncursionAgentController : MonoBehaviour
             case TrajectoryMode.Accelerating: StepAccelerating(); break;
             case TrajectoryMode.FollowPath:   StepFollowPath();   break;
             case TrajectoryMode.HoldShort:    StepHoldShort();    break;
+            case TrajectoryMode.Converging:   StepConverging();   break;
         }
+    }
+
+    // Long-range converging approach. The heading starts pointed at the ego (set by the scenario)
+    // and holds a near-straight course while far away, then jinks — random heading and speed
+    // perturbations that scale up with proximity to the airplane — so the final approach is
+    // unpredictable. The ego's LIVE position is only READ to gauge distance, never steered onto,
+    // so the agent is an evolving collision course rather than a lock-on pursuer that always rams.
+    void StepConverging()
+    {
+        _erraticTimer += Time.fixedDeltaTime;
+        if (_erraticTimer >= convergeUpdateInterval)
+        {
+            _erraticTimer = 0f;
+            float prox = 0f;
+            if (convergeTarget != null)
+            {
+                Vector3 to = convergeTarget.position - transform.position; to.y = 0f;
+                prox = Mathf.Clamp01(1f - to.magnitude / Mathf.Max(convergeJinkDist, 0.01f));
+            }
+            float scale = Mathf.Clamp01(convergeBaseJitter + (1f - convergeBaseJitter) * prox);
+            float hdg   = Random.Range(-convergeHeadingJitter, convergeHeadingJitter) * scale;
+            _dir = Quaternion.AngleAxis(hdg * Mathf.Rad2Deg, Vector3.up) * _dir;
+            _erraticSpeedOffset = Random.Range(-convergeSpeedJitter, convergeSpeedJitter) * scale;
+        }
+        float eff = Mathf.Max(0f, _speed + _erraticSpeedOffset);
+        transform.position += _dir * (eff * Time.fixedDeltaTime);
+        if (faceTravelDirection && _dir.sqrMagnitude > 1e-6f)
+            transform.rotation = Quaternion.LookRotation(frontIsNegativeZ ? -_dir : _dir, Vector3.up);
     }
 
     // Hold at the runway holding position until released, then drive across the runway.

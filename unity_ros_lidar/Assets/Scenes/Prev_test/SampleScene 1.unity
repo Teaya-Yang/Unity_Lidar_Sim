@@ -773,6 +773,9 @@ MonoBehaviour:
   willIncur: 0
   incursionTrigger: {fileID: 0}
   incursionTriggerDist: 35
+  homingTarget: {fileID: 0}
+  homingTurnRateDeg: 45
+  homingStopDist: 2
 --- !u!54 &985866012
 Rigidbody:
   m_ObjectHideFlags: 0
@@ -1062,7 +1065,7 @@ MonoBehaviour:
   maxSteerRate: 0.6
   steerRolloffSpeed: 15
   steerRolloffMin: 0.25
-  simulationTimeScale: 2
+  simulationTimeScale: 1
   goalMarker: {fileID: 35649850}
   taxiwayHalfWidth: 10
   dSafe: 10
@@ -1473,6 +1476,9 @@ MonoBehaviour:
   holdShortBackoff: 25
   runwayApproachGap: 55
   runwayGoalPastCrossing: 35
+  convergeSpawnDist: 70
+  convergeSpeed: 5
+  convergeTurnRateDeg: 45
 --- !u!4 &1820338497
 Transform:
   m_ObjectHideFlags: 0

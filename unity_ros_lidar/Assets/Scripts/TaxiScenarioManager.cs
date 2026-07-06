@@ -16,6 +16,7 @@ public enum ScenarioType
     FollowVehicle   = 2,   // follow a vehicle to the SAME goal; the lead randomly stops/accelerates (difficulty-scaled)
     Intersection    = 3,   // ego on one taxiway branch, ONE agent on the crossing branch — meet at the node
     RunwayIncursion = 4,   // ego drives ON a runway toward a goal; a vehicle holds short on a crossing taxiway and may incur
+    Converging      = 5,   // agents spawn FAR on a ring and home in toward the ego from multiple bearings (long-range planning)
 }
 
 /// <summary>
@@ -70,6 +71,10 @@ public class TaxiScenarioManager : MonoBehaviour
     public float maxEgoTurnDeg    = 35f;
     [Tooltip("Skip ego paths shorter than this [m] so episodes have room to run.")]
     public float minEgoPathLength = 60f;
+    [Tooltip("Cap the ego goal at this arc-length [m] from the start, even on longer paths, so the " +
+             "episode ends a sensible distance past the encounter instead of taxiing a km-long " +
+             "taxiway to timeout. Python can override per-episode via 'max_goal_dist'.")]
+    public float maxEgoGoalDist   = 180f;
     [Tooltip("Never spawn an obstacle closer than this [m] to the ego at episode start.")]
     public float minObstacleSpawnDist = 15f;
     [Tooltip("How far ahead (in seconds of ego travel) a conflict point may be and still " +
@@ -138,6 +143,17 @@ public class TaxiScenarioManager : MonoBehaviour
              "episode so the ego doesn't have to taxi the whole (km-long) runway.")]
     public float runwayGoalPastCrossing = 35f;
 
+    [Header("Converging (long-range multi-direction approach)")]
+    [Tooltip("Radius [m] of the ring on which agents spawn around the ego. Deliberately larger " +
+             "than the other scenarios: the ego must plan for a distant converging threat, not a " +
+             "close-in avoidance. Python can override this per-episode via 'converge_spawn_dist'.")]
+    public float convergeSpawnDist   = 70f;
+    [Tooltip("Converging agent speed [m/s] when ambulance_speed is not supplied for the episode.")]
+    public float convergeSpeed       = 5f;
+    [Tooltip("Within this range of the airplane [m] a converging agent starts to jink (change " +
+             "heading/speed), so the approach is unpredictable near the ego rather than a straight line.")]
+    public float convergeJinkDist    = 25f;
+
     // ── public read-only ───────────────────────────────────────────────────────
     public IReadOnlyList<IncursionAgentController> ActiveAgents => _active;
 
@@ -195,6 +211,14 @@ public class TaxiScenarioManager : MonoBehaviour
         {
             ResetEpisodeFromNetwork(difficulty, aircraftSpeed, aircraftTransform, baseDt,
                                     ambulanceSpeed, scenarioType);
+            return;
+        }
+
+        // Converging is network-independent (it spawns a ring around wherever the ego is), so it
+        // also works in the legacy no-network layout: the ego stays at its spawn and agents home in.
+        if ((ScenarioType)scenarioType == ScenarioType.Converging)
+        {
+            SetupConverging(difficulty, aircraftTransform, ambulanceSpeed);
             return;
         }
 
@@ -316,7 +340,11 @@ public class TaxiScenarioManager : MonoBehaviour
         else
             egoPathIdx = navigable[Random.Range(0, navigable.Count)];
         EgoPath  = paths[egoPathIdx];
-        EgoGoalS = EgoPath.TotalLength;          // goal at the path end (runway incursion overrides)
+        // Goal at the path end, but CAPPED to maxEgoGoalDist: on a long (runway-length) taxiway the
+        // encounter happens in the first ~100 m and the ego would otherwise taxi the whole km to the
+        // end, running the episode to timeout. Bounding the goal keeps episodes a sensible length.
+        // (Runway incursion sets its own goal and never reaches here.)
+        EgoGoalS = Mathf.Min(EgoPath.TotalLength, maxEgoGoalDist);
         var egoWps = EgoPath.Waypoints;
         if (egoWps.Count > 0)
         {
@@ -326,6 +354,14 @@ public class TaxiScenarioManager : MonoBehaviour
                 : Vector3.forward;
             if (initDir.sqrMagnitude > 1e-6f)
                 aircraftTransform.rotation = Quaternion.LookRotation(initDir, Vector3.up);
+        }
+
+        // Converging: the ego is now on a navigable taxiway; spawn homing agents on a ring around
+        // it and let them drive straight at the ego (off-network) from multiple bearings.
+        if ((ScenarioType)scenarioType == ScenarioType.Converging)
+        {
+            SetupConverging(difficulty, aircraftTransform, ambulanceSpeed);
+            return;
         }
 
         // Determine how many obstacle agents to activate
@@ -630,6 +666,65 @@ public class TaxiScenarioManager : MonoBehaviour
                   $"holdArc={holdArc:F0} reverse={reverse}");
     }
 
+    // ── Converging (long-range multi-direction approach) ──────────────────────
+    //
+    // Agents spawn on a ring of radius convergeSpawnDist around the ego, each initially aimed at the
+    // ego's position AT SPAWN (off the taxiway network). They hold a near-straight course while far
+    // out, then JINK — heading/speed perturbations that ramp up with proximity (convergeJinkDist) —
+    // so the final approach is unpredictable rather than a trivially-predicted straight line. They
+    // never lock onto the live ego position, so an agent is an evolving collision course, not a
+    // pursuer that chases and rams: once the ego plans clear, it carries on past. A random base
+    // bearing plus even angular spacing gives multi-direction convergence that differs every episode.
+    // Because the threat starts far out, this exercises LONG-RANGE planning (D_INFL / horizon),
+    // not close-in avoidance — pair it with an enlarged D_INFL on the controller side.
+    void SetupConverging(float difficulty, Transform aircraftTransform, float ambulanceSpeed)
+    {
+        if (_pool.Count == 0)
+        {
+            Debug.LogWarning("[TaxiScenarioManager] (converging) no agent in pool — nothing to spawn.");
+            return;
+        }
+
+        int              nActive;
+        TrajectoryMode[] modes;
+        ResolveLayout(ScenarioType.Converging, difficulty, _pool.Count, false, out nActive, out modes);
+
+        float   spd     = ambulanceSpeed > 0f ? ambulanceSpeed : convergeSpeed;
+        float   baseAng = Random.Range(0f, Mathf.PI * 2f);
+        Vector3 egoPos  = aircraftTransform.position;
+
+        for (int i = 0; i < nActive; i++)
+        {
+            var agent = _pool[i];
+            agent.gameObject.SetActive(true);
+
+            // Even angular spacing + jitter so the agents converge from distinct bearings.
+            float   ang     = baseAng + i * (Mathf.PI * 2f / nActive) + Random.Range(-0.3f, 0.3f);
+            Vector3 bearing = new Vector3(Mathf.Sin(ang), 0f, Mathf.Cos(ang));
+            Vector3 spawnPos = egoPos + bearing * convergeSpawnDist;
+
+            agent.assignedPath      = null;
+            agent.trajectoryMode    = TrajectoryMode.Converging;
+            agent.followReverse     = false;
+            agent.pathLateralOffset = 0f;
+            agent.stochasticFollow  = false;
+            agent.stopAtPathEnd     = false;
+            agent.convergeTarget    = aircraftTransform;   // proximity reference only (not steered onto)
+            agent.convergeJinkDist  = convergeJinkDist;
+            // Initial heading points at the ego's spawn position; the Converging step then holds
+            // course far out and jinks near the plane, so it's a threatening but unpredictable
+            // approach rather than a straight line or a lock-on pursuit.
+            agent.crossDirection    = egoPos - spawnPos;
+            agent.ResetCrossing(spawnPos, spd * (1f + i * speedVariation));
+            _active.Add(agent);
+
+            Debug.Log($"[TaxiScenarioManager] (converging) Agent {i}: bearing={ang * Mathf.Rad2Deg:F0}deg " +
+                      $"dist={convergeSpawnDist:F0}m spd={spd:F1}");
+        }
+
+        Debug.Log($"[TaxiScenarioManager] (converging) n={nActive} ring={convergeSpawnDist:F0}m diff={difficulty:F2}");
+    }
+
     // Place the ego at a given arc-length along a path, headed toward increasing arc.
     void PlaceEgoOnPath(Transform ego, TaxiwayPath path, float arc)
     {
@@ -762,6 +857,18 @@ public class TaxiScenarioManager : MonoBehaviour
                                                      : TrajectoryMode.Straight;
                 modes = new TrajectoryMode[nActive];
                 for (int k = 0; k < nActive; k++) modes[k] = xsnMode;
+                break;
+
+            case ScenarioType.Converging:
+                // Long-range converging threat: agent count ramps with difficulty (1→3). Each
+                // approaches the ego's spawn and jinks near it; more agents = more simultaneous
+                // bearings the ego must plan around. (SetupConverging sets the mode and per-agent
+                // heading/target; modes here just size the count.)
+                if      (d < 0.33f) nActive = 1;
+                else if (d < 0.66f) nActive = 2;
+                else                nActive = 3;
+                modes = new TrajectoryMode[nActive];
+                for (int k = 0; k < nActive; k++) modes[k] = TrajectoryMode.Converging;
                 break;
 
             case ScenarioType.Standard:

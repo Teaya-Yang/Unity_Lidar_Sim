@@ -193,6 +193,18 @@ public class TaxiAgent : Unity.MLAgents.Agent
             float reachSecs = ep.GetWithDefault("episode_reach_seconds", -1f);
             if (reachSecs > 0f) scenarioManager.episodeReachSeconds = reachSecs;
 
+            // Bound the ego goal so long (runway-length) paths don't run the episode to timeout.
+            float maxGoal = ep.GetWithDefault("max_goal_dist", -1f);
+            if (maxGoal > 0f) scenarioManager.maxEgoGoalDist = maxGoal;
+
+            // Converging scenario: let Python set the ring radius (long-range spawn distance).
+            float convergeDist = ep.GetWithDefault("converge_spawn_dist", -1f);
+            if (convergeDist > 0f) scenarioManager.convergeSpawnDist = convergeDist;
+
+            // Head-on scenario: let Python set how far ahead the oncoming agents spawn.
+            float headOnGap = ep.GetWithDefault("head_on_gap", -1f);
+            if (headOnGap > 0f) scenarioManager.headOnApproachGap = headOnGap;
+
             scenarioManager.ResetEpisode(
                 difficulty,
                 episodeSpeed > 0f ? episodeSpeed : desiredSpeed,

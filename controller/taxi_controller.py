@@ -44,6 +44,7 @@ import numpy as np
 import argparse
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.base_env import ActionTuple
+from mlagents_envs.exception import UnityCommunicatorStoppedException
 from mlagents_envs.side_channel.environment_parameters_channel import (
     EnvironmentParametersChannel,
 )
@@ -54,8 +55,24 @@ DT        = 0.1          # Fixed Timestep in Unity (Project Settings → Time)
 L         = 6.0          # wheelbase [m]
 V_DES     = 8.0          # desired taxi speed [m/s] 
 W_HALF    = 10.0         # taxiway half-width [m]
-D_SAFE    = 14.0          # keep-out radius [m]
+D_SAFE    = 10.0          # keep-out radius [m]
 D_INFL    = 16.0         # MPPI obstacle influence radius [m]
+UNC_GROWTH  = 1.5        # influence-ring inflation rate [m/s of prediction time]. The constant-
+                         # velocity obstacle prediction is exact at t=0 but increasingly wrong later
+                         # in the horizon (the agent may turn/brake), so the required clearance grows
+                         # with prediction time: ring(t) = D_INFL + UNC_GROWTH·t. Far-future
+                         # encounters therefore demand WIDE margins — pushing the ego to commit to
+                         # its lateral offset EARLY, while near-term predictions keep the tight ring.
+UNC_GROWTH_MAX = 8.0     # cap on the inflation [m] so the ring can't grow unbounded on long horizons
+D_INFL_PASS = 15.0       # influence ring for a FRONTAL blocker being passed (go-around) [m]. Must sit
+                         # well ABOVE D_SAFE so there's a wide soft band that builds lateral offset
+                         # early; if it's only ~1 m above D_SAFE the ego feels the agent only at the
+                         # last metre and clips the keep-out. (The capped braking + relaxed lane cost
+                         # keep the wider ring from re-causing the freeze.)
+HEADON_GIVEWAY = 6.0     # lateral give-way target [m]: the moment an oncoming agent is detected (out
+                         # to D_BYPASS), the ego's lane target shifts this far to the side AWAY from
+                         # it, so it eases off-centre EARLY and holds that side through the pass —
+                         # proactive clearance, rather than reacting only when the ring bites.
 A_MIN     = -4.0
 A_MAX     =  1.5
 DELTA_LIM = 0.5
@@ -75,7 +92,7 @@ MAX_STEER_RATE    = 0.6    # nose-wheel steering rate limit [rad/s]
 STEER_ROLLOFF_SPD = 15.0   # speed at which steering authority starts rolling off [m/s]
 STEER_ROLLOFF_MIN = 0.25   # minimum steering authority fraction at high speed
 
-H_MPPI    = 25           # planning horizon (steps)
+H_MPPI    = 40           # planning horizon (steps)
 K_MPPI    = 1500         # rollout samples
 LAMBDA    = 1.0          # MPPI temperature
 SIG_A     = 1.0          # noise std for acceleration samples
@@ -83,13 +100,29 @@ SIG_D     = 0.35         # noise std for steering samples
 
 # MPPI stage costs
 W_LAT, W_HEAD, W_V, W_CTRL = 3.0, 6.0, 1.2, 0.05
-W_OBS, W_OFF, W_PROG        = 12.0, 2.0, 0.4
-W_OFF_BYPASS = 3.0    # relaxed lane penalty when a blocking obstacle is ahead
-D_BYPASS     = 35.0   # trigger range: on-lane obstacle within this distance [m]
+# W_OBS lowered and W_PROG raised (was 12.0 / 0.4) so forward progress competes with the obstacle
+# penalty. On a head-on pass the ego can't keep D_SAFE either way (the oncoming agent comes to it),
+# so an over-weighted W_OBS made "stop and wait" the cheapest option; a stronger progress pull makes
+# driving through win. Trade-off: the ego is slightly less conservative around crossers/convergers.
+W_OBS, W_OFF, W_PROG        = 8.0, 2.0, 1.0
+# Go-around (bypass) lane costs — relaxed vs the nominal W_LAT/W_OFF so that, once a frontal threat
+# is ahead, MPPI is free to sit off the centreline and slip past instead of being pulled straight
+# back into the obstacle. (Previously W_OFF_BYPASS=3.0 was *stricter* than W_OFF and W_LAT was never
+# relaxed, so the "bypass" couldn't actually leave the lane.)
+W_LAT_BYPASS  = 0.5   # relaxed cross-track pull during a go-around (vs W_LAT=3.0)
+W_OFF_BYPASS  = 1.0   # relaxed off-taxiway penalty during a go-around (vs W_OFF=2.0)
+W_HEAD_BYPASS = 2.0   # relaxed heading cost during a go-around (vs W_HEAD=6.0) so committing to
+                      # the yaw needed to swerve is cheap.
+A_MIN_BYPASS  = -1.5  # capped braking during a go-around (vs A_MIN=-4.0). Braking to ~0 kills
+                      # steering authority (dθ = v/L·tanδ → 0 at v≈0), stranding the ego in-lane;
+                      # keeping speed lets it STEER clear instead of stopping in front of the agent.
+D_BYPASS     = 70.0   # trigger range: frontal on-lane obstacle within this distance [m]. Larger so
+                      # the go-around (wide steering, relaxed lane, capped braking) engages EARLY —
+                      # the ego starts easing aside well before the fast closer is on top of it.
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
 BIG = 300.0
 
-SIG_D_BYPASS  = 0.35  # wide steering noise to sample go-around rollouts
+SIG_D_BYPASS  = 0.70  # genuinely wider steering noise (2× SIG_D) so rollouts sample real go-arounds
 ALPHA_W_GOAROUND = 0.2  # QP steering weight during go-around (vs ALPHA_W=6 normally)
 
 # ── Uncertainty-aware MPPI (scenario-based prediction + CVaR) ─────────────────
@@ -111,14 +144,14 @@ ALPHA_W_GOAROUND = 0.2  # QP steering weight during go-around (vs ALPHA_W=6 norm
 # is approaching an obstacle whose predicted future is spread out (ambiguous
 # route/timing), buying observation time before committing at a node. Set W_INFO>0
 # to enable; it is a cost term on approach speed scaled by prediction spread.
-UNCERTAINTY      = True              # master switch (set by --uncertainty)
+UNCERTAINTY      = False              # master switch (set by --uncertainty)
 N_SCEN           = 8                  # obstacle future scenarios per MPPI call
 SIG_OBS_SPD      = 0.35               # relative std of obstacle speed (speed distribution)
 ROUTE_HYPOTHESES = (0.0, 0.45, -0.45) # heading offsets [rad]: straight / branch-L / branch-R
 ROUTE_PRIOR      = (0.6, 0.2, 0.2)    # prior prob of each route hypothesis (sums to 1)
 CVAR_ALPHA       = 0.2                # CVaR tail fraction: worst 20% of scenarios drive the cost
 W_INFO           = 0.0               # weight on uncertainty-caution term (0 = off)
-INFO_RANGE       = 25.0              # only apply the caution term to obstacles within this range [m]
+INFO_RANGE       = 40.0              # only apply the caution term to obstacles within this range [m]
 
 # ── Route-intent belief (live prior for the scenarios above) ──────────────────
 # ROUTE_PRIOR is only the belief at first sighting. As we watch an obstacle we
@@ -158,8 +191,11 @@ SCENARIO_HEADON           = 1   # oncoming traffic on the ego's own taxiway
 SCENARIO_FOLLOW           = 2   # follow a lead vehicle to the same goal; lead randomly stops/accelerates
 SCENARIO_INTERSECTION     = 3   # ego on one taxiway branch, crosser on the other — meet at node
 SCENARIO_RUNWAY_INCURSION = 4   # ego drives on a runway; a vehicle holds short and may incur onto it
+SCENARIO_CONVERGING       = 5   # agents spawn FAR on a ring and home toward the ego from multiple
+                                # bearings — a long-range converging threat (tests early/long-range
+                                # planning via D_INFL, not close-in avoidance)
 SCENARIO_NAMES = ['standard', 'headon', 'follow_vehicle', 'intersection',
-                  'runway_incursion']
+                  'runway_incursion', 'converging']
 
 rng = np.random.default_rng(42)
 
@@ -475,20 +511,64 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
 
     Returns (u_nom, new_mean).
     """
-    # Widen steering noise and relax lane penalty when a stationary/slow obstacle
-    # blocks the lane ahead — gives MPPI enough samples to find a go-around path.
-    sig_d_eff = SIG_D
-    w_off_eff = W_OFF
-    for rel_xy, obs_v in obstacles:
-        obs_spd = float(np.hypot(obs_v[0], obs_v[1]))
-        if 0 < rel_xy[0] < D_BYPASS and abs(rel_xy[1]) < W_HALF and obs_spd < 2.0:
-            sig_d_eff = SIG_D_BYPASS
-            w_off_eff = W_OFF_BYPASS
-            break
+    # Ego forward / left unit vectors in the rollout (Z, X) axes, so "ahead / in-lane / closing" is
+    # measured along the actual path heading — correct for angled paths, not just Z-aligned ones.
+    if frenet_mode and tangent is not None:
+        _tn = float(np.hypot(tangent[0], tangent[1])) or 1.0
+        fwd_hat = np.array([tangent[1], tangent[0]]) / _tn      # (tan_z, tan_x): axis0=Z, axis1=X
+    else:
+        fwd_hat = np.array([np.cos(s0[2]), np.sin(s0[2])])
+    left_hat = np.array([-fwd_hat[1], fwd_hat[0]])
+
+    # Widen steering noise and relax the lane pull when a FRONTAL threat blocks the lane ahead — a
+    # near-stationary blocker OR oncoming traffic closing head-on — so MPPI actually samples and
+    # commits to a go-around instead of stopping on the centreline. Pure crossers (velocity mostly
+    # lateral → small closing) don't trip it, so they still get the normal lane-keeping behaviour.
+    sig_d_eff  = SIG_D
+    w_off_eff  = W_OFF
+    w_lat_eff  = W_LAT
+    w_head_eff = W_HEAD
+    a_min_eff  = A_MIN
+    lane_bias  = 0.0            # cross-track give-way target (0 = centreline)
+    _nearest_frontal = np.inf   # range to the nearest frontal threat, to pick the give-way side
+    d_infl_arr = np.full(len(obstacles), D_INFL)   # per-obstacle influence ring
+    d_safe_arr = np.full(len(obstacles), D_SAFE)   # per-obstacle hard keep-out
+    for oi, (rel_xy, obs_v) in enumerate(obstacles):
+        rel = np.asarray(rel_xy, float); ov = np.asarray(obs_v, float)
+        fwd_d   = float(rel @ fwd_hat)          # distance ahead along the ego heading
+        lat_d   = float(rel @ left_hat)         # lateral offset from the ego's track
+        closing = -float(ov @ fwd_hat)          # > 0 ⇒ obstacle approaching the ego head-on
+        obs_spd = float(np.hypot(ov[0], ov[1]))
+        dist    = float(np.hypot(rel[0], rel[1]))
+        # Corridor test: ahead of the ego, roughly in-lane, stationary or closing. Fails around
+        # PATH BENDS — an oncoming agent beyond the bend projects far off the straight tangent
+        # (|lat_d| > W_HALF) even though it is driving straight at the ego, dropping the ego back
+        # to full braking/full ring (the freeze). The radial test below covers that case.
+        in_corridor = 0 < fwd_d < D_BYPASS and abs(lat_d) < W_HALF \
+                      and (obs_spd < 2.0 or closing > 1.0)
+        # Radial (bend-robust) test: range shrinking AND the agent's velocity points mostly AT the
+        # ego (true for head-on traffic on any path geometry; false for crossers, whose velocity
+        # aims at the conflict point, not the ego).
+        closing_rad = -float(rel @ ov) / max(dist, 1e-6)   # range rate toward the ego [m/s]
+        aimed_at_us = dist < D_BYPASS and obs_spd >= 2.0 and closing_rad > 0.7 * obs_spd
+        if in_corridor or aimed_at_us:
+            sig_d_eff  = SIG_D_BYPASS
+            w_off_eff  = W_OFF_BYPASS
+            w_lat_eff  = W_LAT_BYPASS
+            w_head_eff = W_HEAD_BYPASS
+            a_min_eff  = A_MIN_BYPASS
+            # Pass-sized soft ring for THIS frontal blocker (hard keep-out D_SAFE is unchanged).
+            d_infl_arr[oi] = D_INFL_PASS
+            # Give way EARLY to the side away from the nearest oncoming agent: steer to its own side
+            # (keep-right when the agent is dead ahead), so the ego is already offset by the time
+            # they meet instead of jinking at the last moment. lat_d > 0 ⇒ agent on the ego's left.
+            if dist < _nearest_frontal:
+                _nearest_frontal = dist
+                lane_bias = -HEADON_GIVEWAY if lat_d >= 0.0 else HEADON_GIVEWAY
 
     noise = rng.normal(0, [SIG_A, sig_d_eff], (K_MPPI, H_MPPI, 2))
     na    = mean + noise
-    na[:, :, 0] = np.clip(na[:, :, 0], A_MIN, A_MAX)
+    na[:, :, 0] = np.clip(na[:, :, 0], a_min_eff, A_MAX)
     na[:, :, 1] = np.clip(na[:, :, 1], -DELTA_LIM, DELTA_LIM)
 
     cost = np.zeros(K_MPPI)
@@ -531,12 +611,15 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
             # Cross-track error d(t) = d0 + (Tz*ΔX - Tx*ΔZ); matches GetRelativeState sign.
             d_t     = d0 + tan_z * lat - tan_x * fwd
             theta_e = th_tan - th
-            cost += W_LAT  * d_t**2
-            cost += W_HEAD * theta_e**2
+            # Track lane_bias (the give-way offset) rather than the centreline when oncoming traffic
+            # is ahead, so the ego eases to its own side early. The off-taxiway penalty still uses
+            # absolute cross-track, so the ego stays on the pavement.
+            cost += w_lat_eff  * (d_t - lane_bias)**2
+            cost += w_head_eff * theta_e**2
             cost += np.where(np.abs(d_t) > W_HALF, w_off_eff * (np.abs(d_t) - W_HALF)**2, 0.)
         else:
-            cost += W_LAT  * lat**2
-            cost += W_HEAD * th**2
+            cost += w_lat_eff  * (lat - lane_bias)**2
+            cost += w_head_eff * th**2
             cost += np.where(np.abs(lat) > W_HALF, w_off_eff * (np.abs(lat) - W_HALF)**2, 0.)
 
         cost += W_V    * (vv - V_DES)**2
@@ -546,13 +629,14 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
         t_elapsed = (k + 1) * DT
         if scen is not None:
             # Scenario-based prediction: each obstacle has N_SCEN sampled futures.
-            for (rel_xy, _ov), (ovx, ovy), ent_b in zip(obstacles, scen, ent):
+            for oi, ((rel_xy, _ov), (ovx, ovy), ent_b) in enumerate(zip(obstacles, scen, ent)):
+                di, ds = d_infl_arr[oi], d_safe_arr[oi]
                 oz = s0_fwd + rel_xy[0] + ovx * t_elapsed        # (N_SCEN,)
                 ox = s0_lat + rel_xy[1] + ovy * t_elapsed        # (N_SCEN,)
                 d_obs = np.hypot(fwd[:, None] - oz[None, :],
                                  lat[:, None] - ox[None, :])      # (K, N_SCEN)
-                cost_obs_scen += np.where(d_obs < D_INFL, W_OBS * (D_INFL - d_obs)**2, 0.)
-                cost_obs_scen += np.where(d_obs < D_SAFE, BIG, 0.)
+                cost_obs_scen += np.where(d_obs < di, W_OBS * (di - d_obs)**2, 0.)
+                cost_obs_scen += np.where(d_obs < ds, BIG, 0.)
                 # Uncertainty-caution term: slow down when approaching an obstacle
                 # whose route intent is still ambiguous (high belief entropy).
                 if W_INFO > 0. and ent_b > 1e-3:
@@ -561,12 +645,18 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
                     prox   = np.maximum(0., 1. - d_mean / INFO_RANGE)  # (K,)
                     cost  += W_INFO * ent_b * prox * vv**2
         else:
-            for rel_xy, obs_v in obstacles:
+            # Prediction-time uncertainty: the constant-velocity forecast degrades with t, so the
+            # soft ring inflates (ring + UNC_GROWTH·t, capped) — far-future encounters demand wide
+            # clearance, making the ego commit to its lateral offset EARLY. The hard keep-out ds
+            # stays fixed: inflating BIG would re-create the "everything is fatal → freeze" problem.
+            infl_t = min(UNC_GROWTH * t_elapsed, UNC_GROWTH_MAX)
+            for oi, (rel_xy, obs_v) in enumerate(obstacles):
+                di, ds = d_infl_arr[oi] + infl_t, d_safe_arr[oi]
                 obs_z = s0_fwd + rel_xy[0] + obs_v[0] * t_elapsed
                 obs_x = s0_lat + rel_xy[1] + obs_v[1] * t_elapsed
                 d_obs = np.hypot(fwd - obs_z, lat - obs_x)
-                cost += np.where(d_obs < D_INFL, W_OBS * (D_INFL - d_obs)**2, 0.)
-                cost += np.where(d_obs < D_SAFE, BIG, 0.)
+                cost += np.where(d_obs < di, W_OBS * (di - d_obs)**2, 0.)
+                cost += np.where(d_obs < ds, BIG, 0.)
 
     # Risk-aware obstacle cost: aggregate the sampled futures with CVaR (tail-mean)
     # rather than the mean, so a plausible bad branch/timing dominates the score.
@@ -755,6 +845,17 @@ DUD_DIST = 30.0   # [m] — min_dist above this ⇒ episode excluded from condit
 SPEED_CROSS_BASE   = 5.0    # perpendicular crosser speed [m/s] — kept low on purpose
 SPEED_HEADON_MIN   = 5.0    # head-on closing speed at difficulty 0 [m/s]
 SPEED_HEADON_MAX   = 12.0   # head-on closing speed at difficulty 1 [m/s]
+# Distance ahead of the ego where the head-on meet point sits (the oncoming agent spawns further
+# ahead still and drives back to it). Larger = agents appear further away, giving the ego more
+# reaction room before the pass. Pushed to Unity as 'head_on_gap'; only the head-on scenario reads it.
+HEADON_APPROACH_GAP = 90.0
+
+# Converging scenario — homing agents that spawn on a ring around the ego and drive at it.
+# Spawn distance is deliberately large so the ego reacts at long range (raise D_INFL to match);
+# closing speed ramps modestly with difficulty (faster convergence = tighter reaction window).
+CONVERGE_SPAWN_DIST = 70.0  # ring radius [m] agents spawn on around the ego (pushed to Unity)
+SPEED_CONVERGE_MIN  = 4.0   # homing speed at difficulty 0 [m/s]
+SPEED_CONVERGE_MAX  = 8.0   # homing speed at difficulty 1 [m/s]
 
 # Lever 3 — concentrate Δt near the conflict (was a uniform linspace).
 # A power-warped grid keeps the full [-DT_SPAN, DT_SPAN] coverage at the
@@ -770,6 +871,8 @@ DT_CONCENTRATION = 1.0  # with the narrowed ±0.8s span the whole grid is alread
 # At V_DES=8 m/s, 20 s caps intersections to ~160 m ahead — agents at most
 # 100-120 m upstream at spd=5 m/s, arriving in ~20-24 s well within timeout.
 EPISODE_REACH_SECONDS = 20.0   # pushed to Unity as "episode_reach_seconds" each episode
+MAX_GOAL_DIST         = 180.0  # cap the ego goal [m] so long (runway-length) paths don't taxi to
+                               # timeout after the encounter. Pushed to Unity as "max_goal_dist".
 
 
 def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_difficulty=1.0,
@@ -802,7 +905,8 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
         # Scenario type: forced when scenario_type >= 0, else drawn per-episode from the
         # active list ("mixed" mode, scenario_type = -1). Runway incursion is excluded from
         # mixed mode — it needs runway geometry that only some episodes can place — so run it
-        # explicitly via --scenario runway_incursion.
+        # explicitly via --scenario runway_incursion. Converging is likewise explicit-only: it is
+        # a distinct long-range regime best run with an enlarged D_INFL (--d-infl).
         _active_types = [SCENARIO_STANDARD, SCENARIO_HEADON,
                          SCENARIO_FOLLOW, SCENARIO_INTERSECTION]
         stype = float(scenario_type) if scenario_type >= 0 else float(r.choice(_active_types))
@@ -811,6 +915,8 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
         # crossers stay slow (so they linger in the conflict zone).
         if stype == SCENARIO_HEADON:
             spd_base = SPEED_HEADON_MIN + (SPEED_HEADON_MAX - SPEED_HEADON_MIN) * difficulty
+        elif stype == SCENARIO_CONVERGING:
+            spd_base = SPEED_CONVERGE_MIN + (SPEED_CONVERGE_MAX - SPEED_CONVERGE_MIN) * difficulty
         else:
             spd_base = SPEED_CROSS_BASE
         scenarios.append({
@@ -824,6 +930,9 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
             "desired_speed":     desired_spd,
             "head_on_prob":           0.3 if stype == SCENARIO_HEADON else 0.0,
             "episode_reach_seconds":  EPISODE_REACH_SECONDS,
+            "max_goal_dist":          MAX_GOAL_DIST,         # cap ego goal so long paths don't run to timeout
+            "converge_spawn_dist":    CONVERGE_SPAWN_DIST,   # ring radius; only used by SCENARIO_CONVERGING
+            "head_on_gap":            HEADON_APPROACH_GAP,   # meet/spawn distance; only used by SCENARIO_HEADON
         })
     return scenarios
 
@@ -834,13 +943,21 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         min_difficulty=0.0, max_difficulty=1.0,
         noise_std=0.0, scenario_type=SCENARIO_STANDARD, no_cbf=False,
         detect_range=float("inf"), dataset_path=None,
-        uncertainty=False, cvar_alpha=CVAR_ALPHA, n_scenarios=N_SCEN, w_info=W_INFO):
+        uncertainty=False, cvar_alpha=CVAR_ALPHA, n_scenarios=N_SCEN, w_info=W_INFO,
+        d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE):
     global DETECTION_RANGE, UNCERTAINTY, CVAR_ALPHA, N_SCEN, W_INFO
+    global D_INFL, D_SAFE, INFO_RANGE
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     CVAR_ALPHA      = cvar_alpha
     N_SCEN          = n_scenarios
     W_INFO          = w_info
+    D_INFL          = d_infl
+    D_SAFE          = d_safe
+    INFO_RANGE      = info_range
+    if d_infl != 16.0 or d_safe != 14.0:
+        print(f"[Controller] Planning radii : D_INFL={d_infl:.1f} m (plan-start), "
+              f"D_SAFE={d_safe:.1f} m (keep-out)")
     print(f"[Controller] Connecting to Unity on port {port} ...")
     if detect_range < float("inf"):
         print(f"[Controller] Detection range : {detect_range:.1f} m  (obstacles beyond masked)")
@@ -884,6 +1001,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
     episode_stats = []
     recorder      = RLDataRecorder()   # accumulates (s,a,r,s') transitions for offline RL
 
+    # Unity (Editor or build) can exit mid-run — most often the Editor drops Play mode because a
+    # script recompiled, or the window was closed. That surfaces as UnityCommunicatorStoppedException
+    # from env.step(); catch it so we still print the summary for the episodes that DID complete
+    # instead of dying with a traceback and losing the recorded dataset.
+    unity_stopped = False
     for ep in range(n_episodes):
         mean   = np.zeros((H_MPPI, 2))
         _tracker.reset()   # clear per-obstacle route beliefs at episode start
@@ -910,7 +1032,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
               f"dir={'L' if sc['cross_dir_sign'] < 0 else 'R'}  "
               f"{'[NO-CBF]' if no_cbf else '[CBF]'}")
 
-        env.reset()
+        try:
+            env.reset()
+        except UnityCommunicatorStoppedException:
+            unity_stopped = True
+            break
         decision_steps, terminal_steps = env.get_steps(behavior_name)
 
         ep_steps     = 0
@@ -995,9 +1121,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             else:
                 accel_actual = float(np.clip(a_cmd, A_MIN, A_MAX))
 
-            # Log nearest obstacle distance
+            # Log nearest obstacle distance — measured directly from geometry (min |rel_xy|) so it's
+            # correct regardless of the Unity-side dSafe baked into obs[17]. (Back-computing it from
+            # obs[17] + D_SAFE² read 0.00 whenever the retuned Python D_SAFE < Unity's dSafe.)
             h_val = float(obs[17])
-            dist  = float(np.sqrt(max(0., h_val + D_SAFE**2)))
+            dist  = float(min((np.hypot(rel[0], rel[1]) for rel, _ in obstacles), default=np.inf))
             ep_log["min_h"]    = min(ep_log["min_h"], h_val)
             ep_log["min_dist"] = min(ep_log["min_dist"], dist)
             ep_log["steps"]    = ep_steps
@@ -1016,8 +1144,15 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             prev_act = np.array([a_cmd, delta_cmd], dtype=np.float32)
 
             env.set_actions(behavior_name, action)
-            env.step()
+            try:
+                env.step()
+            except UnityCommunicatorStoppedException:
+                unity_stopped = True
+                break
             decision_steps, terminal_steps = env.get_steps(behavior_name)
+
+        if unity_stopped:      # Unity exited mid-episode — don't log a partial episode
+            break
         episode_stats.append(ep_log)
 
         verdict = "COLLISION" if ep_log["collided"] else "safe"
@@ -1027,10 +1162,22 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
               f"min_dist={ep_log['min_dist']:5.2f}m  "
               f"min_h={ep_log['min_h']:8.2f}  → {verdict}")
 
-    env.close()
+    if unity_stopped:
+        print(f"\n[Controller] Unity stopped early (Editor left Play mode, or the app closed). "
+              f"Completed {len(episode_stats)}/{n_episodes} episodes — reporting those.\n"
+              f"             If this was unexpected: check the Unity Console for an exception, and "
+              f"avoid editing C# scripts while the Editor is in Play mode (that triggers a recompile "
+              f"and drops the connection).")
+    try:
+        env.close()
+    except Exception:
+        pass
 
     print("\n=== Summary ===")
     n   = len(episode_stats)
+    if n == 0:
+        print("No episodes completed — nothing to summarise.")
+        return
     col = sum(1 for e in episode_stats if e["collided"])
     dists = [e["min_dist"] for e in episode_stats]
     print(f"Collision rate : {col}/{n} = {col/n:.1%}")
@@ -1084,7 +1231,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--exec",           default=None)
     p.add_argument("--port",           default=5004,  type=int)
-    p.add_argument("--sysid",          default=True,  type=lambda x: x.lower() == "true")
+    p.add_argument("--sysid",          default=False,  type=lambda x: x.lower() == "true")
     p.add_argument("--episodes",       default=20,    type=int)
     p.add_argument("--min-difficulty", default=0.0,   type=float)
     p.add_argument("--max-difficulty", default=1.0,   type=float)
@@ -1117,7 +1264,23 @@ if __name__ == "__main__":
     p.add_argument("--w-info",         default=W_INFO, type=float,
                    help="Weight on the uncertainty-caution term (slow down when approaching an "
                         "obstacle with an ambiguous predicted future). 0=off. Only used with --uncertainty.")
+    p.add_argument("--d-infl",         default=D_INFL, type=float,
+                   help="MPPI obstacle influence radius [m] — the distance at which the planner "
+                        "STARTS bending around an obstacle. Raise it (e.g. 40-60) for long-range "
+                        "planning, e.g. the 'converging' scenario. Must stay >= --d-safe.")
+    p.add_argument("--d-safe",         default=D_SAFE, type=float,
+                   help="Hard keep-out radius [m] for the CBF barrier and the BIG close-in penalty. "
+                        "Governs close-in avoidance; leave at default unless you want a larger "
+                        "physical standoff. Must stay <= --d-infl.")
+    p.add_argument("--info-range",     default=INFO_RANGE, type=float,
+                   help="Radius [m] of the uncertainty (belief-entropy) caution term. Raise it to "
+                        "match --d-infl so the ego slows for ambiguous distant threats. Only used "
+                        "with --uncertainty.")
     args = p.parse_args()
+
+    if args.d_infl < args.d_safe:
+        p.error(f"--d-infl ({args.d_infl}) must be >= --d-safe ({args.d_safe}): "
+                "the soft influence ring cannot be inside the hard keep-out radius.")
 
     sc_int = -1 if args.scenario == "mixed" else SCENARIO_NAMES.index(args.scenario)
     run(unity_exec_path=args.exec if args.exec != "None" else None,
@@ -1134,4 +1297,7 @@ if __name__ == "__main__":
         uncertainty=args.uncertainty,
         cvar_alpha=args.cvar_alpha,
         n_scenarios=args.n_scenarios,
-        w_info=args.w_info)
+        w_info=args.w_info,
+        d_infl=args.d_infl,
+        d_safe=args.d_safe,
+        info_range=args.info_range)
