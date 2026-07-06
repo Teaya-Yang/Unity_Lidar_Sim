@@ -45,6 +45,7 @@ import argparse
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.base_env import ActionTuple
 from mlagents_envs.exception import UnityCommunicatorStoppedException
+from value_net import ValueFunction, terminal_features
 from mlagents_envs.side_channel.environment_parameters_channel import (
     EnvironmentParametersChannel,
 )
@@ -123,6 +124,15 @@ LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed 
 BIG = 300.0
 
 SIG_D_BYPASS  = 0.70  # genuinely wider steering noise (2× SIG_D) so rollouts sample real go-arounds
+
+# ── Learned terminal value (value_net.py) ─────────────────────────────────────
+# Optional: a belief-conditioned cost-to-go V(s,b) evaluated at each rollout's
+# ENDPOINT and added to the MPPI cost, so anticipation beyond the 4 s horizon is
+# learned from data instead of hand-tuned gates. Off unless --value-net is given.
+#   cost += W_TERM · GAMMA_VALUE^H_MPPI · V(terminal_features)
+VALUE_NET   = None    # ValueFunction instance, loaded from --value-net <ckpt.npz>
+W_TERM      = 0.5     # weight of the terminal term (0 = ignore the net; sweep upward)
+GAMMA_VALUE = 0.99    # discount used for the value targets — MUST match train_value.py --gamma
 ALPHA_W_GOAROUND = 0.2  # QP steering weight during go-around (vs ALPHA_W=6 normally)
 
 # ── Uncertainty-aware MPPI (scenario-based prediction + CVaR) ─────────────────
@@ -216,14 +226,19 @@ class RLDataRecorder:
     def __init__(self):
         self.obs, self.actions, self.rewards = [], [], []
         self.next_obs, self.terminals, self.task_ids = [], [], []
+        self.beliefs = []   # (K_OBS, 3) per-slot route posteriors, for V(s,b) training
 
-    def store_step(self, obs, action, reward, next_obs, done, task_id):
+    def store_step(self, obs, action, reward, next_obs, done, task_id, beliefs=None):
         self.obs.append(np.asarray(obs, dtype=np.float32).copy())
         self.actions.append(np.asarray(action, dtype=np.float32).copy())
         self.rewards.append(float(reward))
         self.next_obs.append(np.asarray(next_obs, dtype=np.float32).copy())
         self.terminals.append(bool(done))
         self.task_ids.append(int(task_id))
+        if beliefs is None:   # uniform prior for steps with no tracked obstacles
+            beliefs = np.full((K_OBS, len(ROUTE_HYPOTHESES)),
+                              1.0 / len(ROUTE_HYPOTHESES), dtype=np.float32)
+        self.beliefs.append(np.asarray(beliefs, dtype=np.float32).copy())
 
     def __len__(self):
         return len(self.obs)
@@ -241,6 +256,7 @@ class RLDataRecorder:
             next_observations=np.array(self.next_obs, dtype=np.float32),
             terminals=np.array(self.terminals,   dtype=bool),
             task_ids=np.array(self.task_ids,     dtype=np.int32),
+            beliefs=np.array(self.beliefs,       dtype=np.float32),
         )
         # Per-task transition counts help spot under-represented tasks in the dataset.
         uniq, counts = np.unique(self.task_ids, return_counts=True)
@@ -315,6 +331,31 @@ def obs_to_state(obs: np.ndarray, prev_delta: float = 0.0, prev_accel: float = 0
         obstacles.append((rel_xy, obs_v))
 
     return s, obstacles, goal, frenet, np.array([tan_x, tan_z])
+
+
+def beliefs_to_slots(obs: np.ndarray, beliefs) -> np.ndarray:
+    """
+    Map the tracker's per-obstacle belief list (aligned with obs_to_state's FILTERED
+    obstacle list) back onto the K_OBS observation slots, for the dataset recorder.
+    Skipped slots (sentinel padding / beyond detection range) get the uniform prior —
+    the same convention value_net.features_from_obs uses for invalid slots.
+    """
+    n_route = len(ROUTE_HYPOTHESES)
+    M = np.full((K_OBS, n_route), 1.0 / n_route, dtype=np.float32)
+    if beliefs is None:
+        return M
+    j = 0   # index into the filtered obstacle/belief lists
+    for i in range(K_OBS):
+        base = 4 + i * 4
+        dx, dy = float(obs[base]), float(obs[base + 1])
+        if abs(dy) > 900:
+            continue                        # padded slot — never entered the list
+        if np.hypot(dx, dy) > DETECTION_RANGE:
+            continue                        # masked by sensor range — ditto
+        if j < len(beliefs) and beliefs[j] is not None:
+            M[i] = np.asarray(beliefs[j], dtype=np.float32)
+        j += 1
+    return M
 
 
 def inject_sensor_noise(obs: np.ndarray, noise_std: float, rng_local) -> np.ndarray:
@@ -661,6 +702,18 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
     if scen is not None:
         cost += _cvar(cost_obs_scen, CVAR_ALPHA)
 
+    # Learned terminal value: predicted cost-to-go from each rollout's ENDPOINT,
+    # discounted to be commensurate with the summed stage costs. Rollouts that END
+    # prepared (offset, moderated speed vs. ambiguous traffic) win the softmax even
+    # though their payoff lies beyond the horizon — learned anticipation replacing
+    # the hand-tuned early-reaction gates. st here is the final rollout state.
+    if VALUE_NET is not None:
+        X_term = terminal_features(
+            st, obstacles, beliefs, goal, T=H_MPPI * DT,
+            frenet_mode=frenet_mode, tangent=tangent,
+            d0=(d0 if frenet_mode else 0.0), s0_fwd=s0_fwd, s0_lat=s0_lat)
+        cost += W_TERM * (GAMMA_VALUE ** H_MPPI) * VALUE_NET(X_term)
+
     # Progress
     if frenet_mode:
         prog = tan_z * st[:, 0] + tan_x * st[:, 1]   # displacement along tangent
@@ -942,9 +995,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         noise_std=0.0, scenario_type=SCENARIO_STANDARD, no_cbf=False,
         detect_range=float("inf"), dataset_path=None,
         uncertainty=False, cvar_alpha=CVAR_ALPHA, n_scenarios=N_SCEN, w_info=W_INFO,
-        d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE):
+        d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
+        value_net_path=None, w_term=W_TERM):
     global DETECTION_RANGE, UNCERTAINTY, CVAR_ALPHA, N_SCEN, W_INFO
-    global D_INFL, D_SAFE, INFO_RANGE
+    global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     CVAR_ALPHA      = cvar_alpha
@@ -962,6 +1016,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
     if uncertainty:
         print(f"[Controller] Uncertainty    : ON  (N_SCEN={n_scenarios}, CVaR α={cvar_alpha}, "
               f"W_INFO={w_info})  scenario-based prediction + CVaR obstacle cost")
+    if value_net_path is not None:
+        VALUE_NET = ValueFunction.load(value_net_path)
+        W_TERM    = w_term
+        print(f"[Controller] Terminal value : ON  ({value_net_path}, W_TERM={w_term}, "
+              f"γ^H={GAMMA_VALUE**H_MPPI:.2f})  learned cost-to-go at rollout endpoints")
     env_params = EnvironmentParametersChannel()
     env = UnityEnvironment(
         file_name=unity_exec_path,
@@ -1014,10 +1073,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                   "incursion_dt": sc["incursion_dt"],
                   "difficulty": sc["difficulty"],
                   "scenario": SCENARIO_NAMES[task_id]}
-        # RL transition bookkeeping: hold the previous (obs, action) until the next
-        # obs arrives, so we can emit a complete (obs, action, reward, next_obs) tuple.
+        # RL transition bookkeeping: hold the previous (obs, action, beliefs) until the
+        # next obs arrives, so we can emit a complete (obs, action, reward, next_obs) tuple.
         prev_obs = None
         prev_act = None
+        prev_beliefs = None   # (K_OBS, 3) slot matrix paired with prev_obs
 
         for key, val in sc.items():
             env_params.set_float_parameter(key, val)
@@ -1055,7 +1115,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                     term_reward = -20.0 if ep_log["collided"] else 10.0
                     final_obs   = terminal_steps.obs[0][0]
                     recorder.store_step(prev_obs, prev_act, term_reward,
-                                        final_obs, True, task_id)
+                                        final_obs, True, task_id, prev_beliefs)
                 episode_done = True
                 break
 
@@ -1076,7 +1136,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             if prev_obs is not None:
                 step_reward = 0.05 * float(s[3])   # s[3] = current forward speed
                 recorder.store_step(prev_obs, prev_act, step_reward,
-                                    obs_n, False, task_id)
+                                    obs_n, False, task_id, prev_beliefs)
 
             if ep_steps % 20 == 0:
                 mode_str = f"[Frenet tan=({tangent[0]:.2f},{tangent[1]:.2f})]" if frenet_mode else "[global]"
@@ -1084,10 +1144,12 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                       f"th={s[2]:.3f} v={s[3]:.2f} δ={s[4]:.3f} a_act={s[5]:.2f}  "
                       f"{len(obstacles)} obs  goal={goal:.1f}")
 
-            # Update the per-obstacle route belief from this step's observations,
-            # then feed the live posteriors into MPPI's scenario prediction.
-            # beliefs is update at each timestamp, remember the MPPI account for one timestamp at time for that single episode.
-            beliefs = _tracker.update(obstacles) if UNCERTAINTY else None
+            # Update the per-obstacle route belief from this step's observations. The
+            # tracker now runs in EVERY mode (not just --uncertainty): the beliefs feed
+            # MPPI's scenario prediction when uncertainty is on, condition the terminal
+            # value V(s,b) when --value-net is set, and are logged with each recorded
+            # transition so V(s,b) can be trained from any dataset.
+            beliefs = _tracker.update(obstacles)
             u_nom, mean = mppi(s, mean, obstacles, goal, frenet_mode, tangent, beliefs)
 
             if no_cbf:
@@ -1137,9 +1199,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             action = ActionTuple(
                 continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)
             )
-            # Stash this (obs, action) so the next iteration can close the transition.
+            # Stash this (obs, action, beliefs) so the next iteration can close the transition.
             prev_obs = obs_n.copy()
             prev_act = np.array([a_cmd, delta_cmd], dtype=np.float32)
+            prev_beliefs = beliefs_to_slots(obs_n, beliefs)
 
             env.set_actions(behavior_name, action)
             try:
@@ -1274,6 +1337,12 @@ if __name__ == "__main__":
                    help="Radius [m] of the uncertainty (belief-entropy) caution term. Raise it to "
                         "match --d-infl so the ego slows for ambiguous distant threats. Only used "
                         "with --uncertainty.")
+    p.add_argument("--value-net",      default=None,
+                   help="Path to a value_net checkpoint (.npz from train_value.py). Enables the "
+                        "learned terminal cost-to-go V(s,b) at MPPI rollout endpoints.")
+    p.add_argument("--w-term",         default=W_TERM, type=float,
+                   help="Weight of the learned terminal value term. 0 disables it even with "
+                        "--value-net loaded; sweep upward from 0.5. Only used with --value-net.")
     args = p.parse_args()
 
     if args.d_infl < args.d_safe:
@@ -1298,4 +1367,6 @@ if __name__ == "__main__":
         w_info=args.w_info,
         d_infl=args.d_infl,
         d_safe=args.d_safe,
-        info_range=args.info_range)
+        info_range=args.info_range,
+        value_net_path=args.value_net,
+        w_term=args.w_term)
