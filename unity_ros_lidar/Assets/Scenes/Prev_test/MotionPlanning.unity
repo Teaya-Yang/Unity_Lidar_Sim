@@ -1789,7 +1789,7 @@ MonoBehaviour:
   network: {fileID: 1651804279}
   maxEgoTurnDeg: 35
   minEgoPathLength: 60
-  maxEgoGoalDist: 180
+  maxEgoGoalDist: 300
   minObstacleSpawnDist: 15
   episodeReachSeconds: 20
   headOnApproachGap: 50

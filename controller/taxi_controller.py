@@ -58,13 +58,13 @@ V_DES     = 8.0          # desired taxi speed [m/s]
 W_HALF    = 10.0         # taxiway half-width [m]
 D_SAFE    = 10.0          # keep-out radius [m]
 D_INFL    = 16.0         # MPPI obstacle influence radius [m]
-UNC_GROWTH  = 1.5        # influence-ring inflation rate [m/s of prediction time]. The constant-
-                         # velocity obstacle prediction is exact at t=0 but increasingly wrong later
-                         # in the horizon (the agent may turn/brake), so the required clearance grows
-                         # with prediction time: ring(t) = D_INFL + UNC_GROWTH·t. Far-future
-                         # encounters therefore demand WIDE margins — pushing the ego to commit to
-                         # its lateral offset EARLY, while near-term predictions keep the tight ring.
-UNC_GROWTH_MAX = 8.0     # cap on the inflation [m] so the ring can't grow unbounded on long horizons
+UNC_GROWTH  = 1.0        # influence-ring inflation rate [m/s of prediction time], applied ONLY to
+                         # frontal blockers being passed (see the deterministic obstacle branch).
+                         # The constant-velocity prediction degrades with t, so the pass clearance
+                         # grows mildly with prediction time. NOT applied to crossers/convergers:
+                         # an inflated ring covers the whole lane and its lateral gradient shoves
+                         # the ego off-road when braking in-lane is the right response.
+UNC_GROWTH_MAX = 4.0     # cap on the inflation [m] so the ring can't grow unbounded on long horizons
 D_INFL_PASS = 15.0       # influence ring for a FRONTAL blocker being passed (go-around) [m]. Must sit
                          # well ABOVE D_SAFE so there's a wide soft band that builds lateral offset
                          # early; if it's only ~1 m above D_SAFE the ego feels the agent only at the
@@ -124,6 +124,18 @@ LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed 
 BIG = 300.0
 
 SIG_D_BYPASS  = 0.70  # genuinely wider steering noise (2× SIG_D) so rollouts sample real go-arounds
+
+# ── LiDAR static-obstacle costmap (lidar_costmap.py) ──────────────────────────
+# Optional: a 2-D distance field built from the published PointCloud2 each control
+# step. Gives walls / parked aircraft / buildings — objects the oracle observation
+# never contained — a uniform, shape-true margin in MPPI. Off unless --lidar-costmap.
+# Static objects don't chase the ego, so their rings are much tighter than the
+# D_SAFE/D_INFL used for moving traffic. D_SAFE_STATIC also absorbs the ≤ v·Δt
+# (~0.8 m) staleness of using the latest cloud one control period late.
+LIDAR_COSTMAP  = None    # LidarCostmap instance when --lidar-costmap is set
+W_STATIC       = 8.0     # weight of the static-surface soft ring
+D_SAFE_STATIC  = 3.0     # hard keep-out from any observed static surface [m]
+D_INFL_STATIC  = 7.0     # soft influence ring around static surfaces [m]
 
 # ── Learned terminal value (value_net.py) ─────────────────────────────────────
 # Optional: a belief-conditioned cost-to-go V(s,b) evaluated at each rollout's
@@ -585,8 +597,11 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
         # PATH BENDS — an oncoming agent beyond the bend projects far off the straight tangent
         # (|lat_d| > W_HALF) even though it is driving straight at the ego, dropping the ego back
         # to full braking/full ring (the freeze). The radial test below covers that case.
+        # Movers must be ONCOMING (velocity mostly anti-parallel to the ego heading) to earn the
+        # go-around; a mover merely drifting closer while crossing/converging should be handled by
+        # braking in-lane, not by leaving the lane. Static blockers always qualify.
         in_corridor = 0 < fwd_d < D_BYPASS and abs(lat_d) < W_HALF \
-                      and (obs_spd < 2.0 or closing > 1.0)
+                      and (obs_spd < 2.0 or closing > 0.7 * obs_spd)
         # Radial (bend-robust) test: range shrinking AND the agent's velocity points mostly AT the
         # ego AND is mostly ANTI-PARALLEL to the ego's heading — i.e. genuinely ONCOMING traffic.
         # The anti-parallel condition matters: near an intersection a perpendicular crosser's
@@ -599,21 +614,23 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
         closing_rad = -float(rel @ ov) / max(dist, 1e-6)   # range rate toward the ego [m/s]
         aimed_at_us = (dist < D_BYPASS and obs_spd >= 2.0
                        and closing_rad > 0.7 * obs_spd      # range shrinking toward the ego
-                       and closing     > 0.5 * obs_spd)     # and oncoming along the ego heading
-        if in_corridor or aimed_at_us:
-            sig_d_eff  = SIG_D_BYPASS
-            w_off_eff  = W_OFF_BYPASS
-            w_lat_eff  = W_LAT_BYPASS
-            w_head_eff = W_HEAD_BYPASS
-            a_min_eff  = A_MIN_BYPASS
-            # Pass-sized soft ring for THIS frontal blocker (hard keep-out D_SAFE is unchanged).
-            d_infl_arr[oi] = D_INFL_PASS
-            # Give way EARLY to the side away from the nearest oncoming agent: steer to its own side
-            # (keep-right when the agent is dead ahead), so the ego is already offset by the time
-            # they meet instead of jinking at the last moment. lat_d > 0 ⇒ agent on the ego's left.
-            if dist < _nearest_frontal:
-                _nearest_frontal = dist
-                lane_bias = -HEADON_GIVEWAY if lat_d >= 0.0 else HEADON_GIVEWAY
+                       and closing     > 0.7 * obs_spd)     # and oncoming along the ego heading
+                       # 0.7 ⇒ only threats within ~45° of head-on get the go-around; steeper
+                       # approach angles (convergers, crossers) are yielded to by braking in-lane.
+        # if in_corridor or aimed_at_us:
+        #     sig_d_eff  = SIG_D_BYPASS
+        #     w_off_eff  = W_OFF_BYPASS
+        #     w_lat_eff  = W_LAT_BYPASS
+        #     w_head_eff = W_HEAD_BYPASS
+        #     a_min_eff  = A_MIN_BYPASS
+        #     # Pass-sized soft ring for THIS frontal blocker (hard keep-out D_SAFE is unchanged).
+        #     d_infl_arr[oi] = D_INFL_PASS
+        #     # Give way EARLY to the side away from the nearest oncoming agent: steer to its own side
+        #     # (keep-right when the agent is dead ahead), so the ego is already offset by the time
+        #     # they meet instead of jinking at the last moment. lat_d > 0 ⇒ agent on the ego's left.
+        #     if dist < _nearest_frontal:
+        #         _nearest_frontal = dist
+        #         lane_bias = -HEADON_GIVEWAY if lat_d >= 0.0 else HEADON_GIVEWAY
 
     noise = rng.normal(0, [SIG_A, sig_d_eff], (K_MPPI, H_MPPI, 2))
     na    = mean + noise
@@ -674,6 +691,17 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
         cost += W_V    * (vv - V_DES)**2
         cost += W_CTRL * (na[:, k, 0]**2 + 4. * na[:, k, 1]**2)
 
+        # Static world (LiDAR costmap): distance from each rollout point to the nearest
+        # OBSERVED static surface (walls, parked aircraft, buildings). Rollout displacement
+        # from the ego start is directly comparable to the ego-relative cloud frame. Static
+        # objects don't move, so no prediction — the same field applies at every k.
+        if LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            d_stat = LIDAR_COSTMAP.distance(
+                np.stack([fwd - s0_fwd, lat - s0_lat], axis=1))
+            cost += np.where(d_stat < D_INFL_STATIC,
+                             W_STATIC * (D_INFL_STATIC - d_stat)**2, 0.)
+            cost += np.where(d_stat < D_SAFE_STATIC, BIG, 0.)
+
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
         t_elapsed = (k + 1) * DT
         if scen is not None:
@@ -694,11 +722,17 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
                     prox   = np.maximum(0., 1. - d_mean / INFO_RANGE)  # (K,)
                     cost  += W_INFO * ent_b * prox * vv**2
         else:
-            # Prediction-time uncertainty: the constant-velocity forecast degrades with t, so the
-            # soft ring inflates (ring + UNC_GROWTH·t, capped)
+            # Prediction-time uncertainty: the constant-velocity forecast degrades with t, so
+            # the soft ring inflates mildly (ring + UNC_GROWTH·t, capped). Inflation is applied
+            # ONLY to frontal blockers being passed (the gate already relaxed their lane costs);
+            # for everything else — crossers, convergers — the ring stays NOMINAL, because an
+            # inflated ring covers the whole lane and its gradient shoves the ego sideways when
+            # the right answer is to brake IN-LANE and let the agent clear.
             infl_t = min(UNC_GROWTH * t_elapsed, UNC_GROWTH_MAX)
             for oi, (rel_xy, obs_v) in enumerate(obstacles):
-                di, ds = d_infl_arr[oi] + infl_t, d_safe_arr[oi]
+                di, ds = d_infl_arr[oi], d_safe_arr[oi]
+                if d_infl_arr[oi] != D_INFL:      # gate marked this one a frontal pass
+                    di = di + infl_t
                 obs_z = s0_fwd + rel_xy[0] + obs_v[0] * t_elapsed
                 obs_x = s0_lat + rel_xy[1] + obs_v[1] * t_elapsed
                 d_obs = np.hypot(fwd - obs_z, lat - obs_x)
@@ -1004,9 +1038,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         detect_range=float("inf"), dataset_path=None,
         uncertainty=False, cvar_alpha=CVAR_ALPHA, n_scenarios=N_SCEN, w_info=W_INFO,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
-        value_net_path=None, w_term=W_TERM, pin_episode=None):
+        value_net_path=None, w_term=W_TERM, pin_episode=None,
+        lidar_costmap=False, lidar_topic="/point_cloud"):
     global DETECTION_RANGE, UNCERTAINTY, CVAR_ALPHA, N_SCEN, W_INFO
-    global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM
+    global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM, LIDAR_COSTMAP
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     CVAR_ALPHA      = cvar_alpha
@@ -1029,6 +1064,17 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         W_TERM    = w_term
         print(f"[Controller] Terminal value : ON  ({value_net_path}, W_TERM={w_term}, "
               f"γ^H={GAMMA_VALUE**H_MPPI:.2f})  learned cost-to-go at rollout endpoints")
+    if lidar_costmap:
+        from lidar_costmap import LidarCostmap
+        cm = LidarCostmap()
+        if cm.start(topic=lidar_topic):
+            LIDAR_COSTMAP = cm
+            print(f"[Controller] LiDAR costmap  : ON  (topic={lidar_topic}, "
+                  f"D_SAFE_STATIC={D_SAFE_STATIC:.1f} m, D_INFL_STATIC={D_INFL_STATIC:.1f} m) "
+                  f"— static surfaces enter the MPPI cost")
+        else:
+            print("[Controller] LiDAR costmap  : requested but unavailable (no rclpy) — "
+                  "running WITHOUT static-obstacle avoidance")
     env_params = EnvironmentParametersChannel()
     env = UnityEnvironment(
         file_name=unity_exec_path,
@@ -1170,6 +1216,12 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             # value V(s,b) when --value-net is set, and are logged with each recorded
             # transition so V(s,b) can be trained from any dataset.
             beliefs = _tracker.update(obstacles)
+
+            # Rebuild the LiDAR static-obstacle field from the latest cloud, scrubbing
+            # returns near the known dynamic agents (the oracle pipeline handles those).
+            if LIDAR_COSTMAP is not None:
+                LIDAR_COSTMAP.update([rel for rel, _ in obstacles])
+
             u_nom, mean = mppi(s, mean, obstacles, goal, frenet_mode, tangent, beliefs)
 
             if no_cbf:
@@ -1368,6 +1420,13 @@ if __name__ == "__main__":
                         "obstacles, same timings). Use to hand-place occluders/buildings at a "
                         "known map location in the Unity editor and test against it repeatedly. "
                         "Try different SEED values to pick a location you like.")
+    p.add_argument("--lidar-costmap",  action="store_true",
+                   help="Build a static-obstacle distance field from the published PointCloud2 "
+                        "each control step and add it to the MPPI cost — walls/parked aircraft/"
+                        "buildings get a uniform margin (D_SAFE_STATIC). Needs ROS 2 sourced "
+                        "(rclpy) and the ros_tcp_endpoint running.")
+    p.add_argument("--lidar-topic",    default="/point_cloud",
+                   help="PointCloud2 topic for --lidar-costmap. Default: /point_cloud.")
     args = p.parse_args()
 
     if args.d_infl < args.d_safe:
@@ -1395,4 +1454,6 @@ if __name__ == "__main__":
         info_range=args.info_range,
         value_net_path=args.value_net,
         w_term=args.w_term,
-        pin_episode=args.pin_episode)
+        pin_episode=args.pin_episode,
+        lidar_costmap=args.lidar_costmap,
+        lidar_topic=args.lidar_topic)
