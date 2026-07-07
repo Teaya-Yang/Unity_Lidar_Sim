@@ -1002,9 +1002,6 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 4473652613745982}
-  - component: {fileID: -5394690387771280385}
-  - component: {fileID: 1143836346744944922}
-  - component: {fileID: 34820872403075945}
   m_Layer: 0
   m_Name: Ambulance_no_damage
   m_TagString: Untagged
@@ -1060,72 +1057,6 @@ Transform:
   - {fileID: 4411973597542342}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
---- !u!114 &-5394690387771280385
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1181029763419816}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 6680789e3f721232b9c4c229c25a9316, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: Assembly-CSharp::ErraticVehicle
-  minSpeed: 4
-  maxSpeed: 12
-  rotationSpeed: 3
-  waypointReachedDistance: 2
-  wanderRadius: 40
-  stopProbabilityPerSecond: 0
-  minStopDuration: 1
-  maxStopDuration: 5
-  separationRadius: 1
-  separationStrength: 0.5
-  followDistance: 12
-  stopDistance: 4
-  laneHalfWidth: 3
-  airplane: {fileID: 0}
-  reactionRadius: 30
-  pullOverOnReaction: 1
-  fixedRoute: []
---- !u!65 &1143836346744944922
-BoxCollider:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1181029763419816}
-  m_Material: {fileID: 0}
-  m_IncludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_ExcludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_LayerOverridePriority: 0
-  m_IsTrigger: 1
-  m_ProvidesContacts: 1
-  m_Enabled: 1
-  serializedVersion: 3
-  m_Size: {x: 0.4, y: 0.35, z: 0.9}
-  m_Center: {x: 0, y: 0.18, z: 0.09}
---- !u!208 &34820872403075945
-NavMeshObstacle:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1181029763419816}
-  m_Enabled: 1
-  serializedVersion: 3
-  m_Shape: 1
-  m_Extents: {x: 0.2, y: 0.175, z: 0.45}
-  m_MoveThreshold: 0.1
-  m_Carve: 0
-  m_CarveOnlyStationary: 1
-  m_Center: {x: 0, y: 0.18, z: 0.09}
-  m_TimeToStationary: 0.5
 --- !u!1 &1291643672898436
 GameObject:
   m_ObjectHideFlags: 0
