@@ -588,10 +588,18 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
         in_corridor = 0 < fwd_d < D_BYPASS and abs(lat_d) < W_HALF \
                       and (obs_spd < 2.0 or closing > 1.0)
         # Radial (bend-robust) test: range shrinking AND the agent's velocity points mostly AT the
-        # ego (true for head-on traffic on any path geometry; false for crossers, whose velocity
-        # aims at the conflict point, not the ego).
+        # ego AND is mostly ANTI-PARALLEL to the ego's heading — i.e. genuinely ONCOMING traffic.
+        # The anti-parallel condition matters: near an intersection a perpendicular crosser's
+        # velocity also points roughly at the ego (the conflict point is where the ego will be),
+        # and radial closing alone tripped the go-around — sending the ego OFF-LANE to dodge a
+        # crosser it should yield to by BRAKING IN-LANE (lateral offset barely increases separation
+        # from crossing traffic, and off-pavement there may be unobserved parked obstacles).
+        # cos gates: crosser at 90° has closing ≈ 0 → never fires; head-on around a ≤45° bend has
+        # closing ≈ 0.7·spd → still fires.
         closing_rad = -float(rel @ ov) / max(dist, 1e-6)   # range rate toward the ego [m/s]
-        aimed_at_us = dist < D_BYPASS and obs_spd >= 2.0 and closing_rad > 0.7 * obs_spd
+        aimed_at_us = (dist < D_BYPASS and obs_spd >= 2.0
+                       and closing_rad > 0.7 * obs_spd      # range shrinking toward the ego
+                       and closing     > 0.5 * obs_spd)     # and oncoming along the ego heading
         if in_corridor or aimed_at_us:
             sig_d_eff  = SIG_D_BYPASS
             w_off_eff  = W_OFF_BYPASS
@@ -996,7 +1004,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         detect_range=float("inf"), dataset_path=None,
         uncertainty=False, cvar_alpha=CVAR_ALPHA, n_scenarios=N_SCEN, w_info=W_INFO,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
-        value_net_path=None, w_term=W_TERM):
+        value_net_path=None, w_term=W_TERM, pin_episode=None):
     global DETECTION_RANGE, UNCERTAINTY, CVAR_ALPHA, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM
     DETECTION_RANGE = detect_range
@@ -1055,6 +1063,18 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
     scenarios     = make_scenarios(n_episodes, min_difficulty=min_difficulty,
                                               max_difficulty=max_difficulty,
                                               scenario_type=scenario_type)
+    # --pin-episode: replay ONE fixed scenario every episode. The pinned episode_seed makes
+    # Unity's per-episode RNG (ego path pick, obstacle assignment, timings) fully deterministic,
+    # so the ego spawns at the SAME map location each episode — for hand-placing occluders /
+    # buildings in the editor and iterating on one repeatable situation.
+    if pin_episode is not None:
+        pinned = make_scenarios(1, base_seed=pin_episode,
+                                min_difficulty=min_difficulty,
+                                max_difficulty=max_difficulty,
+                                scenario_type=scenario_type)[0]
+        scenarios = [dict(pinned) for _ in range(n_episodes)]
+        print(f"[Controller] Pinned episode  : seed={pin_episode} — identical scenario every "
+              f"episode (ego path, obstacles, timings all repeat)")
     episode_stats = []
     recorder      = RLDataRecorder()   # accumulates (s,a,r,s') transitions for offline RL
 
@@ -1343,6 +1363,11 @@ if __name__ == "__main__":
     p.add_argument("--w-term",         default=W_TERM, type=float,
                    help="Weight of the learned terminal value term. 0 disables it even with "
                         "--value-net loaded; sweep upward from 0.5. Only used with --value-net.")
+    p.add_argument("--pin-episode",    default=None, type=int, metavar="SEED",
+                   help="Replay one fixed scenario every episode (same ego spawn/path, same "
+                        "obstacles, same timings). Use to hand-place occluders/buildings at a "
+                        "known map location in the Unity editor and test against it repeatedly. "
+                        "Try different SEED values to pick a location you like.")
     args = p.parse_args()
 
     if args.d_infl < args.d_safe:
@@ -1369,4 +1394,5 @@ if __name__ == "__main__":
         d_safe=args.d_safe,
         info_range=args.info_range,
         value_net_path=args.value_net,
-        w_term=args.w_term)
+        w_term=args.w_term,
+        pin_episode=args.pin_episode)

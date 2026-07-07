@@ -129,6 +129,10 @@ public class TaxiwayNetwork : MonoBehaviour
 
     // ── Public API ────────────────────────────────────────────────────────────
 
+    // Right-click the component header in the Inspector → "Load Map Data" to parse the
+    // GeoJSON in EDIT mode, so the network gizmos are visible without pressing Play
+    // (e.g. while hand-placing occluders/buildings along a known taxiway).
+    [ContextMenu("Load Map Data")]
     public void LoadMapData()
     {
         _paths.Clear();
@@ -432,12 +436,29 @@ public class TaxiwayNetwork : MonoBehaviour
 
     // ── Gizmos ────────────────────────────────────────────────────────────────
 
+    bool _editorLoadTried;   // avoid re-parsing every gizmo frame when the file is missing
+
     void OnDrawGizmosSelected()
     {
+        // Edit mode: Awake() hasn't run, so lazily parse the GeoJSON once — makes the
+        // network visible in the Scene view without entering Play mode.
+        if (_paths.Count == 0 && !Application.isPlaying && !_editorLoadTried)
+        {
+            _editorLoadTried = true;
+            LoadMapData();
+        }
         if (_paths == null) return;
         for (int pi = 0; pi < _paths.Count; pi++)
         {
-            Gizmos.color = Color.HSVToRGB(pi / (float)Mathf.Max(_paths.Count, 1), 0.8f, 1f);
+            // Colour by feature type so aprons (parking = occluder candidates) stand out:
+            // taxiway = yellow, runway = red, apron = cyan, other = grey.
+            switch (_paths[pi].AerowayType)
+            {
+                case "taxiway": Gizmos.color = Color.yellow;              break;
+                case "runway":  Gizmos.color = Color.red;                 break;
+                case "apron":   Gizmos.color = Color.cyan;                break;
+                default:        Gizmos.color = new Color(.6f, .6f, .6f);  break;
+            }
             var wps = _paths[pi].Waypoints;
             for (int i = 0; i < wps.Count - 1; i++)
             {
