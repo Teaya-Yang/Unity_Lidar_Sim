@@ -49,6 +49,7 @@ import numpy as np
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import PointCloud2
     from geometry_msgs.msg import PoseStamped, Pose
     _HAS_RCLPY = True
@@ -200,16 +201,16 @@ class LidarCostmap:
 
     def __init__(self,
                  size_m: float = 100.0, res: float = 0.5,
-                 sensor_height: float = 2.0,
+                 sensor_height: float = 3.45,
                  min_obstacle_height: float = 0.4, max_obstacle_height: float = 12.0,
                  min_range: float = 1.0, dyn_mask_radius: float = 6.0,
                  max_age: float = 0.5,
                  free_ttl: float = 4.0, occ_ttl: float = 12.0, carve_samples: int = 80,
                  # visibility params
-                 roi_range: float = 40.0, roi_half_angle_deg: float = 60.0,
-                 max_roi_cells: int = 48,
+                 roi_range: float = 30.0, roi_half_angle_deg: float = 70.0,
+                 max_roi_cells: int = 30,
                  cand_reach: float = 30.0, cand_res: float = 2.0,
-                 los_samples: int = 24):
+                 los_samples: int = 40):
         self.res  = float(res)
         self.half = float(size_m) / 2.0
         self.z_lo = -sensor_height + min_obstacle_height
@@ -261,9 +262,16 @@ class LidarCostmap:
         class _Sub(Node):
             def __init__(self):
                 super().__init__("mppi_lidar_costmap")
-                self.create_subscription(PointCloud2, topic, self._cloud, 5)
+                # Sensor-data QoS (BEST_EFFORT/VOLATILE): the ros_tcp_endpoint bridge commonly
+                # publishes streamed sensor topics best-effort. A default (RELIABLE) subscriber
+                # is INCOMPATIBLE with a best-effort publisher per the DDS QoS spec — both sides
+                # come up cleanly, no error either side, but zero messages ever cross. That
+                # silent mismatch is the most common cause of "subscribed OK but ready=False".
+                qos = qos_profile_sensor_data
+                self.create_subscription(PointCloud2, topic, self._cloud, qos)
                 # Unity publishes a bare Pose; accept PoseStamped too.
-                self.create_subscription(Pose, pose_topic, self._pose_cb, 5)
+                self.create_subscription(Pose, pose_topic, self._pose_cb, qos)
+                self._got_cloud = self._got_pose = False   # one-shot confirmation logs
 
             def _cloud(self, msg):
                 pts = outer._parse_cloud(msg)
@@ -271,11 +279,19 @@ class LidarCostmap:
                     with outer._lock:
                         outer._pts = pts
                         outer._stamp = time.monotonic()
+                    if not self._got_cloud:
+                        self._got_cloud = True
+                        print(f"[LidarCostmap] first /point_cloud message received "
+                              f"({len(pts)} valid pts)")
 
             def _pose_cb(self, msg):
                 p = msg.position
                 with outer._lock:
                     outer._pose = (float(p.z), float(p.x))   # world (a0, a1)
+                if not self._got_pose:
+                    self._got_pose = True
+                    print(f"[LidarCostmap] first /laser_scan_pose message received "
+                          f"(a0={p.z:.1f}, a1={p.x:.1f})")
 
         self._node = _Sub()
         self._thread = threading.Thread(target=rclpy.spin, args=(self._node,), daemon=True)

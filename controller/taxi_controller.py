@@ -100,28 +100,15 @@ SIG_A     = 1.0          # noise std for acceleration samples
 SIG_D     = 0.35         # noise std for steering samples
 
 # MPPI stage costs
-W_LAT, W_HEAD, W_V, W_CTRL = 3.0, 6.0, 1.2, 0.05
+W_LAT, W_HEAD, W_V, W_CTRL = 0.05, 2.0, 1.2, 0.05
 # W_OBS lowered and W_PROG raised (was 12.0 / 0.4) so forward progress competes with the obstacle
 # penalty. On a head-on pass the ego can't keep D_SAFE either way (the oncoming agent comes to it),
 # so an over-weighted W_OBS made "stop and wait" the cheapest option; a stronger progress pull makes
 # driving through win. Trade-off: the ego is slightly less conservative around crossers/convergers.
 W_OBS, W_OFF, W_PROG        = 2.0, 2.0, 1.0
-# Go-around (bypass) lane costs — relaxed vs the nominal W_LAT/W_OFF so that, once a frontal threat
-# is ahead, MPPI is free to sit off the centreline and slip past instead of being pulled straight
-# back into the obstacle. (Previously W_OFF_BYPASS=3.0 was *stricter* than W_OFF and W_LAT was never
-# relaxed, so the "bypass" couldn't actually leave the lane.)
-W_LAT_BYPASS  = 0.5   # relaxed cross-track pull during a go-around (vs W_LAT=3.0)
-W_OFF_BYPASS  = 1.0   # relaxed off-taxiway penalty during a go-around (vs W_OFF=2.0)
-W_HEAD_BYPASS = 2.0   # relaxed heading cost during a go-around (vs W_HEAD=6.0) so committing to
-                      # the yaw needed to swerve is cheap.
-A_MIN_BYPASS  = -1.5  # capped braking during a go-around (vs A_MIN=-4.0). Braking to ~0 kills
-                      # steering authority (dθ = v/L·tanδ → 0 at v≈0), stranding the ego in-lane;
-                      # keeping speed lets it STEER clear instead of stopping in front of the agent.
-D_BYPASS     = 70.0   # trigger range: frontal on-lane obstacle within this distance [m]. Larger so
-                      # the go-around (wide steering, relaxed lane, capped braking) engages EARLY —
-                      # the ego starts easing aside well before the fast closer is on top of it.
+
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
-BIG = 300.0
+BIG = 200.0
 
 SIG_D_BYPASS  = 0.70  # genuinely wider steering noise (2× SIG_D) so rollouts sample real go-arounds
 
@@ -144,7 +131,14 @@ D_INFL_STATIC  = 7.0     # soft influence ring around static surfaces [m]
 # there IS occluded relevant space (empty ROI ⇒ term is zero ⇒ nominal). Off
 # unless --visibility-cost. Enables the same LidarCostmap as --lidar-costmap.
 VISIBILITY_COST = False
-W_VIS           = 3.0    # weight on the per-step hidden-fraction (sweep from ~2-4)
+W_VIS           = 10.0    # weight on the per-step hidden-fraction. hidden ∈ [0,1] is bounded, so it
+                         # needs a large weight AND the investigate-mode relaxation below to compete
+                         # with the quadratic lane cost.
+# Investigate mode: gates a temporary relaxation of lane-keeping AND steering-noise width (see
+# mppi()) when LIDAR_COSTMAP.peek_gain says a reachable position would meaningfully reduce the
+# hidden ROI fraction. Self-gating: no occlusion worth investigating → both stay nominal.
+INVESTIGATE_GAIN_MIN = 0.12   # min reachable hidden-fraction reduction to trigger investigate mode
+W_LAT_INVESTIGATE    = 0.2    # relaxed cross-track weight while investigating (vs W_LAT=3.0)
 
 # ── Learned terminal value (value_net.py) ─────────────────────────────────────
 # Optional: a belief-conditioned cost-to-go V(s,b) evaluated at each rollout's
@@ -633,9 +627,10 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
             # Track lane_bias (the give-way offset) rather than the centreline when oncoming traffic
             # is ahead, so the ego eases to its own side early. The off-taxiway penalty still uses
             # absolute cross-track, so the ego stays on the pavement.
-            cost += w_lat_eff  * (d_t - lane_bias)**2
-            cost += w_head_eff * theta_e**2
-            cost += np.where(np.abs(d_t) > W_HALF, w_off_eff * (np.abs(d_t) - W_HALF)**2, 0.)
+            cost += w_lat_eff  * np.abs(d_t - lane_bias)
+            print("LAT_COST =", w_lat_eff  * np.abs(d_t - lane_bias)[:5])
+            #cost += w_head_eff * theta_e**2
+            #cost += np.where(np.abs(d_t) > W_HALF, w_off_eff * (np.abs(d_t) - W_HALF)**2, 0.)
         else:
             cost += w_lat_eff  * (lat - lane_bias)**2
             cost += w_head_eff * th**2
@@ -648,9 +643,11 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
         # which the occluded, path-relevant region stays hidden. Zero when the ROI is empty, so
         # behaviour is nominal unless there is genuinely occluded space worth seeing. (The static-
         # obstacle distance cost from the same map is intentionally disabled here — visibility only.)
+
         if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             pts_rel = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
-            cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(pts_rel)
+            cost += W_VIS * (LIDAR_COSTMAP.hidden_fraction(pts_rel))
+            print("VIS_COST =", W_VIS * (LIDAR_COSTMAP.hidden_fraction(pts_rel)[:5]))
 
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
         t_elapsed = (k + 1) * DT
