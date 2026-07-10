@@ -757,6 +757,37 @@ MeshCollider:
   m_Convex: 0
   m_CookingOptions: 30
   m_Mesh: {fileID: -2009745383818241702, guid: 63acf3fb5905fd843b4e8f044246ee10, type: 3}
+--- !u!1 &561364482
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 561364483}
+  m_Layer: 0
+  m_Name: start
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &561364483
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 561364482}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 108.9, y: 0.00002, z: 154.6}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &617769492 stripped
 GameObject:
   m_CorrespondingSourceObject: {fileID: 1038379840033536, guid: e88383b28fa9049408fb72235350effe, type: 3}
@@ -2450,6 +2481,37 @@ MeshCollider:
   m_Convex: 0
   m_CookingOptions: 30
   m_Mesh: {fileID: 2959467708922500008, guid: 1969077d58e18384dbec397ec49e985c, type: 3}
+--- !u!1 &1558885025
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1558885026}
+  m_Layer: 0
+  m_Name: start (1)
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &1558885026
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1558885025}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 106.7, y: 0.00002, z: 253.4}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &1592401317 stripped
 GameObject:
   m_CorrespondingSourceObject: {fileID: 1159056185390114, guid: e88383b28fa9049408fb72235350effe, type: 3}
@@ -2746,6 +2808,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 1acfeab23f1d0e084ac6d7b8752855ba, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::TaxiScenarioManager
+  manualTwoPointMode: 1
+  egoStartMarker: {fileID: 561364483}
+  egoGoalMarker: {fileID: 1558885026}
   incursionPrefab: {fileID: 985866007}
   maxAgents: 3
   conflictPoints:
@@ -3429,3 +3494,5 @@ SceneRoots:
   - {fileID: 239363171}
   - {fileID: 1089279841}
   - {fileID: 1268898168}
+  - {fileID: 561364483}
+  - {fileID: 1558885026}

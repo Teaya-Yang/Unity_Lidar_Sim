@@ -32,6 +32,16 @@ public enum ScenarioType
 /// </summary>
 public class TaxiScenarioManager : MonoBehaviour
 {
+    [Header("Two-point sandbox mode (ignores ALL scenario/episode/difficulty logic)")]
+    [Tooltip("When ON: no scenario agents are spawned. The ego is placed at Ego Start Marker facing " +
+             "down its taxiway toward Ego Goal Marker, and drives there under the MPPI cost. Drop two " +
+             "empty GameObjects on the (always-drawn) taxiways for the two markers.")]
+    public bool manualTwoPointMode = false;
+    [Tooltip("EGO START: the plane spawns here, on the nearest taxiway, facing toward the goal.")]
+    public Transform egoStartMarker;
+    [Tooltip("GOAL: where the ego taxis to (projected onto the ego's start taxiway).")]
+    public Transform egoGoalMarker;
+
     [Header("Prefab")]
     public GameObject incursionPrefab;
     public int        maxAgents = 3;
@@ -165,6 +175,14 @@ public class TaxiScenarioManager : MonoBehaviour
     // runway. TaxiAgent reads this for the goal observation and the reached-goal test.
     public float EgoGoalS { get; private set; }
 
+    // ── Two-point mode outputs (read by TaxiAgent) ──────────────────────────────
+    // Orients the lane tangent to the travel direction toward the goal: +1 with the taxiway's
+    // stored waypoint order, -1 against it. Always +1 in scenario mode (goal at higher arc).
+    public float   EgoPathSign  { get; private set; } = 1f;
+    public bool    EgoHasSpawn  { get; private set; }        // teleport ego to EgoSpawnPos/EgoTravelDir?
+    public Vector3 EgoSpawnPos  { get; private set; }
+    public Vector3 EgoTravelDir { get; private set; } = Vector3.forward;
+
     // ── internal ───────────────────────────────────────────────────────────────
     readonly List<IncursionAgentController> _pool   = new List<IncursionAgentController>();
     readonly List<IncursionAgentController> _active = new List<IncursionAgentController>();
@@ -173,6 +191,7 @@ public class TaxiScenarioManager : MonoBehaviour
 
     void Awake()
     {
+        if (manualTwoPointMode) return;   // sandbox: no scenario agents, nothing to pool
         if (incursionPrefab == null || conflictPoints == null || conflictPoints.Count == 0)
         {
             Debug.LogError("[TaxiScenarioManager] incursionPrefab or conflictPoints not assigned.", this);
@@ -205,6 +224,13 @@ public class TaxiScenarioManager : MonoBehaviour
         _active.Clear();
         foreach (var a in _pool) a.gameObject.SetActive(false);
         EgoPath = null;
+
+        // ── Two-point sandbox: bypass ALL scenario logic ───────────────────────
+        if (manualTwoPointMode)
+        {
+            SetupTwoPoint(aircraftTransform);
+            return;
+        }
 
         // ── Map-based episode (network assigned and has paths) ─────────────────
         if (network != null && network.Paths.Count > 0)
@@ -888,6 +914,64 @@ public class TaxiScenarioManager : MonoBehaviour
             var t = new TrajectoryMode[nActive];
             System.Array.Copy(modes, t, nActive); modes = t;
         }
+    }
+
+    // ── Two-point sandbox ───────────────────────────────────────────────────────
+
+    // Place the ego at the start marker facing down its taxiway toward the goal, and set the
+    // goal arc-length. No scenario agents. The travel direction is derived from where the goal
+    // sits along the lane (its arc-length vs the start's), so it never depends on how the plane
+    // was rotated in the editor — TaxiAgent applies EgoSpawnPos/EgoTravelDir directly.
+    void SetupTwoPoint(Transform aircraftTransform)
+    {
+        EgoPath     = null;
+        EgoGoalS    = 0f;
+        EgoPathSign = 1f;
+        EgoHasSpawn = false;
+        if (network == null || network.Paths.Count == 0)
+        {
+            Debug.LogWarning("[TaxiScenarioManager] two-point mode needs a TaxiwayNetwork assigned.");
+            return;
+        }
+
+        Vector3 startRef = egoStartMarker != null ? egoStartMarker.position : aircraftTransform.position;
+        EgoPath = NearestTaxiway(startRef);
+        if (EgoPath == null) return;
+
+        PathState startPs = network.GetRelativeState(startRef, Vector3.forward, EgoPath);
+        float goalS = egoGoalMarker != null
+            ? network.GetRelativeState(egoGoalMarker.position, Vector3.forward, EgoPath).s
+            : EgoPath.TotalLength;
+
+        EgoPathSign = (goalS >= startPs.s) ? 1f : -1f;
+        EgoGoalS    = egoGoalMarker != null ? goalS : (EgoPathSign > 0f ? EgoPath.TotalLength : 0f);
+
+        Vector3 dir = EgoPathSign * startPs.tangent; dir.y = 0f;
+        EgoTravelDir = dir.sqrMagnitude > 1e-6f ? dir.normalized : Vector3.forward;
+
+        if (egoStartMarker != null)
+        {
+            EgoSpawnPos = egoStartMarker.position;
+            EgoHasSpawn = true;
+        }
+
+        Debug.Log($"[TaxiScenarioManager] two-point: startS={startPs.s:F1}  startD={startPs.d:F1}  " +
+                  $"sign={EgoPathSign:F0}  goalS={EgoGoalS:F1}  remaining={Mathf.Abs(EgoGoalS - startPs.s):F1} m");
+    }
+
+    // Taxiway whose centreline is nearest world point p (by cross-track distance).
+    TaxiwayPath NearestTaxiway(Vector3 p)
+    {
+        var         paths = network.Paths;
+        TaxiwayPath best  = null;
+        float       bestD = float.MaxValue;
+        for (int i = 0; i < paths.Count; i++)
+        {
+            if (!paths[i].IsTaxiway) continue;
+            float d = Mathf.Abs(network.GetRelativeState(p, Vector3.forward, paths[i]).d);
+            if (d < bestD) { bestD = d; best = paths[i]; }
+        }
+        return best;
     }
 
     // ── Gizmos ────────────────────────────────────────────────────────────────

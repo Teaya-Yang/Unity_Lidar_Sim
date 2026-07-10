@@ -210,6 +210,14 @@ public class TaxiAgent : Unity.MLAgents.Agent
                 episodeSpeed > 0f ? episodeSpeed : desiredSpeed,
                 transform, incursionDt, ambulanceSpeed,
                 conflictZOffset, crossDirSign, scenarioType, headOnProb);
+
+            // Two-point sandbox: place the plane at the start marker facing down the lane toward
+            // the goal, overriding the spawn above. Movement/observations use transform.forward,
+            // which now points along the travel direction, so it drives toward the goal.
+            if (scenarioManager.EgoHasSpawn)
+                transform.SetPositionAndRotation(
+                    scenarioManager.EgoSpawnPos,
+                    Quaternion.LookRotation(scenarioManager.EgoTravelDir, Vector3.up));
         }
         // ── Legacy single-agent path ──────────────────────────────────────────
         else if (incursionController != null && conflictPoint != null)
@@ -246,14 +254,17 @@ public class TaxiAgent : Unity.MLAgents.Agent
         {
             // Frenet frame
             PathState ps = network.GetRelativeState(transform.position, transform.forward, egoPath);
+            // Direction toward the goal along the lane. +1 for scenario mode; two-point mode sets it
+            // to -1 when the goal lies at a lower arc-length, so the reported tangent / cross-track /
+            // goal all orient to the travel direction rather than the taxiway's stored waypoint order.
+            float sign = scenarioManager != null ? scenarioManager.EgoPathSign : 1f;
+            tangent = sign * ps.tangent;
             ego0    = ps.s;
-            ego1    = ps.d;
-            ego2    = ps.thetaError;
-            tangent = ps.tangent;
-            // Goal arc: manager's EgoGoalS (path end for most scenarios; just past the crossing
-            // for runway incursion so a km-long runway still yields a bounded episode).
+            ego1    = sign * ps.d;
+            ego2    = (sign > 0f) ? ps.thetaError : HeadingErrorTo(tangent);
+            // Goal arc: manager's EgoGoalS. Remaining distance in the travel direction, clamped ≥ 0.
             float goalS = scenarioManager != null ? scenarioManager.EgoGoalS : egoPath.TotalLength;
-            goal_val = Mathf.Max(0f, goalS - ps.s);
+            goal_val = Mathf.Max(0f, sign * (goalS - ps.s));
         }
         else
         {
@@ -345,8 +356,9 @@ public class TaxiAgent : Unity.MLAgents.Agent
         if (network != null && egoPathAct != null)
         {
             float goalS = scenarioManager != null ? scenarioManager.EgoGoalS : egoPathAct.TotalLength;
+            float sign  = scenarioManager != null ? scenarioManager.EgoPathSign : 1f;
             float sArc  = network.GetRelativeState(transform.position, transform.forward, egoPathAct).s;
-            goal_dx = Mathf.Max(0f, goalS - sArc);
+            goal_dx = Mathf.Max(0f, sign * (goalS - sArc));   // matches CollectObservations' goal_val
         }
         else
         {
@@ -432,6 +444,15 @@ public class TaxiAgent : Unity.MLAgents.Agent
 
         if (Mathf.Abs(lateralErr) > taxiwayHalfWidth) r -= 0.5f;
         return r;
+    }
+
+    // Signed heading error [rad] from a world-space travel tangent to the plane's forward,
+    // matching Python's Frenet convention: theta_e = atan2(tan_x, tan_z) − plane_heading.
+    // Used in two-point mode when the travel direction opposes the taxiway's stored tangent.
+    float HeadingErrorTo(Vector3 tan)
+    {
+        float e = Mathf.Atan2(tan.x, tan.z) - Mathf.Atan2(transform.forward.x, transform.forward.z);
+        return Mathf.Atan2(Mathf.Sin(e), Mathf.Cos(e));
     }
 
     // Signed cross-track error to the ego path (map mode) or global X (fallback).

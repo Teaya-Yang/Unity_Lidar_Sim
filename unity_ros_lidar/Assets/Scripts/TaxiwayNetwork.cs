@@ -438,8 +438,9 @@ public class TaxiwayNetwork : MonoBehaviour
 
     bool _editorLoadTried;   // avoid re-parsing every gizmo frame when the file is missing
 
-    void OnDrawGizmosSelected()
+    void OnDrawGizmos()
     {
+        // Always drawn (not just when selected) so taxiways are visible while placing markers.
         // Edit mode: Awake() hasn't run, so lazily parse the GeoJSON once — makes the
         // network visible in the Scene view without entering Play mode.
         if (_paths.Count == 0 && !Application.isPlaying && !_editorLoadTried)
