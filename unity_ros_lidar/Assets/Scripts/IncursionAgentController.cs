@@ -14,6 +14,7 @@ public enum TrajectoryMode
     FollowPath,  // drive along an assigned TaxiwayPath (GeoJSON map-based scenario)
     HoldShort,   // hold at a runway holding position; if willIncur, drive across when the ego nears
     Converging,  // long-range approach toward the ego that jinks (heading/speed) more as it nears
+    PointToPoint,// drive in a straight line from pointStart to pointEnd, then stop or loop
 }
 
 /// <summary>
@@ -114,6 +115,19 @@ public class IncursionAgentController : MonoBehaviour
              "from being a dead-straight line). 0 = perfectly straight until inside convergeJinkDist.")]
     public float     convergeBaseJitter     = 0.25f;
 
+    [Header("PointToPoint (manual start/end placement)")]
+    [Tooltip("Spawn here and drive in a straight line toward pointEnd. If left null, the agent " +
+             "spawns at whatever position ResetCrossing() was called with instead (e.g. from " +
+             "TaxiScenarioManager's normal spawn logic).")]
+    public Transform pointStart;
+    [Tooltip("Drive straight toward this point at crossSpeed.")]
+    public Transform pointEnd;
+    [Tooltip("Distance [m] from pointEnd at which the agent is considered arrived.")]
+    public float     pointArriveRadius = 1.5f;
+    [Tooltip("What happens on arrival: stop and hold position, or turn around and drive back to " +
+             "pointStart (ping-pong), repeating indefinitely.")]
+    public bool      pointToPointLoop  = false;
+
     // ── private ────────────────────────────────────────────────────────────────
 
     bool    _moving;
@@ -172,6 +186,12 @@ public class IncursionAgentController : MonoBehaviour
 
     public void ResetCrossing(Vector3 startPos, float speed = -1f)
     {
+        // PointToPoint with a pointStart assigned overrides the caller's spawn position — this
+        // is the manual-placement path: drop the prefab, set pointStart/pointEnd in the
+        // Inspector, and it spawns exactly there regardless of what the scenario spawner passed.
+        if (trajectoryMode == TrajectoryMode.PointToPoint && pointStart != null)
+            startPos = pointStart.position;
+
         transform.position  = startPos;
         _topSpeed           = speed > 0f ? speed : crossSpeed;
         _speed              = trajectoryMode == TrajectoryMode.Accelerating
@@ -203,6 +223,11 @@ public class IncursionAgentController : MonoBehaviour
             toNext.y = 0f;
             _dir = toNext.sqrMagnitude > 1e-6f ? toNext.normalized : Vector3.forward;
         }
+        else if (trajectoryMode == TrajectoryMode.PointToPoint && pointEnd != null)
+        {
+            Vector3 toEnd = pointEnd.position - startPos; toEnd.y = 0f;
+            _dir = toEnd.sqrMagnitude > 1e-6f ? toEnd.normalized : Vector3.forward;
+        }
         else
         {
             _dir = CrossDirectionNormalized;
@@ -233,6 +258,7 @@ public class IncursionAgentController : MonoBehaviour
             case TrajectoryMode.FollowPath:   StepFollowPath();   break;
             case TrajectoryMode.HoldShort:    StepHoldShort();    break;
             case TrajectoryMode.Converging:   StepConverging();   break;
+            case TrajectoryMode.PointToPoint: StepPointToPoint(); break;
         }
     }
 
@@ -283,6 +309,27 @@ public class IncursionAgentController : MonoBehaviour
     }
 
     // ── modes ──────────────────────────────────────────────────────────────────
+
+    // Drive straight from pointStart toward pointEnd. On arrival: hold position, or (if
+    // pointToPointLoop) turn around and drive back the other way, repeating indefinitely.
+    void StepPointToPoint()
+    {
+        if (pointEnd == null) { StepStraight(); return; }   // no end assigned — degrade to Straight
+
+        Vector3 toEnd = pointEnd.position - transform.position; toEnd.y = 0f;
+        if (toEnd.sqrMagnitude <= pointArriveRadius * pointArriveRadius)
+        {
+            if (!pointToPointLoop || pointStart == null) { _stopped = true; return; }
+            // Ping-pong: swap which point we're heading toward and keep going.
+            (pointStart, pointEnd) = (pointEnd, pointStart);
+            toEnd = pointEnd.position - transform.position; toEnd.y = 0f;
+        }
+        _stopped = false;
+        if (toEnd.sqrMagnitude > 1e-6f) _dir = toEnd.normalized;
+        transform.position += _dir * (_speed * Time.fixedDeltaTime);
+        if (faceTravelDirection && _dir.sqrMagnitude > 1e-6f)
+            transform.rotation = Quaternion.LookRotation(frontIsNegativeZ ? -_dir : _dir, Vector3.up);
+    }
 
     void StepStraight()
     {
@@ -489,5 +536,13 @@ public class IncursionAgentController : MonoBehaviour
         Vector3 d = CrossDirectionNormalized;
         Gizmos.DrawLine(transform.position - d * 20f, transform.position + d * 20f);
         Gizmos.DrawWireSphere(transform.position, 1f);
+
+        if (trajectoryMode == TrajectoryMode.PointToPoint && pointStart != null && pointEnd != null)
+        {
+            Gizmos.color = Color.cyan;
+            Gizmos.DrawLine(pointStart.position, pointEnd.position);
+            Gizmos.DrawWireSphere(pointStart.position, 1f);
+            Gizmos.DrawWireSphere(pointEnd.position, 1f);
+        }
     }
 }

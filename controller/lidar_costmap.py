@@ -195,8 +195,9 @@ class LidarCostmap:
 
         cm = LidarCostmap(); cm.start()
         cm.update(ego_fwd, dyn_positions)       # once per control step
-        d      = cm.distance(pts)               # (N,) static-surface distance [m]
-        hidden = cm.hidden_fraction(pts)        # (N,) occluded-ROI fraction [0..1]
+        d   = cm.distance(w0, w1)               # (N,) static-surface distance [m], ABSOLUTE world
+        occ = cm.occupancy(w0, w1)              # (N,) {occupied:1, free:0, unknown:-1}, ABS world
+        hidden = cm.hidden_fraction(pts)        # (N,) occluded-ROI fraction [0..1], ego-relative Δ
     """
 
     def __init__(self,
@@ -207,7 +208,7 @@ class LidarCostmap:
                  max_age: float = 0.5,
                  free_ttl: float = 4.0, occ_ttl: float = 12.0, carve_samples: int = 80,
                  # visibility params
-                 roi_range: float = 30.0, roi_half_angle_deg: float = 70.0,
+                 roi_range: float = 40.0, roi_half_angle_deg: float = 180.0,
                  max_roi_cells: int = 30,
                  cand_reach: float = 30.0, cand_res: float = 2.0,
                  los_samples: int = 40):
@@ -233,6 +234,7 @@ class LidarCostmap:
         self._pose = None           # (a0, a1) sensor world position
         self._stamp = 0.0
         self._dist = None           # (n,n) static distance field [m]
+        self._dist_unknown = None   # (n,n) distance-to-nearest-UNKNOWN (frontier) field [m]
         self._ready = False
         self._node = self._thread = None
         # visibility lookup (ego-relative candidate offsets → hidden fraction)
@@ -371,6 +373,20 @@ class LidarCostmap:
         else:
             self._dist = _chamfer_distance(occ, self.res)
 
+        # Frontier distance field: distance from every cell to the nearest UNKNOWN cell. For a
+        # query point in observed FREE space the nearest UNKNOWN cell lies on the FREE↔UNKNOWN
+        # boundary (the frontier / blind-corner edge), so this doubles as the distance to the
+        # frontier that the virtual-obstacle (forward-reachable-set) cost expands its bubble from.
+        # NOTE: the map's outer border is also UNKNOWN, so far from any real occlusion this returns
+        # the (large) distance to the window edge — harmless as long as size_m >> the horizon reach.
+        unknown = (self.grid.state == UNKNOWN)
+        if not unknown.any():
+            self._dist_unknown = np.full((self.grid.n, self.grid.n), 1e6)
+        elif _HAS_SCIPY:
+            self._dist_unknown = distance_transform_edt(~unknown) * self.res
+        else:
+            self._dist_unknown = _chamfer_distance(unknown, self.res)
+
         self._build_visibility(ego0, ego1, ego_fwd, occ)
         self._ready = True
 
@@ -474,18 +490,68 @@ class LidarCostmap:
 
     # ── Planner-side lookups ──────────────────────────────────────────────────
 
-    def distance(self, pts: np.ndarray) -> np.ndarray:
-        """(N,2) ego-relative (Δa0,Δa1) → (N,) distance to nearest static surface [m]."""
+    def distance(self, w0: np.ndarray, w1: np.ndarray) -> np.ndarray:
+        """
+        (N,) ABSOLUTE world (a0,a1) → (N,) distance to nearest static surface [m]. Uses the
+        grid's own world_to_cell (its tracked origin), NOT an ego-relative-delta + assumed
+        centre — the grid's centre is the last SENSOR pose, which is not generally the same
+        point as the caller's ego reference (e.g. a laser_link mounted away from the vehicle
+        pivot), so that shortcut silently samples the wrong cell.
+        """
+        w0 = np.asarray(w0); w1 = np.asarray(w1)
         if not self._ready or self._dist is None:
-            return np.full(len(pts), 1e6)
-        # Ego is at the grid centre after recentring.
-        c = self.grid.n // 2
-        i = c + np.round(pts[:, 0] / self.res).astype(int)
-        j = c + np.round(pts[:, 1] / self.res).astype(int)
-        inside = (i >= 0) & (i < self.grid.n) & (j >= 0) & (j < self.grid.n)
-        out = np.full(len(pts), 1e6)
+            return np.full(len(w0), 1e6)
+        g = self.grid
+        i, j = g.world_to_cell(w0, w1)
+        inside = (i >= 0) & (i < g.n) & (j >= 0) & (j < g.n)
+        out = np.full(len(w0), 1e6)
         out[inside] = self._dist[i[inside], j[inside]]
         return out
+
+    def distance_to_unknown(self, w0: np.ndarray, w1: np.ndarray) -> np.ndarray:
+        """
+        (N,) ABSOLUTE world (a0,a1) → (N,) distance to the nearest UNKNOWN cell [m], i.e. the
+        distance to the FREE↔UNKNOWN frontier (blind-corner edge) for a query point in free
+        space. Used by the virtual-obstacle / forward-reachable-set cost: a phantom agent is
+        assumed to sit on that frontier, so this is the distance to where the bubble originates.
+        Not-ready / out-of-window points return 1e6 (no nearby frontier ⇒ no virtual penalty).
+        """
+        w0 = np.asarray(w0); w1 = np.asarray(w1)
+        if not self._ready or self._dist_unknown is None:
+            return np.full(len(w0), 1e6)
+        g = self.grid
+        i, j = g.world_to_cell(w0, w1)
+        inside = (i >= 0) & (i < g.n) & (j >= 0) & (j < g.n)
+        out = np.full(len(w0), 1e6)
+        out[inside] = self._dist_unknown[i[inside], j[inside]]
+        return out
+
+    def occupancy(self, w0: np.ndarray, w1: np.ndarray) -> np.ndarray:
+        """
+        G(p_WB): (N,) ABSOLUTE world (a0,a1) → (N,) three-state occupancy in the PAPER's
+        convention {occupied: 1, free: 0, unknown: -1}. Points outside the grid window (or
+        before the map is ready) are treated as free (0) so they carry no collision penalty.
+        Uses the grid's own world_to_cell — see distance() docstring for why NOT ego-relative.
+        """
+        w0 = np.asarray(w0); w1 = np.asarray(w1)
+        out = np.zeros(len(w0), dtype=np.int8)      # default: free (0)
+        if not self._ready:
+            return out
+        g = self.grid
+        i, j = g.world_to_cell(w0, w1)
+        inside = (i >= 0) & (i < g.n) & (j >= 0) & (j < g.n)
+        st = g.state[i[inside], j[inside]]            # internal {UNKNOWN:0, FREE:1, OCC:2}
+        paper = np.where(st == OCC, 1, np.where(st == FREE, 0, -1)).astype(np.int8)
+        out[inside] = paper
+        return out
+
+    def not_free(self, w0: np.ndarray, w1: np.ndarray) -> np.ndarray:
+        """
+        Collision indicator 1{G(p_WB) != 0}: (N,) bool, True where the cell is occupied OR
+        unknown (i.e. NOT known-free). Out-of-window / not-ready points are free ⇒ False.
+        w0/w1: ABSOLUTE world (a0,a1) — see occupancy()/distance() docstrings.
+        """
+        return self.occupancy(w0, w1) != 0
 
     def hidden_fraction(self, pts: np.ndarray) -> np.ndarray:
         """

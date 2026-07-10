@@ -28,6 +28,7 @@ CBF uses Euclidean obstacle distances in the same frame.
 
 import numpy as np
 import argparse
+import time
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.base_env import ActionTuple
 from mlagents_envs.exception import UnityCommunicatorStoppedException
@@ -100,6 +101,21 @@ MEAN_STEER_DECAY = 0.10
 
 # MPPI stage costs
 W_LAT, W_HEAD, W_V, W_CTRL = 0.05, 4.0, 1.2, 0.05
+# Action cost   ℓact = ||u||²_R + ||Δu||²_RΔ,  u = [a, delta], Δu_k = u_k - u_{k-1}.
+#   R  (R_ACT)  — diagonal effort weight: penalises large commands (energy/effort).
+#   RΔ (R_DACT) — diagonal rate weight: penalises command CHANGE (smoothness, no jerk).
+# Stored as the diagonals of the R / RΔ matrices, per channel [a, delta].
+R_ACT  = np.array([0.05, 0.20])
+R_DACT = np.array([0.10, 0.40])
+# Velocity cost  ℓvel = W_VEL · exp(-C_VEL · d_k²) · ||v_k||²,  d_k = distance to goal, v_k = speed.
+# The exp(-C_VEL·d_k²) envelope is ~0 far from the goal (speed unpenalised while transiting) and
+# →1 as d_k→0, so the ego is driven to bleed off speed and arrive stopped at the goal. C_VEL sets
+# the envelope's half-strength RADIUS: d_half = sqrt(ln2 / C_VEL). 0.02 gives ~5.9m — too late to
+# brake a fast-moving plane; 0.003 gives ~15m, matching GOAL_SLOWDOWN_DIST so braking starts with
+# enough room. W_VEL scales overall strength — must be large enough to outweigh ℓprogress, which
+# unconditionally rewards continued movement (including flying past the goal).
+C_VEL  = 0.003
+W_VEL  = 3.0
 # W_OBS lowered and W_PROG raised (was 12.0 / 0.4) so forward progress competes with the obstacle
 # penalty. On a head-on pass the ego can't keep D_SAFE either way (the oncoming agent comes to it),
 # so an over-weighted W_OBS made "stop and wait" the cheapest option; a stronger progress pull makes
@@ -114,6 +130,26 @@ W_OBS, W_OFF, W_PROG        = 2.0, 2.0, 1.0
 # or 0.125 (goal occluded → encourage exploration); C_GOAL_TERM 10.0.
 C_GOAL                      = 5.0
 C_GOAL_TERM                 = 10.0
+C_PROGRESS                  = 5.0
+# Collision cost ℓcollision = C_COLLISION · 1{G(p_WB) != 0}: flat penalty per rollout point that
+# lands in a NON-free cell (occupied OR unknown) of the persistent 3-state LiDAR occupancy grid.
+# Penalising UNKNOWN too (per the paper) keeps the ego in observed-free space; drop it to OCC-only
+# via LidarCostmap.occupancy()==1 if that is too conservative while the map is still filling in.
+C_COLLISION                 = 100.0
+
+# Virtual-obstacle / forward-reachable-set (FRS) cost — occlusion safety. Assumes a worst-case
+# hidden agent sitting on the FREE↔UNKNOWN frontier (blind corner). As the rollout looks t_k =
+# (k+1)·DT into the future, that phantom could have travelled up to V_MAX_VIRTUAL·t_k in any
+# direction, so a bubble of that radius grows out of the frontier. The rollout is penalised for
+# entering within D_SAFE_VIRTUAL of the bubble's edge:
+#   d_virtual = distance_to_frontier − V_MAX_VIRTUAL·t_k
+#   ℓvirtual  = W_VIRTUAL · max(0, D_SAFE_VIRTUAL − d_virtual)²
+# Effect: the ego swings wide around blind corners or slows so its future doesn't penetrate the
+# expanding bubble. Keep V_MAX_VIRTUAL realistic — too high and the bubble swallows the whole
+# horizon and the ego freezes ("freezing robot"). Gated on --visibility-cost.
+W_VIRTUAL       = 50.0   # weight of the virtual-bubble soft penalty
+V_MAX_VIRTUAL   = 5.0    # assumed max speed of a hidden agent [m/s]
+D_SAFE_VIRTUAL  = 8.0    # safety margin kept from the expanding bubble edge [m]
 
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
 BIG = 200.0
@@ -140,7 +176,7 @@ W_STATIC       = 8.0     # weight of the static-surface soft ring
 # so the soft ring starts the detour close to where it's actually needed instead of forcing a
 # wide early swerve that can require moving the goal well past the obstacle to reach it.
 D_SAFE_STATIC  = 8.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
-D_INFL_STATIC  = 10.0      # soft influence ring around static surfaces [m]
+D_INFL_STATIC  = 15.0      # soft influence ring around static surfaces [m]
 
 # Active-perception (visibility) cost: per rollout point, the fraction of the
 # occluded, path-relevant region that stays HIDDEN from that position (from the
@@ -149,7 +185,7 @@ D_INFL_STATIC  = 10.0      # soft influence ring around static surfaces [m]
 # there IS occluded relevant space (empty ROI ⇒ term is zero ⇒ nominal). Off
 # unless --visibility-cost. Enables the same LidarCostmap as --lidar-costmap.
 VISIBILITY_COST = False
-W_VIS           = 0.0    # weight on the per-step hidden-fraction. hidden ∈ [0,1] is bounded, so it
+W_VIS           = 0.0    # weight on the per-step hidden-fraction. hidden ∈ [0,1] is bounded, so it.
                          # needs a large weight AND the investigate-mode relaxation below to compete
                          # with the quadratic lane cost.
 # Investigate mode: gates a temporary relaxation of lane-keeping AND steering-noise width (see
@@ -542,12 +578,14 @@ def _cvar(cost_kn, alpha):
     return worst.mean(axis=1)
 
 
-def mppi(s0, mean, obstacles, goal_xy, beliefs=None):
+def mppi(s0, mean, obstacles, goal_xy, beliefs=None, u_prev=None):
     """
     Sample K_MPPI rollouts with realistic 6D state dynamics.
 
     s0 = [x, y, theta_global, v, delta, accel]. Rollout in world frame.
     goal_xy = goal world position (x_fwd, y_lat), same axes as the rollout state.
+    u_prev  = last APPLIED control [a, delta], used for the Δu_0 = u_0 - u_prev term
+              (defaults to zero if None).
     Lane cost penalises lateral position y; obstacles in world coords.
 
     Returns (u_nom, new_mean).
@@ -569,6 +607,9 @@ def mppi(s0, mean, obstacles, goal_xy, beliefs=None):
     na[:, :, 0] = np.clip(na[:, :, 0], a_min_eff, A_MAX)
     na[:, :, 1] = np.clip(na[:, :, 1], -DELTA_LIM, DELTA_LIM)
 
+    # Previous applied control for the Δu_0 term (u_0 - u_prev). Zero if not supplied.
+    u_prev = np.zeros(2) if u_prev is None else np.asarray(u_prev, dtype=float)
+
     cost = np.zeros(K_MPPI)
     st   = np.tile(s0, (K_MPPI, 1)).astype(float)
 
@@ -585,31 +626,62 @@ def mppi(s0, mean, obstacles, goal_xy, beliefs=None):
     slow_frac = np.clip(d0 / GOAL_SLOWDOWN_DIST, 0.0, 1.0)
     v_des_eff = GOAL_MIN_SPEED + (V_DES - GOAL_MIN_SPEED) * slow_frac
 
+    prev_fwd = np.full(K_MPPI, s0_fwd)   # ego position at the previous step (p_k), for ℓprogress
+    prev_lat = np.full(K_MPPI, s0_lat)
+
     for k in range(H_MPPI):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
 
         # Keeping only heading cost at the moment, no lane cost used
-        #cost += w_head_eff * th**2
+        cost += w_head_eff * th**2
 
         # ℓgoal = -C_GOAL * max(0, d0 - d_k): reward net closure toward the goal by this stage,
         # d_k = ||p_k - p_goal|| the true Euclidean distance to the goal at stage k.
         d_k = np.hypot(goal_fwd - fwd, goal_lat - lat)
         cost += -C_GOAL * np.maximum(0.0, d0 - d_k)
 
-        #cost += W_V    * (vv - v_des_eff)**2
-        #cost += W_CTRL * (na[:, k, 0]**2 + 4. * na[:, k, 1]**2)
+        u_k   = na[:, k, :]                                  # (K, 2)
+        u_km1 = u_prev[None, :] if k == 0 else na[:, k - 1, :]
+        du    = u_k - u_km1
+        cost += (R_ACT  * u_k**2).sum(axis=1)
+        cost += (R_DACT * du**2 ).sum(axis=1)
 
+        # ℓprogress = -C_PROGRESS · ||p_k - p_{k+1}||: reward the distance travelled between
+        # consecutive positions (p_k = prev step, p_{k+1} = this step) — rewards making ground.
+        cost += -C_PROGRESS * np.hypot(fwd - prev_fwd, lat - prev_lat)
+        prev_fwd, prev_lat = fwd, lat
+
+        # ℓvel = W_VEL · exp(-C_VEL · d_k²) · ||v_k||².  d_k already computed above; v_k = speed vv.
+        cost += np.exp(-C_VEL * d_k**2) * vv**2
+
+        # ℓcollision: soft influence ring + hard keep-out from the persistent LiDAR distance
+        # field, evaluated at the rollout's ABSOLUTE world position (fwd, lat) — see distance()/
+        # occupancy() docstrings for why absolute, not ego-relative-delta.
+        #
+        # NOTE: a pure point-occupancy check (1{G(p)==OCCUPIED} at exactly this sample) is NOT
+        # enough on its own: grid resolution is 0.5m but a rollout step covers ~v*DT (e.g. 1.3m
+        # at 13 m/s), so a straight-through trajectory can "tunnel" past an obstacle without any
+        # sampled point ever landing inside its cell — zero collision cost despite geometrically
+        # clipping it. The continuous distance field can't be skipped like that: it penalises
+        # proximity smoothly, so even a rollout that steps OVER the obstacle cell still registers
+        # a large cost from being close to it on either side of the gap.
         # if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-        #     pts_rel = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
-        #     d_static = LIDAR_COSTMAP.distance(pts_rel)
+        #     d_static = LIDAR_COSTMAP.distance(fwd, lat)
         #     cost += np.where(d_static < D_INFL_STATIC,
         #                      W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
-        #     cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
+        #     cost += np.where(d_static < D_SAFE_STATIC, C_COLLISION, 0.)
 
-        # if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-        #     pts_rel = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
-        #     cost += W_VIS * (LIDAR_COSTMAP.hidden_fraction(pts_rel))
+        # ℓvirtual (forward-reachable-set / occlusion safety): a worst-case phantom sits on the
+        # FREE↔UNKNOWN frontier and could have reached V_MAX_VIRTUAL·t_k out of it by this step.
+        # Penalise the rollout for entering within D_SAFE_VIRTUAL of that expanding bubble's edge.
+        if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            t_elapsed  = (k + 1) * DT
+            r_bubble   = V_MAX_VIRTUAL * t_elapsed                       # bubble radius at step k
+            d_frontier = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)     # dist to blind-corner edge
+            d_virtual  = d_frontier - r_bubble                          # dist to the bubble's edge
+            cost += np.where(d_virtual < D_SAFE_VIRTUAL,
+                             W_VIRTUAL * (D_SAFE_VIRTUAL - d_virtual)**2, 0.0)
 
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
         # t_elapsed = (k + 1) * DT
@@ -842,7 +914,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         VISIBILITY_COST = visibility_cost
         STATIC_AVOID    = lidar_costmap
         from lidar_costmap import LidarCostmap
-        cm = LidarCostmap()
+        # max_age raised from the 0.5s default: Unity's PointCloudPublisher is configured well
+        # below 10Hz (measured ~1Hz cloud_age via [DEBUG lidar]), so 0.5s made `ready` permanently
+        # False and the static-avoidance/collision cost never activated. 1.5s covers ~1Hz publish
+        # with margin; lower it again if the Unity publish rate is raised instead.
+        cm = LidarCostmap(max_age=1.5)
         if cm.start(topic=lidar_topic):
             LIDAR_COSTMAP = cm
             feats = []
@@ -945,6 +1021,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         ep_steps     = 0
         delta_actual = 0.0   # tracked Python-side to feed into MPPI state
         accel_actual = 0.0
+        u_prev       = np.zeros(2)   # last applied [a, delta], for the MPPI Δu smoothness cost
         episode_done = False
         # Re-seed MPPI per episode so CBF vs no-CBF runs are directly comparable.
         rng = np.random.default_rng(BASE_SEED + ep)
@@ -1000,8 +1077,19 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             if LIDAR_COSTMAP is not None:
                 ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
                 LIDAR_COSTMAP.update(ego_fwd, [rel for rel, _ in obstacles])
+                if ep_steps % 20 == 0:
+                    st  = LIDAR_COSTMAP.grid.state
+                    age = time.monotonic() - LIDAR_COSTMAP._stamp
+                    sensor_pose = LIDAR_COSTMAP._pose
+                    offset = (None if sensor_pose is None else
+                              (sensor_pose[0] - s[0], sensor_pose[1] - s[1]))
+                    print(f"[DEBUG lidar] ready={LIDAR_COSTMAP.ready}  cloud_age={age:.2f}s  "
+                          f"OCC={int((st==2).sum())}  FREE={int((st==1).sum())}  "
+                          f"UNKNOWN={int((st==0).sum())}  "
+                          f"ego(vehicle)=({s[0]:.1f},{s[1]:.1f})  "
+                          f"ego(sensor_pose)={sensor_pose}  offset={offset}")
 
-            u_nom, mean = mppi(s, mean, obstacles, goal_xy, beliefs)
+            u_nom, mean = mppi(s, mean, obstacles, goal_xy, beliefs, u_prev)
 
             
             u_cmd      = u_nom
@@ -1009,6 +1097,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
 
             a_cmd     = float(np.clip(u_cmd[0], A_MIN, A_MAX))
             delta_cmd = float(np.clip(u_cmd[1], -DELTA_LIM, DELTA_LIM))
+            u_prev    = np.array([a_cmd, delta_cmd])   # feed the Δu smoothness cost next step
 
             # Advance Python-side kinematic state to match what Unity will compute
             v = s[3]

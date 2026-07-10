@@ -49,6 +49,30 @@ public class TaxiScenarioManager : MonoBehaviour
     [Tooltip("GOAL: where the ego taxis to (projected onto the ego's start taxiway).")]
     public Transform egoGoalMarker;
 
+    [System.Serializable]
+    public struct ManualObstacle
+    {
+        [Tooltip("Which prefab to spawn for this obstacle (needs an IncursionAgentController).")]
+        public GameObject prefab;
+        [Tooltip("Spawn position — the obstacle appears here and drives toward End.")]
+        public Transform   start;
+        [Tooltip("The obstacle drives in a straight line toward this point.")]
+        public Transform   end;
+        [Tooltip("Travel speed [m/s].")]
+        public float       speed;
+        [Tooltip("On reaching End, turn around and drive back to Start, repeating indefinitely. " +
+                 "Off = stop and hold position at End.")]
+        public bool        loop;
+    }
+
+    [Header("Manual obstacle placement (independent of scenario/ego mode)")]
+    [Tooltip("Hand-place obstacles: pick a prefab and give it a Start and an End point in the " +
+             "Inspector. Spawned once at Awake and repositioned every episode; runs alongside " +
+             "whatever ego mode (scenario / two-point / free-goal) is active, so it works as a " +
+             "simple way to test avoidance against a specific obstacle without wiring up full " +
+             "scenario logic.")]
+    public List<ManualObstacle> manualObstacles = new List<ManualObstacle>();
+
     [Header("Prefab")]
     public GameObject incursionPrefab;
     public int        maxAgents = 3;
@@ -193,11 +217,14 @@ public class TaxiScenarioManager : MonoBehaviour
     // ── internal ───────────────────────────────────────────────────────────────
     readonly List<IncursionAgentController> _pool   = new List<IncursionAgentController>();
     readonly List<IncursionAgentController> _active = new List<IncursionAgentController>();
+    readonly List<IncursionAgentController> _manual = new List<IncursionAgentController>();
 
     // ── Awake ──────────────────────────────────────────────────────────────────
 
     void Awake()
     {
+        SpawnManualObstacles();           // independent of ego mode — always spawned if configured
+
         if (freeGoalMode) return;         // free-field: no scenario agents, nothing to pool
         if (manualTwoPointMode) return;   // sandbox: no scenario agents, nothing to pool
         if (incursionPrefab == null || conflictPoints == null || conflictPoints.Count == 0)
@@ -217,6 +244,50 @@ public class TaxiScenarioManager : MonoBehaviour
         Debug.Log($"[TaxiScenarioManager] {_pool.Count} agents, {conflictPoints.Count} conflict point(s).");
     }
 
+    // Instantiate one persistent agent per configured manualObstacles entry. Each is forced into
+    // PointToPoint mode with its Start/End/speed/loop from the Inspector row — this is the
+    // "select a prefab, give it a start and an end point" placement path, independent of whatever
+    // scenario/ego mode is running.
+    void SpawnManualObstacles()
+    {
+        for (int i = 0; i < manualObstacles.Count; i++)
+        {
+            var entry = manualObstacles[i];
+            if (entry.prefab == null || entry.start == null || entry.end == null)
+            {
+                Debug.LogWarning($"[TaxiScenarioManager] manualObstacles[{i}] missing prefab/start/end — skipped.", this);
+                continue;
+            }
+            var go = Instantiate(entry.prefab, entry.start.position, Quaternion.identity, transform);
+            go.name = $"ManualObstacle_{i}";
+            var ctrl = go.GetComponent<IncursionAgentController>();
+            if (ctrl == null)
+            {
+                Debug.LogWarning($"[TaxiScenarioManager] manualObstacles[{i}] prefab has no IncursionAgentController — skipped.", this);
+                Destroy(go);
+                continue;
+            }
+            ctrl.trajectoryMode    = TrajectoryMode.PointToPoint;
+            ctrl.pointStart        = entry.start;
+            ctrl.pointEnd          = entry.end;
+            ctrl.crossSpeed        = entry.speed > 0f ? entry.speed : ctrl.crossSpeed;
+            ctrl.pointToPointLoop  = entry.loop;
+            _manual.Add(ctrl);
+        }
+        if (_manual.Count > 0)
+            Debug.Log($"[TaxiScenarioManager] {_manual.Count} manual obstacle(s) placed.");
+    }
+
+    // Re-arm every manual obstacle for a new episode: back to its Start point, driving toward End.
+    void ResetManualObstacles()
+    {
+        foreach (var ctrl in _manual)
+        {
+            if (ctrl.pointStart == null) continue;
+            ctrl.ResetCrossing(ctrl.pointStart.position, ctrl.crossSpeed);
+        }
+    }
+
     // ── per-episode reset ──────────────────────────────────────────────────────
 
     public void ResetEpisode(float difficulty,
@@ -232,6 +303,9 @@ public class TaxiScenarioManager : MonoBehaviour
         _active.Clear();
         foreach (var a in _pool) a.gameObject.SetActive(false);
         EgoPath = null;
+
+        ResetManualObstacles();
+        _active.AddRange(_manual);   // included in ActiveAgents regardless of ego/scenario mode
 
         // ── Free-field point-to-point: bypass the map/lane entirely ────────────
         if (freeGoalMode)

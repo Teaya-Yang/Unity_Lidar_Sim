@@ -41,3 +41,5 @@ Test_Data/
 TODO_CLAUDE.md
 
 unity_ros_lidar/Assets/AirportPack*
+
+*.claude/
