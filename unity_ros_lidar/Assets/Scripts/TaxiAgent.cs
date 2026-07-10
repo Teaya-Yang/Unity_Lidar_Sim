@@ -13,29 +13,16 @@ using UnityEngine;
 /// bearing to a goal marker, in free space. Obstacle avoidance (CBF/MPPI for dynamic agents,
 /// the LiDAR static costmap for buildings/walls) is frame-independent and unaffected.
 ///
-/// OBSERVATION VECTOR (20 floats — must match Python OBS_SIZE=20):
-///
-///   With a goal marker resolved (ResolveGoalMarker() != null):
-///   [0]  0         (s stub — always at the start of the live bearing segment)
-///   [1]  0         (d stub — always 0: no lane, no cross-track cost)
-///   [2]  theta_e   — heading error vs the live bearing to the goal [rad]
-///   [3]  v
-///   [4..15]        3 × obstacle (dx_global, dy_global, vx, vy)
-///   [16] goal_dx   — true Euclidean distance to the goal [m]
-///   [17] cbf_h
-///   [18] tangent_x — world X component of the live bearing to the goal
-///   [19] tangent_z — world Z component of the live bearing to the goal
-///
-///   Legacy fallback (no goal marker assigned anywhere):
+/// OBSERVATION VECTOR (20 floats — must match Python OBS_SIZE=20), always WORLD frame:
 ///   [0]  x_ego    — Unity Z position [m]
 ///   [1]  y_ego    — Unity X position [m]
-///   [2]  theta    — heading [rad]
+///   [2]  theta    — world heading [rad]
 ///   [3]  v
 ///   [4..15]        3 × obstacle (dx_global, dy_global, vx, vy)
-///   [16] goal_dx  — 999 (no goal marker to measure against)
+///   [16] goal_dx  — true Euclidean distance to the goal [m] (999 if no goal marker)
 ///   [17] cbf_h
-///   [18] 0        (tangent_x stub)
-///   [19] 1        (tangent_z stub — points forward)
+///   [18] goal_z   — goal world Z position [m] (same axis as [0]); = x_ego if no goal marker
+///   [19] goal_x   — goal world X position [m] (same axis as [1]); = y_ego if no goal marker
 ///
 /// COORDINATE MAPPING:
 ///   Python X (forward) = Unity +Z
@@ -245,7 +232,7 @@ public class TaxiAgent : Unity.MLAgents.Agent
     }
 
     // ── Observations (20 floats) ───────────────────────────────────────────────
-    // Layout: [ego(4)] [obs0..2 (4 each, 12 total)] [goal(1)] [cbf_h(1)] [tangent(2)]
+    // Layout: [ego(4)] [obs0..2 (4 each, 12 total)] [goal_dist(1)] [cbf_h(1)] [goal_pos(2)]
     // See class doc-comment for full slot descriptions.
 
     public override void CollectObservations(VectorSensor sensor)
@@ -256,32 +243,30 @@ public class TaxiAgent : Unity.MLAgents.Agent
         // construction (there is no lane), so only progress-to-goal, control effort, and
         // obstacle avoidance (CBF/MPPI + LiDAR static cost, both frame-independent) drive
         // the plan.
-        Vector3 tangent = new Vector3(0f, 0f, 1f); // default: straight ahead
-        float   ego0, ego1, ego2, goal_val;
+        // Everything is reported in the WORLD frame: ego world position (z, x) and world heading,
+        // plus the goal's world position (z, x). Python computes the true Euclidean distance to
+        // the goal at every rollout point directly from these — no projection / bearing frame.
+        float thWorld = transform.eulerAngles.y * Mathf.Deg2Rad;
+        float ego0 = transform.position.z;   // world Z → x_fwd (ROS convention used downstream)
+        float ego1 = transform.position.x;   // world X → y_lat
+        float ego2 = Mathf.Atan2(Mathf.Sin(thWorld), Mathf.Cos(thWorld));
 
+        float goal_val, goalZ, goalX;
         Transform goalT = ResolveGoalMarker();
         if (goalT != null)
         {
             Vector3 toGoal = goalT.position - transform.position;
             toGoal.y = 0f;
-            float dist = toGoal.magnitude;
-            Vector3 bearing = dist > 1e-3f ? toGoal.normalized : transform.forward;
-            bearing.y = 0f;
-
-            tangent  = bearing;
-            ego0     = 0f;                          // s — always at the start of the live bearing segment
-            ego1     = 0f;                           // d — always 0: no lane, no cross-track cost
-            ego2     = HeadingErrorTo(bearing);      // theta_e — heading error vs bearing to goal
-            goal_val = dist;
+            goal_val = toGoal.magnitude;      // true Euclidean distance to goal [m]
+            goalZ    = goalT.position.z;      // goal world position (same axes as ego0/ego1)
+            goalX    = goalT.position.x;
         }
         else
         {
-            // Legacy global-frame fallback (no goal marker at all).
-            float th = transform.eulerAngles.y * Mathf.Deg2Rad;
-            ego0 = transform.position.z;
-            ego1 = transform.position.x;
-            ego2 = Mathf.Atan2(Mathf.Sin(th), Mathf.Cos(th));
+            // Legacy fallback (no goal marker): no goal to measure against.
             goal_val = 999f;
+            goalZ    = ego0;                  // degenerate: goal at the ego ⇒ zero goal cost
+            goalX    = ego1;
         }
 
         sensor.AddObservation(ego0);
@@ -337,11 +322,11 @@ public class TaxiAgent : Unity.MLAgents.Agent
             }
         }
 
-        // ── Goal, CBF, tangent [16..19] ───────────────────────────────────────
+        // ── Goal distance, CBF, goal world position [16..19] ──────────────────
         sensor.AddObservation(goal_val);
         sensor.AddObservation(cbf_h_nearest == float.MaxValue ? 999f : cbf_h_nearest);
-        sensor.AddObservation(tangent.x);  // [18] tangent_x — Python rotates CBF constraint
-        sensor.AddObservation(tangent.z);  // [19] tangent_z
+        sensor.AddObservation(goalZ);      // [18] goal world Z (x_fwd axis)
+        sensor.AddObservation(goalX);      // [19] goal world X (y_lat axis)
     }
 
     // ── Actions received from Python ───────────────────────────────────────────

@@ -7,37 +7,23 @@ Connects via the ML-Agents Python API, runs MPPI + HOCBF-QP, and sends
 
 Observation contract (must match TaxiAgent.cs CollectObservations, OBS_SIZE=20):
 
-  WITHOUT TaxiwayNetwork (global frame):
+  World/Euclidean frame:
     obs[0]   x_ego    — Unity Z position [m]
     obs[1]   y_ego    — Unity X position [m]
     obs[2]   theta    — heading [rad]
-    obs[18]  0.0      (tangent_x stub)
-    obs[19]  1.0      (tangent_z stub)
-
-  WITH TaxiwayNetwork (Frenet frame):
-    obs[0]   s        — arc-length along ego path [m]
-    obs[1]   d        — signed cross-track error [m]  (+ = left)
-    obs[2]   theta_e  — heading error vs path tangent [rad]
-    obs[18]  tangent_x — world X component of path tangent (Unity X)
-    obs[19]  tangent_z — world Z component of path tangent (Unity Z)
-
-  Both modes (common):
     obs[3]   v        — speed [m/s]
     obs[4..15]        3 × obstacle (dx_global, dy_global, vx, vy) — 12 floats
-    obs[16]  goal     — remaining distance/arc to goal [m]
+    obs[16]  goal     — remaining Euclidean distance to goal [m]
     obs[17]  cbf_h    — barrier value h = dist^2 - D^2 of nearest obstacle
-
-  FRENET MODE DETECTION: abs(obs[18]) + abs(obs[19]) > 0.01 AND obs[19] != 1.0
+    obs[18]  goal_z   — goal world Z position [m] (same axis as obs[0])
+    obs[19]  goal_x   — goal world X position [m] (same axis as obs[1])
 
 Action contract:
   act[0]  a_cmd     — acceleration [m/s^2], clipped to [A_MIN, A_MAX]
   act[1]  delta_cmd — steering [rad],       clipped to [-DELTA_LIM, DELTA_LIM]
 
-MPPI IN FRENET MODE:
-  Uses a local linear path approximation (zero curvature between steps).
-  State [0] = arc-length progress Δs, [1] = cross-track error d.
-  Valid for airport taxiway curvatures over a 2.5 s horizon.
-  CBF uses Euclidean obstacle distances and is frame-independent.
+MPPI runs entirely in the world frame: s0 = [x, y, theta, v, delta, accel].
+CBF uses Euclidean obstacle distances in the same frame.
 """
 
 import numpy as np
@@ -119,6 +105,15 @@ W_LAT, W_HEAD, W_V, W_CTRL = 0.05, 4.0, 1.2, 0.05
 # so an over-weighted W_OBS made "stop and wait" the cheapest option; a stronger progress pull makes
 # driving through win. Trade-off: the ego is slightly less conservative around crossers/convergers.
 W_OBS, W_OFF, W_PROG        = 2.0, 2.0, 1.0
+# Goal-approach reward (paper's ℓgoal). Per stage k:  ℓgoal = -C_GOAL * max(0, d0 - d_k), with
+# d0 = Euclidean distance to the goal at the rollout start and d_k = ||p_k - p_goal|| the true
+# Euclidean distance to the goal at stage k. A heavier TERMINAL copy at the last stage H-1
+# (ℓgoal,H-1 = -C_GOAL_TERM * max(0, d0 - d_{H-1})) weights the END position of the rollout, so
+# a rollout is allowed to detour around an obstacle as long as it ENDS closer to the goal — this
+# is what prevents greedy stop-short behaviour. Paper values: C_GOAL 5.0 (goal in line-of-sight)
+# or 0.125 (goal occluded → encourage exploration); C_GOAL_TERM 10.0.
+C_GOAL                      = 5.0
+C_GOAL_TERM                 = 10.0
 
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
 BIG = 200.0
@@ -306,45 +301,23 @@ class RLDataRecorder:
 
 # ── Observation unpacking ────────────────────────────────────────────────────
 
-def _is_frenet_mode(obs: np.ndarray) -> bool:
-    """
-    Detect whether Unity is sending Frenet-frame observations.
-    The stub values when no network is assigned are tangent=(0,1) exactly.
-    A real path tangent will have tangent_z != 1.0 or tangent_x != 0.0.
-    """
-    tan_x = float(obs[18])
-    tan_z = float(obs[19])
-    # Stub: (0.0, 1.0).  Real tangent: anything else (path tangent is unit-length).
-    return not (abs(tan_x) < 1e-4 and abs(tan_z - 1.0) < 1e-4)
-
-
 def obs_to_state(obs: np.ndarray, prev_delta: float = 0.0, prev_accel: float = 0.0):
     """
-    Unpack the Unity 20-D observation vector.
+    Unpack the Unity 20-D observation vector into world/Euclidean coordinates.
 
     Returns
     -------
-    s          : np.ndarray shape (6,)
-                 Global mode   — [x_fwd, y_lat, theta, v, delta_actual, accel_actual]
-                 Frenet mode   — [s_arc, d_cross, theta_e, v, delta_actual, accel_actual]
-    obstacles  : list of (rel_xy, obs_v)
-                 rel_xy is ego-relative (dx, dy) in whichever frame.
-                 CBF uses Euclidean distance so it's frame-independent.
-    goal       : float  — remaining distance / arc-length to goal
-    frenet_mode: bool   — True when TaxiwayNetwork is active in Unity
-    tangent    : np.ndarray (2,) — (tan_x, tan_z) in Unity world space;
-                 use to rotate CBF safe-set or path-following cost
+    s          : np.ndarray shape (6,) — [x_fwd, y_lat, theta, v, delta_actual, accel_actual]
+    obstacles  : list of (rel_xy, obs_v), rel_xy ego-relative (dx, dy) in world coords.
+    goal_xy    : np.ndarray shape (2,) — goal world position (z, x), same axes as ego (obs[18:20]).
 
     A zero-padded obstacle slot has dy == 999; those are skipped.
     """
-    ego0    = float(obs[0])   # x_ego (global) or s (Frenet)
-    ego1    = float(obs[1])   # y_ego (global) or d (Frenet)
-    ego2    = float(obs[2])   # theta (global) or theta_e (Frenet)
+    ego0    = float(obs[0])   # x_ego (world)
+    ego1    = float(obs[1])   # y_ego (world)
+    ego2    = float(obs[2])   # theta (world)
     v       = float(obs[3])
-    goal    = float(obs[16])
-    tan_x   = float(obs[18])
-    tan_z   = float(obs[19])
-    frenet  = _is_frenet_mode(obs)
+    goal_xy = np.array([float(obs[18]), float(obs[19])])   # goal world (z, x)
 
     s = np.array([ego0, ego1, ego2, v, prev_delta, prev_accel])
 
@@ -368,7 +341,7 @@ def obs_to_state(obs: np.ndarray, prev_delta: float = 0.0, prev_accel: float = 0
         obs_v  = np.array([vx_obs, vy_obs])
         obstacles.append((rel_xy, obs_v))
 
-    return s, obstacles, goal, frenet, np.array([tan_x, tan_z])
+    return s, obstacles, goal_xy
 
 
 def beliefs_to_slots(obs: np.ndarray, beliefs) -> np.ndarray:
@@ -399,7 +372,7 @@ def beliefs_to_slots(obs: np.ndarray, beliefs) -> np.ndarray:
 def inject_sensor_noise(obs: np.ndarray, noise_std: float, rng_local) -> np.ndarray:
     """
     Add Gaussian noise to the obstacle observation slots [4..15].
-    Ego state [0..3], goal/cbf [16..17], and tangent [18..19] are not corrupted.
+    Ego state [0..3], goal/cbf [16..17], and goal position [18..19] are not corrupted.
     """
     if noise_std <= 0.0:
         return obs
@@ -569,24 +542,13 @@ def _cvar(cost_kn, alpha):
     return worst.mean(axis=1)
 
 
-def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=None):
+def mppi(s0, mean, obstacles, goal_xy, beliefs=None):
     """
     Sample K_MPPI rollouts with realistic 6D state dynamics.
 
-    Global mode (frenet_mode=False):
-      s0 = [x, y, theta_global, v, delta, accel]. Rollout in world frame.
-      Lane cost penalises lateral position y; obstacles in world coords.
-
-    Frenet mode (frenet_mode=True, tangent=(tan_x, tan_z)):
-      s0 = [s_arc, d, theta_e, v, delta, accel].
-      We RECONSTRUCT the global heading from the path tangent and roll out in
-      the WORLD frame so that obstacle deltas/velocities (which Unity always
-      sends in world coords) stay in one consistent frame as the ego heading.
-      The lane-following cost is then recovered by projecting the world-frame
-      displacement onto the path tangent (progress) and normal (cross-track).
-
-      tangent points along the path in world space: heading angle is
-      atan2(tan_x, tan_z) because the rollout uses cos(theta)->Z, sin(theta)->X.
+    s0 = [x, y, theta_global, v, delta, accel]. Rollout in world frame.
+    goal_xy = goal world position (x_fwd, y_lat), same axes as the rollout state.
+    Lane cost penalises lateral position y; obstacles in world coords.
 
     Returns (u_nom, new_mean).
     """
@@ -613,248 +575,80 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
     # Taper the speed TARGET down as the goal gets close (see GOAL_SLOWDOWN_DIST doc comment) so
     # the aircraft's turn radius shrinks enough to actually hit the small arrival capture radius
     # instead of sweeping past it at cruise speed.
-    slow_frac = np.clip(goal / GOAL_SLOWDOWN_DIST, 0.0, 1.0)
+    s0_fwd = s0[0]
+    s0_lat = s0[1]
+
+    # Goal world position (sent by Unity, obs[18:20]) and the initial Euclidean distance to it.
+    goal_fwd, goal_lat = float(goal_xy[0]), float(goal_xy[1])
+    d0 = np.hypot(goal_fwd - s0_fwd, goal_lat - s0_lat)
+
+    slow_frac = np.clip(d0 / GOAL_SLOWDOWN_DIST, 0.0, 1.0)
     v_des_eff = GOAL_MIN_SPEED + (V_DES - GOAL_MIN_SPEED) * slow_frac
-
-    if frenet_mode:
-        # Reconstruct world heading and roll out from a zeroed world origin.
-        tan_x, tan_z = float(tangent[0]), float(tangent[1])
-        th_tan = np.arctan2(tan_x, tan_z)          # path heading in world frame
-        d0     = s0[1]                             # initial cross-track error
-        th_g0  = th_tan - s0[2]                     # theta_e = th_tan - th_global
-        st[:, 0] = 0.0                              # world Z displacement from start
-        st[:, 1] = 0.0                              # world X displacement from start
-        st[:, 2] = th_g0                            # world heading
-        s0_fwd = 0.0
-        s0_lat = 0.0
-    else:
-        s0_fwd = s0[0]
-        s0_lat = s0[1]
-
-    # Uncertainty mode: sample per-obstacle future scenarios once, and accumulate
-    # obstacle cost per (rollout, scenario) so it can be aggregated with CVaR below.
-    if UNCERTAINTY and obstacles:
-        # Per-obstacle route belief (live posterior) drives both the scenario draw
-        # and the entropy used by the caution term. Falls back to the fixed prior.
-        if beliefs is None:
-            beliefs = [None] * len(obstacles)
-        scen          = [_sample_obstacle_scenarios(ov, bp) for (_, ov), bp in zip(obstacles, beliefs)]
-        ent           = [_entropy(bp) if bp is not None else np.log(len(ROUTE_HYPOTHESES))
-                         for bp in beliefs]
-        cost_obs_scen = np.zeros((K_MPPI, N_SCEN))
-    else:
-        scen = None
 
     for k in range(H_MPPI):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
 
-        if frenet_mode:
-            # Cross-track error d(t) = d0 + (Tz*ΔX - Tx*ΔZ); matches GetRelativeState sign.
-            d_t     = d0 + tan_z * lat - tan_x * fwd
-            theta_e = th_tan - th
-            # NO lane-tracking (cross-track) cost — the ego is not following a lane, it just
-            # goes to the goal. The ONLY guidance term is heading-toward-the-goal-bearing
-            # (theta_e^2): it points the aircraft at the goal so steering noise can't self-
-            # reinforce into a runaway turn (the persistent "circling"), but it imposes no
-            # penalty on WHERE the ego is laterally, so it's free to swing wide around obstacles
-            # under the LiDAR static/visibility costs + CBF. Cross-track (d_t) is left unused.
-            cost += w_head_eff * theta_e**2
-        else:
-            #TODO not currenlty used, remove the frenet branch and use euclidean coordinates instead
-            cost += w_lat_eff  * (lat - lane_bias)**2
-            cost += w_head_eff * th**2
-            cost += np.where(np.abs(lat) > W_HALF, w_off_eff * (np.abs(lat) - W_HALF)**2, 0.)
+        # Keeping only heading cost at the moment, no lane cost used
+        #cost += w_head_eff * th**2
 
-        cost += W_V    * (vv - v_des_eff)**2
-        cost += W_CTRL * (na[:, k, 0]**2 + 4. * na[:, k, 1]**2)
+        # ℓgoal = -C_GOAL * max(0, d0 - d_k): reward net closure toward the goal by this stage,
+        # d_k = ||p_k - p_goal|| the true Euclidean distance to the goal at stage k.
+        d_k = np.hypot(goal_fwd - fwd, goal_lat - lat)
+        cost += -C_GOAL * np.maximum(0.0, d0 - d_k)
 
-        # LiDAR static-obstacle avoidance: soft influence ring + hard keep-out from any
-        # OCCUPIED cell in the persistent map (walls / parked aircraft / buildings — objects
-        # the oracle obstacle list never contains). This is what actually makes the planner
-        # detour around a building; the visibility term below is a separate "peek around
-        # blind corners" incentive and does not by itself avoid a collision.
-        if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            pts_rel = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
-            d_static = LIDAR_COSTMAP.distance(pts_rel)
-            cost += np.where(d_static < D_INFL_STATIC,
-                             W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
-            cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
+        #cost += W_V    * (vv - v_des_eff)**2
+        #cost += W_CTRL * (na[:, k, 0]**2 + 4. * na[:, k, 1]**2)
 
-        # Active perception (LiDAR visibility): penalise ending this step at a position from
-        # which the occluded, path-relevant region stays hidden. Zero when the ROI is empty, so
-        # behaviour is nominal unless there is genuinely occluded space worth seeing.
-        if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            pts_rel = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
-            cost += W_VIS * (LIDAR_COSTMAP.hidden_fraction(pts_rel))
+        # if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+        #     pts_rel = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
+        #     d_static = LIDAR_COSTMAP.distance(pts_rel)
+        #     cost += np.where(d_static < D_INFL_STATIC,
+        #                      W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
+        #     cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
+
+        # if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+        #     pts_rel = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
+        #     cost += W_VIS * (LIDAR_COSTMAP.hidden_fraction(pts_rel))
 
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
-        t_elapsed = (k + 1) * DT
-        if scen is not None:
-            # Scenario-based prediction: each obstacle has N_SCEN sampled futures.
-            for oi, ((rel_xy, _ov), (ovx, ovy), ent_b) in enumerate(zip(obstacles, scen, ent)):
-                di, ds = d_infl_arr[oi], d_safe_arr[oi]
-                oz = s0_fwd + rel_xy[0] + ovx * t_elapsed        # (N_SCEN,)
-                ox = s0_lat + rel_xy[1] + ovy * t_elapsed        # (N_SCEN,)
-                d_obs = np.hypot(fwd[:, None] - oz[None, :],
-                                 lat[:, None] - ox[None, :])      # (K, N_SCEN)
-                cost_obs_scen += np.where(d_obs < di, W_OBS * (di - d_obs)**2, 0.)
-                cost_obs_scen += np.where(d_obs < ds, BIG, 0.)
-        else:
-            # Deterministic (single constant-velocity ray) obstacle cost: soft influence ring +
-            # hard keep-out, per obstacle.
-            for oi, (rel_xy, obs_v) in enumerate(obstacles):
-                di, ds = d_infl_arr[oi], d_safe_arr[oi]
-                obs_z = s0_fwd + rel_xy[0] + obs_v[0] * t_elapsed
-                obs_x = s0_lat + rel_xy[1] + obs_v[1] * t_elapsed
-                d_obs = np.hypot(fwd - obs_z, lat - obs_x)
-                cost += np.where(d_obs < di, W_OBS * (di - d_obs)**2, 0.)
-                cost += np.where(d_obs < ds, BIG, 0.)
+        # t_elapsed = (k + 1) * DT
+        # if scen is not None:
+        #     # Scenario-based prediction: each obstacle has N_SCEN sampled futures.
+        #     for oi, ((rel_xy, _ov), (ovx, ovy), ent_b) in enumerate(zip(obstacles, scen, ent)):
+        #         di, ds = d_infl_arr[oi], d_safe_arr[oi]
+        #         oz = s0_fwd + rel_xy[0] + ovx * t_elapsed        # (N_SCEN,)
+        #         ox = s0_lat + rel_xy[1] + ovy * t_elapsed        # (N_SCEN,)
+        #         d_obs = np.hypot(fwd[:, None] - oz[None, :],
+        #                          lat[:, None] - ox[None, :])      # (K, N_SCEN)
+        #         cost_obs_scen += np.where(d_obs < di, W_OBS * (di - d_obs)**2, 0.)
+        #         cost_obs_scen += np.where(d_obs < ds, BIG, 0.)
+        # else:
+        #     # Deterministic (single constant-velocity ray) obstacle cost: soft influence ring +
+        #     # hard keep-out, per obstacle.
+        #     for oi, (rel_xy, obs_v) in enumerate(obstacles):
+        #         di, ds = d_infl_arr[oi], d_safe_arr[oi]
+        #         obs_z = s0_fwd + rel_xy[0] + obs_v[0] * t_elapsed
+        #         obs_x = s0_lat + rel_xy[1] + obs_v[1] * t_elapsed
+        #         d_obs = np.hypot(fwd - obs_z, lat - obs_x)
+        #         cost += np.where(d_obs < di, W_OBS * (di - d_obs)**2, 0.)
+        #         cost += np.where(d_obs < ds, BIG, 0.)
 
-    # Risk-aware obstacle cost: aggregate the sampled futures with CVaR (tail-mean)
-    # rather than the mean, so a plausible bad branch/timing dominates the score.
-    # if scen is not None:
-    #     cost += _cvar(cost_obs_scen, CVAR_ALPHA)
+    # Terminal goal cost ℓgoal,H-1 = -C_GOAL_TERM * max(0, d0 - d_{H-1}): a heavier copy of the
+    # goal reward evaluated at the FINAL rollout state, so a rollout that ENDS closer to the goal
+    # wins even if it detoured en route (lets the planner go around obstacles instead of stopping
+    # short). st is the final rollout state here.
+    d_H1 = np.hypot(goal_fwd - st[:, 0], goal_lat - st[:, 1])
+    cost += -C_GOAL_TERM * np.maximum(0.0, d0 - d_H1)
 
-    # Learned terminal value: predicted cost-to-go from each rollout's ENDPOINT,
-    # discounted to be commensurate with the summed stage costs. Rollouts that END
-    # prepared (offset, moderated speed vs. ambiguous traffic) win the softmax even
-    # though their payoff lies beyond the horizon — learned anticipation replacing
-    # the hand-tuned early-reaction gates. st here is the final rollout state.
-    # if VALUE_NET is not None:
-    #     X_term = terminal_features(
-    #         st, obstacles, beliefs, goal, T=H_MPPI * DT,
-    #         frenet_mode=frenet_mode, tangent=tangent,
-    #         d0=(d0 if frenet_mode else 0.0), s0_fwd=s0_fwd, s0_lat=s0_lat)
-    #     cost += W_TERM * (GAMMA_VALUE ** H_MPPI) * VALUE_NET(X_term)
-
-    # Progress
-    if frenet_mode:
-        prog = tan_z * st[:, 0] + tan_x * st[:, 1]   # displacement along tangent
-        cost += W_PROG * (goal - prog)
-    else:
-        cost += W_PROG * (goal - (st[:, 0] - s0_fwd))
-
-    # Leave -cost.min() to avoid underflow
+    # Leave -cost.min() to avoid underflow, softmax to compute the weights
     w   = np.exp(-(cost - cost.min()) / LAMBDA)
     w  /= w.sum()
     opt = (w[:, None, None] * na).sum(axis=0)
 
     u_nom    = opt[0].copy()
     new_mean = np.vstack([opt[1:], opt[-1]])
-    # Decay the retained STEERING plan toward zero each call. Without this, a strong avoidance
-    # turn (BIG=200 keep-out while passing an obstacle) leaves the running `mean` heavily biased
-    # toward "keep turning," and because the next call's noise is sampled AROUND that mean
-    # (rng.normal(mean, ...)), recovery back toward the goal bearing can be sluggish — exploration
-    # stays centred on continuing the turn for many steps even after the obstacle cost has faded,
-    # which reads as "it overcomes the obstacle then just keeps going that way." Decaying steering
-    # (not acceleration) makes a stale turn commitment fade on its own within a few steps unless
-    # the current cost (heading-to-goal, or a still-nearby obstacle) keeps reinforcing it.
-    new_mean[:, 1] *= MEAN_STEER_DECAY
     return u_nom, new_mean
-
-
-# ── HOCBF-QP ─────────────────────────────────────────────────────────────────
-
-def hocbf_constraint(s, u_nom, rel_xy, obs_v):
-    """
-    Compute one HOCBF constraint row for a single obstacle.
-    Returns (A_row, b_row) for the QP inequality A @ u >= b.
-
-    rel_xy : ego-relative obstacle position (dx_fwd, dy_lat) — works in both frames
-             because h = dist² - D² is Euclidean and frame-independent for constraint geometry.
-    """
-    x, y, th, v  = s
-    a_nom  = float(np.clip(u_nom[0], A_MIN, A_MAX))
-    d_nom  = float(np.clip(u_nom[1], -DELTA_LIM, DELTA_LIM))
-    # dx, dy are relative to ego: obstacle is at (x+rel_xy[0], y+rel_xy[1])
-    dx     = -rel_xy[0]   # ego → obstacle: ego minus obstacle = -(obs - ego)
-    dy     = -rel_xy[1]
-    vx, vy = obs_v
-    rel_vx = v * np.cos(th) - vx
-    rel_vy = v * np.sin(th) - vy
-
-    h    = dx**2 + dy**2 - D_SAFE**2
-    hdot = 2. * (dx * rel_vx + dy * rel_vy)
-
-    tand    = np.tan(d_nom)
-    sec2d   = 1. + tand**2
-    thdot_n = v / L * tand
-
-    hh_kin = 2. * (rel_vx**2 + rel_vy**2)
-    hh_th  = 2.*dx*(-v*np.sin(th)*thdot_n) + 2.*dy*(v*np.cos(th)*thdot_n)
-    hh_a   = (2.*dx*np.cos(th) + 2.*dy*np.sin(th)) * a_nom
-    hh_nom = hh_kin + hh_th + hh_a
-
-    dHH_da  = 2.*dx*np.cos(th) + 2.*dy*np.sin(th)
-    dthd_dd = v / L * sec2d
-    dHH_dd  = 2.*dx*(-v*np.sin(th))*dthd_dd + 2.*dy*(v*np.cos(th))*dthd_dd
-
-    rhs = (-(ALPHA1 + ALPHA2)*hdot - ALPHA1*ALPHA2*h
-           - hh_nom + dHH_da*a_nom + dHH_dd*d_nom)
-
-    return np.array([dHH_da, dHH_dd]), rhs
-
-
-def cbf_qp(s, u_nom, obstacles, lat=0.0):
-    """
-    Solve the safety QP with one constraint row per obstacle:
-        min  (u - u_nom)^T W (u - u_nom)
-        s.t. A_cbf[i] @ u >= b_cbf[i]  for each obstacle i
-             A_MIN <= a <= A_MAX
-             |delta| <= DELTA_LIM
-
-    lat: current lateral offset [m] — used to detect committed go-around.
-    Returns (u_cmd, cbf_engaged).
-    """
-    a_nom = float(np.clip(u_nom[0], A_MIN, A_MAX))
-    d_nom = float(np.clip(u_nom[1], -DELTA_LIM, DELTA_LIM))
-    u_n   = np.array([a_nom, d_nom])
-
-    # During a go-around (large lateral offset), strongly prefer steering over braking
-    alpha_w = ALPHA_W_GOAROUND if abs(lat) > LAT_GOAROUND else ALPHA_W
-    W = np.diag([1., alpha_w])
-    c = W @ u_n
-
-    # Box constraints: a >= A_MIN, a <= A_MAX, delta >= -DELTA_LIM, delta <= DELTA_LIM
-    C_box = np.array([[ 1., 0.], [-1., 0.], [0.,  1.], [0., -1.]]).T   # (2, 4)
-    b_box = np.array([A_MIN, -A_MAX, -DELTA_LIM, -DELTA_LIM])
-
-    th   = float(s[2])
-    ehat = np.array([np.cos(th), np.sin(th)])   # ego heading unit vector
-
-    cbf_rows = []  # obstacles is list of (rel_xy, obs_v)
-    cbf_rhs  = []
-    for obs_xy, obs_v in obstacles:
-        # Velocity-based geometry gate (see CBF_MOVER_MIN / CBF_COS_GATE note).
-        # Static blockers always engage; movers engage only when their velocity is
-        # aligned with the heading axis (head-on/along-track), not for pure crossers.
-        v_obs = np.asarray(obs_v, dtype=float)
-        speed = float(np.hypot(v_obs[0], v_obs[1]))
-        if speed >= CBF_MOVER_MIN:
-            cos_align = abs(float(v_obs @ ehat)) / speed
-            if cos_align < CBF_COS_GATE:
-                continue   # perpendicular crosser — braking is impotent, skip
-        row, rhs = hocbf_constraint(s, u_nom, obs_xy, obs_v)
-        cbf_rows.append(row)
-        cbf_rhs.append(rhs)
-
-    if cbf_rows:
-        C_cbf = np.array(cbf_rows).T          # (2, n_active)
-        b_cbf = np.array(cbf_rhs)
-        C = np.hstack([C_cbf, C_box])          # (2, n_active + 4)
-        b = np.concatenate([b_cbf, b_box])
-    else:
-        C = C_box
-        b = b_box
-
-    try:
-        u_star  = quadprog.solve_qp(W, c, C, b, 0)[0]
-        engaged = bool(np.linalg.norm(u_star - u_n) > 1e-3)
-        return u_star, engaged
-    except Exception:
-        return np.array([A_MIN, d_nom]), True
-
 
 # ── System identification ─────────────────────────────────────────────────────
 
@@ -1015,8 +809,7 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 
 def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         min_difficulty=0.0, max_difficulty=1.0,
-        noise_std=0.0, scenario_type=SCENARIO_STANDARD, no_cbf=False,
-        detect_range=float("inf"), dataset_path=None,
+        noise_std=0.0, scenario_type=SCENARIO_STANDARD, detect_range=float("inf"), dataset_path=None,
         uncertainty=False, cvar_alpha=CVAR_ALPHA, n_scenarios=N_SCEN, w_info=W_INFO,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         value_net_path=None, w_term=W_TERM, pin_episode=None,
@@ -1140,8 +933,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
               f"v_amb={sc['ambulance_speed']:.2f} m/s  "
               f"diff={sc['difficulty']:.2f}  "
               f"noise={noise_std:.3f}  "
-              f"dir={'L' if sc['cross_dir_sign'] < 0 else 'R'}  "
-              f"{'[NO-CBF]' if no_cbf else '[CBF]'}")
+              f"dir={'L' if sc['cross_dir_sign'] < 0 else 'R'}")
 
         try:
             env.reset()
@@ -1153,7 +945,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         ep_steps     = 0
         delta_actual = 0.0   # tracked Python-side to feed into MPPI state
         accel_actual = 0.0
-        frenet_mode  = False
         episode_done = False
         # Re-seed MPPI per episode so CBF vs no-CBF runs are directly comparable.
         rng = np.random.default_rng(BASE_SEED + ep)
@@ -1181,7 +972,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             ep_steps += 1
 
             obs_n = inject_sensor_noise(obs, noise_std, rng)
-            s, obstacles, goal, frenet_mode, tangent = obs_to_state(obs_n, delta_actual, accel_actual)
+            s, obstacles, goal_xy = obs_to_state(obs_n, delta_actual, accel_actual)
 
             # Emit the previous transition now that its next_obs (obs_n) is available.
             # Reward: light progress shaping (forward speed); terminal bonus is added at
@@ -1192,10 +983,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                                     obs_n, False, task_id, prev_beliefs)
 
             if ep_steps % 20 == 0:
-                mode_str = f"[Frenet tan=({tangent[0]:.2f},{tangent[1]:.2f})]" if frenet_mode else "[global]"
-                print(f"[DEBUG] {mode_str} fwd={s[0]:.1f} lat={s[1]:.2f} "
+                print(f"[DEBUG] [global] fwd={s[0]:.1f} lat={s[1]:.2f} "
                       f"th={s[2]:.3f} v={s[3]:.2f} δ={s[4]:.3f} a_act={s[5]:.2f}  "
-                      f"{len(obstacles)} obs  goal={goal:.1f}")
+                      f"{len(obstacles)} obs  goal_dist={np.hypot(goal_xy[0]-s[0], goal_xy[1]-s[1]):.1f}")
 
             # Update the per-obstacle route belief from this step's observations. The
             # tracker now runs in EVERY mode (not just --uncertainty): the beliefs feed
@@ -1208,29 +998,15 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             # the known dynamic agents (the oracle handles those). ego_fwd (world a0,a1)
             # orients the visibility ROI wedge — same axes as the mppi rollout frame.
             if LIDAR_COSTMAP is not None:
-                if frenet_mode:
-                    _n = float(np.hypot(tangent[0], tangent[1])) or 1.0
-                    ego_fwd = np.array([tangent[1] / _n, tangent[0] / _n])  # (tan_z, tan_x)
-                else:
-                    ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
+                ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
                 LIDAR_COSTMAP.update(ego_fwd, [rel for rel, _ in obstacles])
 
-            u_nom, mean = mppi(s, mean, obstacles, goal, frenet_mode, tangent, beliefs)
+            u_nom, mean = mppi(s, mean, obstacles, goal_xy, beliefs)
 
-            if no_cbf:
-                u_cmd      = u_nom
-                cbf_engaged = False
-            else:
-                # CBF must run in the WORLD frame: obstacle deltas/velocities are world-frame,
-                # so the ego heading fed to the CBF must be world-frame too. In Frenet mode the
-                # observed heading is theta_e (path-relative), so reconstruct global heading.
-                if frenet_mode:
-                    th_tan   = np.arctan2(tangent[0], tangent[1])
-                    th_world = th_tan - s[2]
-                    s_cbf    = np.array([0.0, 0.0, th_world, s[3]])
-                else:
-                    s_cbf    = s[:4]
-                u_cmd, cbf_engaged = cbf_qp(s_cbf, u_nom, obstacles, lat=float(s[1]))
+            
+            u_cmd      = u_nom
+            cbf_engaged = False
+
             a_cmd     = float(np.clip(u_cmd[0], A_MIN, A_MAX))
             delta_cmd = float(np.clip(u_cmd[1], -DELTA_LIM, DELTA_LIM))
 
@@ -1255,11 +1031,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             ep_log["min_dist"] = min(ep_log["min_dist"], dist)
             ep_log["steps"]    = ep_steps
 
-            if cbf_engaged:
-                print(f"  [CBF] t={ep_steps*DT:.1f}s  h={h_val:.1f}  dist={dist:.2f}m  "
-                      f"a_nom={u_nom[0]:.2f}→{a_cmd:.2f}  "
-                      f"d_nom={u_nom[1]:.3f}→{delta_cmd:.3f}  "
-                      f"n_obs={len(obstacles)}")
 
             action = ActionTuple(
                 continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)
@@ -1368,23 +1139,10 @@ if __name__ == "__main__":
                    help="Force a specific scenario type for all episodes, or "
                         "'mixed' to randomise across the active crossing-conflict types "
                         "(standard, headon, follow_vehicle, intersection) per episode.")
-    p.add_argument("--no-cbf",         action="store_true",
-                   help="Disable the HOCBF-QP safety filter (MPPI only). "
-                        "Use for ablation baseline.")
     p.add_argument("--detect-range",   default=float("inf"), type=float,
                    help="Euclidean detection range [m]. Obstacles beyond this distance "
                         "are masked from MPPI and CBF, simulating finite sensor range. "
                         "Default=inf (oracle). Try 25 for a tight reaction window.")
-    p.add_argument("--dataset",        default=None,
-                   help="Path to save the recorded offline-RL dataset (.npz). "
-                        "Omit to skip saving (e.g. for quick ablation runs).")
-    p.add_argument("--uncertainty",    action="store_true",
-                   help="Enable uncertainty-aware MPPI: predict each obstacle's future as "
-                        "route-hypotheses × speed-distribution scenarios and score the "
-                        "obstacle cost with CVaR instead of a single deterministic value.")
-    p.add_argument("--cvar-alpha",     default=CVAR_ALPHA, type=float,
-                   help="CVaR tail fraction for obstacle cost (0→worst-case robust, "
-                        "1→risk-neutral mean). Only used with --uncertainty.")
     p.add_argument("--n-scenarios",    default=N_SCEN, type=int,
                    help="Number of sampled obstacle futures per MPPI call. Only used with --uncertainty.")
     p.add_argument("--w-info",         default=W_INFO, type=float,
@@ -1440,11 +1198,7 @@ if __name__ == "__main__":
         max_difficulty=args.max_difficulty,
         noise_std=args.noise_std,
         scenario_type=sc_int,
-        no_cbf=args.no_cbf,
         detect_range=args.detect_range,
-        dataset_path=args.dataset,
-        uncertainty=args.uncertainty,
-        cvar_alpha=args.cvar_alpha,
         n_scenarios=args.n_scenarios,
         w_info=args.w_info,
         d_infl=args.d_infl,
