@@ -9,29 +9,33 @@ using UnityEngine;
 /// ML-Agents Agent for aircraft taxiing.
 /// External Python process sends actions [a, delta] each decision step.
 ///
+/// No taxiway/map/Frenet path-following: the ego always navigates by a live straight-line
+/// bearing to a goal marker, in free space. Obstacle avoidance (CBF/MPPI for dynamic agents,
+/// the LiDAR static costmap for buildings/walls) is frame-independent and unaffected.
+///
 /// OBSERVATION VECTOR (20 floats — must match Python OBS_SIZE=20):
 ///
-///   WITHOUT network (global frame, backward-compat fallback):
+///   With a goal marker resolved (ResolveGoalMarker() != null):
+///   [0]  0         (s stub — always at the start of the live bearing segment)
+///   [1]  0         (d stub — always 0: no lane, no cross-track cost)
+///   [2]  theta_e   — heading error vs the live bearing to the goal [rad]
+///   [3]  v
+///   [4..15]        3 × obstacle (dx_global, dy_global, vx, vy)
+///   [16] goal_dx   — true Euclidean distance to the goal [m]
+///   [17] cbf_h
+///   [18] tangent_x — world X component of the live bearing to the goal
+///   [19] tangent_z — world Z component of the live bearing to the goal
+///
+///   Legacy fallback (no goal marker assigned anywhere):
 ///   [0]  x_ego    — Unity Z position [m]
 ///   [1]  y_ego    — Unity X position [m]
 ///   [2]  theta    — heading [rad]
 ///   [3]  v
 ///   [4..15]        3 × obstacle (dx_global, dy_global, vx, vy)
-///   [16] goal_dx  — Unity Z distance to goal
+///   [16] goal_dx  — 999 (no goal marker to measure against)
 ///   [17] cbf_h
 ///   [18] 0        (tangent_x stub)
 ///   [19] 1        (tangent_z stub — points forward)
-///
-///   WITH network (Frenet frame):
-///   [0]  s         — arc-length along ego path [m]
-///   [1]  d         — signed cross-track error [m]  (+ = left)
-///   [2]  theta_e   — heading error vs path tangent [rad]
-///   [3]  v
-///   [4..15]        3 × obstacle (dx_global, dy_global, vx, vy)  ← still global Δ
-///   [16] goal_ds  — remaining arc-length to path end [m]
-///   [17] cbf_h
-///   [18] tangent_x — world X component of path tangent (for CBF rotation in Python)
-///   [19] tangent_z — world Z component of path tangent
 ///
 /// COORDINATE MAPPING:
 ///   Python X (forward) = Unity +Z
@@ -92,11 +96,6 @@ public class TaxiAgent : Unity.MLAgents.Agent
              "Leave null to fall back to the single-agent incursionController path.")]
     public TaxiScenarioManager scenarioManager;
 
-    [Header("Map network (optional — enables Frenet frame observations)")]
-    [Tooltip("Assign the TaxiwayNetwork in the scene to switch observations to Frenet frame. " +
-             "BehaviorParameters must be set to 20 continuous observations.")]
-    public TaxiwayNetwork network;
-
     // ── Legacy single-agent fields (kept for backward compatibility) ───────────
 
     [Header("Legacy single-agent (used only when scenarioManager is null)")]
@@ -134,6 +133,11 @@ public class TaxiAgent : Unity.MLAgents.Agent
     // arrival logic (e.g. the follow-vehicle arrival test).
     int _scenarioType;
 
+    // True once the goal has been reached this episode: freezes the aircraft (zero speed, no
+    // further dynamics) instead of letting it keep driving/overshoot for the frame(s) between
+    // detecting arrival and the episode actually resetting. Reset each episode.
+    bool _stoppedAtGoal;
+
     // ── Unity / ML-Agents lifecycle ────────────────────────────────────────────
 
     public override void Initialize()
@@ -154,6 +158,7 @@ public class TaxiAgent : Unity.MLAgents.Agent
         _deltaActual  = 0f;
         _accelActual  = 0f;
         _episodeTime  = 0f;
+        _stoppedAtGoal = false;
 
         var ep = Academy.Instance.EnvironmentParameters;
 
@@ -246,36 +251,37 @@ public class TaxiAgent : Unity.MLAgents.Agent
     public override void CollectObservations(VectorSensor sensor)
     {
         // ── Ego state [0..3] ───────────────────────────────────────────────────
-        TaxiwayPath egoPath = scenarioManager != null ? scenarioManager.EgoPath : null;
-        Vector3     tangent = new Vector3(0f, 0f, 1f); // default: straight ahead
-        float       ego0, ego1, ego2, goal_val;
+        // No TaxiwayNetwork/Frenet path-following: the ego always navigates by a live
+        // straight-line bearing to the goal marker, in free space. d is always 0 by
+        // construction (there is no lane), so only progress-to-goal, control effort, and
+        // obstacle avoidance (CBF/MPPI + LiDAR static cost, both frame-independent) drive
+        // the plan.
+        Vector3 tangent = new Vector3(0f, 0f, 1f); // default: straight ahead
+        float   ego0, ego1, ego2, goal_val;
 
-        if (network != null && egoPath != null)
+        Transform goalT = ResolveGoalMarker();
+        if (goalT != null)
         {
-            // Frenet frame
-            PathState ps = network.GetRelativeState(transform.position, transform.forward, egoPath);
-            // Direction toward the goal along the lane. +1 for scenario mode; two-point mode sets it
-            // to -1 when the goal lies at a lower arc-length, so the reported tangent / cross-track /
-            // goal all orient to the travel direction rather than the taxiway's stored waypoint order.
-            float sign = scenarioManager != null ? scenarioManager.EgoPathSign : 1f;
-            tangent = sign * ps.tangent;
-            ego0    = ps.s;
-            ego1    = sign * ps.d;
-            ego2    = (sign > 0f) ? ps.thetaError : HeadingErrorTo(tangent);
-            // Goal arc: manager's EgoGoalS. Remaining distance in the travel direction, clamped ≥ 0.
-            float goalS = scenarioManager != null ? scenarioManager.EgoGoalS : egoPath.TotalLength;
-            goal_val = Mathf.Max(0f, sign * (goalS - ps.s));
+            Vector3 toGoal = goalT.position - transform.position;
+            toGoal.y = 0f;
+            float dist = toGoal.magnitude;
+            Vector3 bearing = dist > 1e-3f ? toGoal.normalized : transform.forward;
+            bearing.y = 0f;
+
+            tangent  = bearing;
+            ego0     = 0f;                          // s — always at the start of the live bearing segment
+            ego1     = 0f;                           // d — always 0: no lane, no cross-track cost
+            ego2     = HeadingErrorTo(bearing);      // theta_e — heading error vs bearing to goal
+            goal_val = dist;
         }
         else
         {
-            // Global frame (backward-compat)
+            // Legacy global-frame fallback (no goal marker at all).
+            float th = transform.eulerAngles.y * Mathf.Deg2Rad;
             ego0 = transform.position.z;
             ego1 = transform.position.x;
-            float th = transform.eulerAngles.y * Mathf.Deg2Rad;
             ego2 = Mathf.Atan2(Mathf.Sin(th), Mathf.Cos(th));
-            goal_val = goalMarker != null
-                ? goalMarker.position.z - transform.position.z
-                : 999f;
+            goal_val = 999f;
         }
 
         sensor.AddObservation(ego0);
@@ -342,6 +348,15 @@ public class TaxiAgent : Unity.MLAgents.Agent
 
     public override void OnActionReceived(ActionBuffers actions)
     {
+        // Already reached the goal this episode: stay parked, ignore further commands, until
+        // OnEpisodeBegin resets us. Prevents the aircraft continuing to drive/overshoot past the
+        // goal (or into something beyond it) for the frame(s) between arrival and episode reset.
+        if (_stoppedAtGoal)
+        {
+            _speed = 0f;
+            return;
+        }
+
         float a_cmd     = actions.ContinuousActions[0];
         float delta_cmd = actions.ContinuousActions[1];
 
@@ -350,25 +365,18 @@ public class TaxiAgent : Unity.MLAgents.Agent
 
         _episodeTime += Time.fixedDeltaTime;
 
-        // Goal distance: arc-length remaining when on network, global Z delta otherwise.
-        TaxiwayPath egoPathAct = scenarioManager != null ? scenarioManager.EgoPath : null;
-        float goal_dx;
-        if (network != null && egoPathAct != null)
-        {
-            float goalS = scenarioManager != null ? scenarioManager.EgoGoalS : egoPathAct.TotalLength;
-            float sign  = scenarioManager != null ? scenarioManager.EgoPathSign : 1f;
-            float sArc  = network.GetRelativeState(transform.position, transform.forward, egoPathAct).s;
-            goal_dx = Mathf.Max(0f, sign * (goalS - sArc));   // matches CollectObservations' goal_val
-        }
-        else
-        {
-            goal_dx = goalMarker != null ? goalMarker.position.z - transform.position.z : 999f;
-        }
+        // Goal distance: straight-line distance to the goal marker (no map/lane involved).
+        Transform goalTAct = ResolveGoalMarker();
+        float goal_dx = goalTAct != null
+            ? Vector3.Distance(
+                  new Vector3(transform.position.x, 0f, transform.position.z),
+                  new Vector3(goalTAct.position.x,   0f, goalTAct.position.z))
+            : 999f;
 
-        // Off-road: cross-track error in map mode, global X otherwise.
+        // Off-road: never in free-field mode (no lane to leave) — see LaneLateralError.
         float lateralErr = LaneLateralError();
 
-        bool reached = goal_dx < 2.0f;
+        bool reached = goal_dx < 3.0f;
 
         // Follow-vehicle: the lead parks ON the shared goal, so the ego settles ~dSafe behind it
         // and goal_dx never reaches the 2 m threshold — a false timeout. Count arrival when the
@@ -388,7 +396,19 @@ public class TaxiAgent : Unity.MLAgents.Agent
         if (reached)   AddReward( 10f);
         if (_collided) AddReward(-20f);
 
-        if (reached || _collided || timeout || offRoad)
+        if (reached && !_stoppedAtGoal)
+        {
+            // Stop right here and STAY stopped — deliberately NOT ending the episode, so
+            // ML-Agents doesn't immediately reset/respawn the plane back at the start marker for
+            // the next episode (which looked like "it never actually stopped"). It parks here
+            // until collision/timeout/off-road ends the episode for real.
+            _speed         = 0f;
+            _accelActual   = 0f;
+            _deltaActual   = 0f;
+            _stoppedAtGoal = true;
+        }
+
+        if (_collided || timeout || offRoad)
             EndEpisode();
     }
 
@@ -455,21 +475,35 @@ public class TaxiAgent : Unity.MLAgents.Agent
         return Mathf.Atan2(Mathf.Sin(e), Mathf.Cos(e));
     }
 
-    // Signed cross-track error to the ego path (map mode) or global X (fallback).
+    // Goal marker to drive to: prefers the scenario manager's goal marker (freeGoalMode /
+    // two-point workflows) so it doesn't need to be duplicated on this component; falls back to
+    // the legacy goalMarker field.
+    Transform ResolveGoalMarker()
+    {
+        if (scenarioManager != null && scenarioManager.egoGoalMarker != null)
+            return scenarioManager.egoGoalMarker;
+        return goalMarker;
+    }
+
+    // No taxiway/lane: always 0 (never off-road, no cross-track cost) when there's a goal to
+    // navigate to; global X only in the legacy no-goal-marker fallback.
     float LaneLateralError()
     {
-        TaxiwayPath egoPath = scenarioManager != null ? scenarioManager.EgoPath : null;
-        if (network != null && egoPath != null)
-            return network.GetRelativeState(transform.position, transform.forward, egoPath).d;
+        if (ResolveGoalMarker() != null) return 0f;
         return transform.position.x;
     }
 
-    // Heading error vs path tangent (map mode) or global heading (fallback).
+    // Heading error vs the live bearing to the goal; global heading in the legacy fallback.
     float LaneHeadingError()
     {
-        TaxiwayPath egoPath = scenarioManager != null ? scenarioManager.EgoPath : null;
-        if (network != null && egoPath != null)
-            return network.GetRelativeState(transform.position, transform.forward, egoPath).thetaError;
+        Transform goalT = ResolveGoalMarker();
+        if (goalT != null)
+        {
+            Vector3 toGoal = goalT.position - transform.position;
+            toGoal.y = 0f;
+            if (toGoal.sqrMagnitude > 1e-6f) return HeadingErrorTo(toGoal.normalized);
+            return 0f;
+        }
         float th = transform.eulerAngles.y * Mathf.Deg2Rad;
         return Mathf.Atan2(Mathf.Sin(th), Mathf.Cos(th));
     }

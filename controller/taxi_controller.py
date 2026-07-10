@@ -54,7 +54,16 @@ import quadprog
 # ── Parameters — keep in sync with TaxiAgent.cs inspector fields ─────────────
 DT        = 0.1          # Fixed Timestep in Unity (Project Settings → Time)
 L         = 6.0          # wheelbase [m]
-V_DES     = 8.0          # desired taxi speed [m/s] 
+V_DES     = 8.0          # desired taxi speed [m/s]
+# Goal-approach deceleration: at V_DES the aircraft's minimum turn radius can exceed the
+# remaining distance once it's close to the goal, so it geometrically can't curve tightly enough
+# to hit the small arrival capture radius (TaxiAgent's 2 m "reached" threshold) — it sweeps past
+# and has to loop back around, which looks like circling/overshoot right at arrival. Taper the
+# MPPI speed TARGET down as remaining goal distance shrinks below GOAL_SLOWDOWN_DIST so the turn
+# radius shrinks enough for a precise final approach.
+GOAL_SLOWDOWN_DIST = 15.0   # [m] remaining distance at which speed target starts tapering
+GOAL_MIN_SPEED     = 1.5    # [m/s] speed target floor right at the goal (not 0 — avoid stalling
+                            # the bicycle model's steering authority, which rolls off toward 0 speed)
 W_HALF    = 10.0         # taxiway half-width [m]
 D_SAFE    = 10.0          # keep-out radius [m]
 D_INFL    = 16.0         # MPPI obstacle influence radius [m]
@@ -98,9 +107,13 @@ K_MPPI    = 1500         # rollout samples
 LAMBDA    = 1.0          # MPPI temperature
 SIG_A     = 1.0          # noise std for acceleration samples
 SIG_D     = 0.35         # noise std for steering samples
+# Per-call decay applied to the retained STEERING plan (see mppi()'s return). <1 lets a stale
+# avoidance-turn commitment fade back toward straight/goal-seeking within a few steps once the
+# cost stops reinforcing it, instead of the running mean staying pinned to "keep turning."
+MEAN_STEER_DECAY = 0.10
 
 # MPPI stage costs
-W_LAT, W_HEAD, W_V, W_CTRL = 0.05, 2.0, 1.2, 0.05
+W_LAT, W_HEAD, W_V, W_CTRL = 0.05, 4.0, 1.2, 0.05
 # W_OBS lowered and W_PROG raised (was 12.0 / 0.4) so forward progress competes with the obstacle
 # penalty. On a head-on pass the ego can't keep D_SAFE either way (the oncoming agent comes to it),
 # so an over-weighted W_OBS made "stop and wait" the cheapest option; a stronger progress pull makes
@@ -120,9 +133,19 @@ SIG_D_BYPASS  = 0.70  # genuinely wider steering noise (2× SIG_D) so rollouts s
 # D_SAFE/D_INFL used for moving traffic. D_SAFE_STATIC also absorbs the ≤ v·Δt
 # (~0.8 m) staleness of using the latest cloud one control period late.
 LIDAR_COSTMAP  = None    # LidarCostmap instance when --lidar-costmap / --visibility-cost is set
+STATIC_AVOID   = False   # set True by --lidar-costmap: adds the static keep-out/soft-ring cost
+                         # below to MPPI. Independent of VISIBILITY_COST (--visibility-cost),
+                         # which only adds the "peek around blind corners" incentive and does
+                         # NOT by itself avoid a collision with a static surface.
 W_STATIC       = 8.0     # weight of the static-surface soft ring
-D_SAFE_STATIC  = 3.0     # hard keep-out from any observed static surface [m]
-D_INFL_STATIC  = 7.0     # soft influence ring around static surfaces [m]
+# D_SAFE_STATIC is measured from the ego's centre/sensor origin, not the wingtip — size it as
+# (half the aircraft's actual width) + a small buffer, so the HARD keep-out alone guarantees at
+# least one aircraft-width of clearance from any surface. ~10 m wingspan -> half-width 5 m + 1 m
+# buffer = 6 m. D_INFL_STATIC kept only modestly above it (not the much larger 10 m used before)
+# so the soft ring starts the detour close to where it's actually needed instead of forcing a
+# wide early swerve that can require moving the goal well past the obstacle to reach it.
+D_SAFE_STATIC  = 8.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
+D_INFL_STATIC  = 10.0      # soft influence ring around static surfaces [m]
 
 # Active-perception (visibility) cost: per rollout point, the fraction of the
 # occluded, path-relevant region that stays HIDDEN from that position (from the
@@ -131,7 +154,7 @@ D_INFL_STATIC  = 7.0     # soft influence ring around static surfaces [m]
 # there IS occluded relevant space (empty ROI ⇒ term is zero ⇒ nominal). Off
 # unless --visibility-cost. Enables the same LidarCostmap as --lidar-costmap.
 VISIBILITY_COST = False
-W_VIS           = 10.0    # weight on the per-step hidden-fraction. hidden ∈ [0,1] is bounded, so it
+W_VIS           = 0.0    # weight on the per-step hidden-fraction. hidden ∈ [0,1] is bounded, so it
                          # needs a large weight AND the investigate-mode relaxation below to compete
                          # with the quadratic lane cost.
 # Investigate mode: gates a temporary relaxation of lane-keeping AND steering-noise width (see
@@ -587,6 +610,12 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
     cost = np.zeros(K_MPPI)
     st   = np.tile(s0, (K_MPPI, 1)).astype(float)
 
+    # Taper the speed TARGET down as the goal gets close (see GOAL_SLOWDOWN_DIST doc comment) so
+    # the aircraft's turn radius shrinks enough to actually hit the small arrival capture radius
+    # instead of sweeping past it at cruise speed.
+    slow_frac = np.clip(goal / GOAL_SLOWDOWN_DIST, 0.0, 1.0)
+    v_des_eff = GOAL_MIN_SPEED + (V_DES - GOAL_MIN_SPEED) * slow_frac
+
     if frenet_mode:
         # Reconstruct world heading and roll out from a zeroed world origin.
         tan_x, tan_z = float(tangent[0]), float(tangent[1])
@@ -624,30 +653,40 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
             # Cross-track error d(t) = d0 + (Tz*ΔX - Tx*ΔZ); matches GetRelativeState sign.
             d_t     = d0 + tan_z * lat - tan_x * fwd
             theta_e = th_tan - th
-            # Track lane_bias (the give-way offset) rather than the centreline when oncoming traffic
-            # is ahead, so the ego eases to its own side early. The off-taxiway penalty still uses
-            # absolute cross-track, so the ego stays on the pavement.
-            cost += w_lat_eff  * np.abs(d_t - lane_bias)
-            print("LAT_COST =", w_lat_eff  * np.abs(d_t - lane_bias)[:5])
-            #cost += w_head_eff * theta_e**2
-            #cost += np.where(np.abs(d_t) > W_HALF, w_off_eff * (np.abs(d_t) - W_HALF)**2, 0.)
+            # NO lane-tracking (cross-track) cost — the ego is not following a lane, it just
+            # goes to the goal. The ONLY guidance term is heading-toward-the-goal-bearing
+            # (theta_e^2): it points the aircraft at the goal so steering noise can't self-
+            # reinforce into a runaway turn (the persistent "circling"), but it imposes no
+            # penalty on WHERE the ego is laterally, so it's free to swing wide around obstacles
+            # under the LiDAR static/visibility costs + CBF. Cross-track (d_t) is left unused.
+            cost += w_head_eff * theta_e**2
         else:
+            #TODO not currenlty used, remove the frenet branch and use euclidean coordinates instead
             cost += w_lat_eff  * (lat - lane_bias)**2
             cost += w_head_eff * th**2
             cost += np.where(np.abs(lat) > W_HALF, w_off_eff * (np.abs(lat) - W_HALF)**2, 0.)
 
-        cost += W_V    * (vv - V_DES)**2
+        cost += W_V    * (vv - v_des_eff)**2
         cost += W_CTRL * (na[:, k, 0]**2 + 4. * na[:, k, 1]**2)
+
+        # LiDAR static-obstacle avoidance: soft influence ring + hard keep-out from any
+        # OCCUPIED cell in the persistent map (walls / parked aircraft / buildings — objects
+        # the oracle obstacle list never contains). This is what actually makes the planner
+        # detour around a building; the visibility term below is a separate "peek around
+        # blind corners" incentive and does not by itself avoid a collision.
+        if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            pts_rel = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
+            d_static = LIDAR_COSTMAP.distance(pts_rel)
+            cost += np.where(d_static < D_INFL_STATIC,
+                             W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
+            cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
 
         # Active perception (LiDAR visibility): penalise ending this step at a position from
         # which the occluded, path-relevant region stays hidden. Zero when the ROI is empty, so
-        # behaviour is nominal unless there is genuinely occluded space worth seeing. (The static-
-        # obstacle distance cost from the same map is intentionally disabled here — visibility only.)
-
+        # behaviour is nominal unless there is genuinely occluded space worth seeing.
         if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             pts_rel = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
             cost += W_VIS * (LIDAR_COSTMAP.hidden_fraction(pts_rel))
-            print("VIS_COST =", W_VIS * (LIDAR_COSTMAP.hidden_fraction(pts_rel)[:5]))
 
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
         t_elapsed = (k + 1) * DT
@@ -703,6 +742,15 @@ def mppi(s0, mean, obstacles, goal, frenet_mode=False, tangent=None, beliefs=Non
 
     u_nom    = opt[0].copy()
     new_mean = np.vstack([opt[1:], opt[-1]])
+    # Decay the retained STEERING plan toward zero each call. Without this, a strong avoidance
+    # turn (BIG=200 keep-out while passing an obstacle) leaves the running `mean` heavily biased
+    # toward "keep turning," and because the next call's noise is sampled AROUND that mean
+    # (rng.normal(mean, ...)), recovery back toward the goal bearing can be sluggish — exploration
+    # stays centred on continuing the turn for many steps even after the obstacle cost has faded,
+    # which reads as "it overcomes the obstacle then just keeps going that way." Decaying steering
+    # (not acceleration) makes a stale turn commitment fade on its own within a few steps unless
+    # the current cost (heading-to-goal, or a still-nearby obstacle) keeps reinforcing it.
+    new_mean[:, 1] *= MEAN_STEER_DECAY
     return u_nom, new_mean
 
 
@@ -974,7 +1022,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         value_net_path=None, w_term=W_TERM, pin_episode=None,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False):
     global DETECTION_RANGE, UNCERTAINTY, CVAR_ALPHA, N_SCEN, W_INFO
-    global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM, LIDAR_COSTMAP, VISIBILITY_COST
+    global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     CVAR_ALPHA      = cvar_alpha
@@ -999,6 +1047,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
               f"γ^H={GAMMA_VALUE**H_MPPI:.2f})  learned cost-to-go at rollout endpoints")
     if lidar_costmap or visibility_cost:
         VISIBILITY_COST = visibility_cost
+        STATIC_AVOID    = lidar_costmap
         from lidar_costmap import LidarCostmap
         cm = LidarCostmap()
         if cm.start(topic=lidar_topic):
@@ -1010,6 +1059,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                   f"in the MPPI cost; persistent 3-state map")
         else:
             VISIBILITY_COST = False
+            STATIC_AVOID    = False
             print("[Controller] LiDAR map     : requested but unavailable (no rclpy) — "
                   "running WITHOUT LiDAR-based costs")
     env_params = EnvironmentParametersChannel()

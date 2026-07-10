@@ -244,12 +244,28 @@ public class TaxiwayNetwork : MonoBehaviour
     /// <summary>
     /// Returns the Frenet-frame state of the agent relative to the given path.
     /// agentForward should be the world-space forward direction of the agent (Y ignored).
+    ///
+    /// sHint/searchWindow (optional): restrict the nearest-segment search to arc-lengths within
+    /// searchWindow of sHint. Without this, a PURE global nearest-point search can snap onto a
+    /// completely different (and oppositely-oriented) segment of the path whenever the agent is
+    /// pushed far enough off-lane — e.g. swerving wide around a building via the LiDAR static-
+    /// avoidance cost — because some unrelated stretch of the same taxiway polyline happens to
+    /// pass physically closer than the segment the agent actually should be tracking. That snap
+    /// flips the tangent/heading and can jump the arc-length backward, which is why progress
+    /// toward the goal can stall or reverse right after a detour. Pass sHint &lt; 0 (default) for
+    /// the old unrestricted behaviour; callers that track continuity (TaxiAgent) should pass the
+    /// previous frame's s. Falls back to an unrestricted search if nothing falls in the window
+    /// (e.g. first call, or the path changed).
     /// </summary>
-    public PathState GetRelativeState(Vector3 agentPos, Vector3 agentForward, TaxiwayPath path)
+    public PathState GetRelativeState(Vector3 agentPos, Vector3 agentForward, TaxiwayPath path,
+                                      float sHint = -1f, float searchWindow = 40f)
     {
         var wps = path.Waypoints;
+        var cum = path.CumulativeLength;
+        bool useWindow = sHint >= 0f;
 
-        // Find closest point on any segment
+        // Find closest point on any segment (optionally restricted to an arc-length window
+        // around sHint, for continuity — see doc comment above).
         int   bestSeg  = 0;
         float bestT    = 0f;
         float bestDist2 = float.MaxValue;
@@ -257,6 +273,9 @@ public class TaxiwayNetwork : MonoBehaviour
 
         for (int i = 0; i < wps.Count - 1; i++)
         {
+            if (useWindow && (cum[i] < sHint - searchWindow || cum[i] > sHint + searchWindow))
+                continue;
+
             Vector3 a = wps[i], b = wps[i + 1];
             Vector3 ab = b - a;
             float len2 = ab.sqrMagnitude;
@@ -268,6 +287,27 @@ public class TaxiwayNetwork : MonoBehaviour
             if (dist2 < bestDist2)
             {
                 bestDist2 = dist2; bestSeg = i; bestT = t; bestProj = proj;
+            }
+        }
+
+        // Nothing fell inside the window (stale/first hint, or the path changed) — fall back to
+        // an unrestricted search rather than returning a meaningless default.
+        if (useWindow && bestDist2 == float.MaxValue)
+        {
+            for (int i = 0; i < wps.Count - 1; i++)
+            {
+                Vector3 a = wps[i], b = wps[i + 1];
+                Vector3 ab = b - a;
+                float len2 = ab.sqrMagnitude;
+                float t = len2 > 1e-6f
+                    ? Mathf.Clamp01(Vector3.Dot(agentPos - a, ab) / len2)
+                    : 0f;
+                Vector3 proj = a + ab * t;
+                float dist2  = (agentPos - proj).sqrMagnitude;
+                if (dist2 < bestDist2)
+                {
+                    bestDist2 = dist2; bestSeg = i; bestT = t; bestProj = proj;
+                }
             }
         }
 
@@ -328,6 +368,164 @@ public class TaxiwayNetwork : MonoBehaviour
             }
         }
         return found;
+    }
+
+    /// <summary>
+    /// Builds a single continuous taxiway path from startPos to goalPos, stitching across
+    /// intersections when the two points sit on different TaxiwayPath features (e.g. the goal
+    /// is on the far side of an intersection from the start). BFS over the taxiway adjacency
+    /// graph (edges = intersections found by TryFindIntersection), then slices/concatenates the
+    /// waypoints of each path on the route between its entry and exit intersection.
+    ///
+    /// Returns null if start/goal aren't on any taxiway, or no connected route exists — callers
+    /// should fall back to single-path behaviour in that case (e.g. via NearestTaxiway).
+    /// startArc/goalArc are always 0 / stitched.TotalLength since the stitched path is built to
+    /// start exactly at startPos's projection and end exactly at goalPos's projection.
+    /// </summary>
+    public TaxiwayPath BuildRoutedPath(Vector3 startPos, Vector3 goalPos,
+                                       out float startArc, out float goalArc)
+    {
+        startArc = 0f; goalArc = 0f;
+
+        var taxiways = new List<int>();
+        for (int i = 0; i < _paths.Count; i++)
+            if (_paths[i].IsTaxiway) taxiways.Add(i);
+        if (taxiways.Count == 0) return null;
+
+        int startIdx = NearestTaxiwayIndex(startPos, taxiways);
+        int goalIdx  = NearestTaxiwayIndex(goalPos, taxiways);
+        if (startIdx < 0 || goalIdx < 0) return null;
+
+        if (startIdx == goalIdx)
+        {
+            var single = _paths[startIdx];
+            var slice  = SlicePath(single,
+                GetRelativeState(startPos, Vector3.forward, single).s,
+                GetRelativeState(goalPos,  Vector3.forward, single).s);
+            var stitchedSame = new TaxiwayPath { AerowayType = "taxiway" };
+            stitchedSame.Waypoints.AddRange(slice);
+            stitchedSame.Precompute();
+            goalArc = stitchedSame.TotalLength;
+            return stitchedSame;
+        }
+
+        // BFS over taxiway paths; edge (cur -> nb) exists when TryFindIntersection finds a
+        // crossing between them within intersectionThreshold.
+        var prevPath = new Dictionary<int, int>();
+        var viaPoint = new Dictionary<int, Vector3>();
+        var visited  = new HashSet<int> { startIdx };
+        var queue    = new Queue<int>();
+        queue.Enqueue(startIdx);
+
+        while (queue.Count > 0 && !visited.Contains(goalIdx))
+        {
+            int cur = queue.Dequeue();
+            foreach (int nb in taxiways)
+            {
+                if (visited.Contains(nb)) continue;
+                if (!TryFindIntersection(_paths[cur], _paths[nb], out Vector3 ix)) continue;
+                visited.Add(nb);
+                prevPath[nb] = cur;
+                viaPoint[nb] = ix;
+                queue.Enqueue(nb);
+            }
+        }
+
+        if (!visited.Contains(goalIdx))
+        {
+            Debug.LogWarning("[TaxiwayNetwork] BuildRoutedPath: no connected taxiway route from " +
+                              "start to goal (paths never intersect within intersectionThreshold).");
+            return null;
+        }
+
+        // Reconstruct route = [startIdx, ..., goalIdx] and the intersection point entering each
+        // path after the first.
+        var route    = new List<int> { goalIdx };
+        var ixPoints = new List<Vector3>();
+        int c = goalIdx;
+        while (c != startIdx)
+        {
+            ixPoints.Add(viaPoint[c]);
+            c = prevPath[c];
+            route.Add(c);
+        }
+        route.Reverse();
+        ixPoints.Reverse();
+
+        // Stitch: for each path on the route, slice from its entry arc-length to its exit
+        // arc-length (start marker / previous intersection → next intersection / goal marker).
+        var combined = new List<Vector3>();
+        for (int k = 0; k < route.Count; k++)
+        {
+            var path  = _paths[route[k]];
+            float sFrom = (k == 0)
+                ? GetRelativeState(startPos, Vector3.forward, path).s
+                : GetRelativeState(ixPoints[k - 1], Vector3.forward, path).s;
+            float sTo = (k < route.Count - 1)
+                ? GetRelativeState(ixPoints[k], Vector3.forward, path).s
+                : GetRelativeState(goalPos, Vector3.forward, path).s;
+
+            var slice = SlicePath(path, sFrom, sTo);
+            if (combined.Count > 0 && slice.Count > 0 &&
+                Vector3.Distance(combined[combined.Count - 1], slice[0]) < 0.01f)
+                slice.RemoveAt(0);
+            combined.AddRange(slice);
+        }
+
+        var stitched = new TaxiwayPath { AerowayType = "taxiway" };
+        stitched.Waypoints.AddRange(combined);
+        if (stitched.Waypoints.Count < 2) return null;
+        stitched.Precompute();
+        goalArc = stitched.TotalLength;
+        return stitched;
+    }
+
+    int NearestTaxiwayIndex(Vector3 p, List<int> taxiways)
+    {
+        int   best  = -1;
+        float bestD = float.MaxValue;
+        foreach (int i in taxiways)
+        {
+            float d = Mathf.Abs(GetRelativeState(p, Vector3.forward, _paths[i]).d);
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    /// <summary>
+    /// Returns the ordered waypoints of `path` between arc-lengths sFrom and sTo (inclusive),
+    /// oriented from sFrom to sTo (reversed if sFrom &gt; sTo, i.e. travelling backward along
+    /// the source waypoint order).
+    /// </summary>
+    static List<Vector3> SlicePath(TaxiwayPath path, float sFrom, float sTo)
+    {
+        var wps    = path.Waypoints;
+        var cum    = path.CumulativeLength;
+        bool fwd   = sTo >= sFrom;
+        float lo   = Mathf.Min(sFrom, sTo), hi = Mathf.Max(sFrom, sTo);
+
+        Vector3 PointAtArc(float s)
+        {
+            s = Mathf.Clamp(s, 0f, path.TotalLength);
+            for (int i = 0; i < cum.Length - 1; i++)
+            {
+                if (s <= cum[i + 1] || i == cum.Length - 2)
+                {
+                    float segLen = cum[i + 1] - cum[i];
+                    float t = segLen > 1e-6f ? (s - cum[i]) / segLen : 0f;
+                    return Vector3.Lerp(wps[i], wps[i + 1], Mathf.Clamp01(t));
+                }
+            }
+            return wps[wps.Count - 1];
+        }
+
+        var result = new List<Vector3> { PointAtArc(lo) };
+        for (int i = 0; i < wps.Count; i++)
+            if (cum[i] > lo && cum[i] < hi) result.Add(wps[i]);
+        result.Add(PointAtArc(hi));
+
+        if (!fwd) result.Reverse();
+        return result;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

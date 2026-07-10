@@ -32,6 +32,13 @@ public enum ScenarioType
 /// </summary>
 public class TaxiScenarioManager : MonoBehaviour
 {
+    [Header("Free-field point-to-point (no map, no lane cost — highest priority mode)")]
+    [Tooltip("When ON: bypasses the taxiway network and ALL lane/map cost entirely. No TaxiwayNetwork " +
+             "is required. The ego spawns at Ego Start Marker facing Ego Goal Marker and drives straight " +
+             "there, using only obstacle avoidance (CBF/MPPI) — no cross-track or off-road cost, since " +
+             "there is no lane. Takes priority over Two-Point/manualTwoPointMode when both are set.")]
+    public bool freeGoalMode = false;
+
     [Header("Two-point sandbox mode (ignores ALL scenario/episode/difficulty logic)")]
     [Tooltip("When ON: no scenario agents are spawned. The ego is placed at Ego Start Marker facing " +
              "down its taxiway toward Ego Goal Marker, and drives there under the MPPI cost. Drop two " +
@@ -191,6 +198,7 @@ public class TaxiScenarioManager : MonoBehaviour
 
     void Awake()
     {
+        if (freeGoalMode) return;         // free-field: no scenario agents, nothing to pool
         if (manualTwoPointMode) return;   // sandbox: no scenario agents, nothing to pool
         if (incursionPrefab == null || conflictPoints == null || conflictPoints.Count == 0)
         {
@@ -224,6 +232,13 @@ public class TaxiScenarioManager : MonoBehaviour
         _active.Clear();
         foreach (var a in _pool) a.gameObject.SetActive(false);
         EgoPath = null;
+
+        // ── Free-field point-to-point: bypass the map/lane entirely ────────────
+        if (freeGoalMode)
+        {
+            SetupFreeGoal(aircraftTransform);
+            return;
+        }
 
         // ── Two-point sandbox: bypass ALL scenario logic ───────────────────────
         if (manualTwoPointMode)
@@ -916,6 +931,47 @@ public class TaxiScenarioManager : MonoBehaviour
         }
     }
 
+    // ── Free-field point-to-point (no map) ────────────────────────────────────────
+
+    // Place the ego at the start marker facing the goal marker, with EgoPath left null so
+    // TaxiAgent skips the taxiway network entirely and drives straight at the goal, using only
+    // obstacle avoidance (no lane/cross-track cost, no off-road termination — there's no lane).
+    void SetupFreeGoal(Transform aircraftTransform)
+    {
+        EgoPath     = null;
+        EgoGoalS    = 0f;
+        EgoPathSign = 1f;
+        EgoHasSpawn = false;
+
+        if (egoStartMarker == null)
+        {
+            Debug.LogWarning("[TaxiScenarioManager] freeGoalMode needs Ego Start Marker assigned.");
+            return;
+        }
+
+        EgoSpawnPos = egoStartMarker.position;
+
+        Vector3 dir = Vector3.forward;
+        if (egoGoalMarker != null)
+        {
+            Vector3 d = egoGoalMarker.position - egoStartMarker.position;
+            d.y = 0f;
+            if (d.sqrMagnitude > 1e-6f) dir = d.normalized;
+        }
+        else
+        {
+            Debug.LogWarning("[TaxiScenarioManager] freeGoalMode: no Ego Goal Marker assigned — " +
+                             "spawning with default forward heading.");
+        }
+        EgoTravelDir = dir;
+        EgoHasSpawn  = true;
+
+        Debug.Log($"[TaxiScenarioManager] freeGoalMode: spawn={EgoSpawnPos:F1} facing={EgoTravelDir:F2}" +
+                  (egoGoalMarker != null
+                      ? $"  goal={egoGoalMarker.position:F1}  dist={Vector3.Distance(EgoSpawnPos, egoGoalMarker.position):F1} m"
+                      : ""));
+    }
+
     // ── Two-point sandbox ───────────────────────────────────────────────────────
 
     // Place the ego at the start marker facing down its taxiway toward the goal, and set the
@@ -935,14 +991,39 @@ public class TaxiScenarioManager : MonoBehaviour
         }
 
         Vector3 startRef = egoStartMarker != null ? egoStartMarker.position : aircraftTransform.position;
-        EgoPath = NearestTaxiway(startRef);
-        if (EgoPath == null) return;
+
+        float goalS;
+        if (egoGoalMarker != null)
+        {
+            // Route from start to goal, stitching across intersections when the goal sits on a
+            // different taxiway feature than the start (e.g. "goal on the far side of the
+            // intersection"). Falls back to single-nearest-taxiway behaviour if no connected
+            // route exists so a genuinely unreachable goal doesn't hard-fail the scenario.
+            TaxiwayPath routed = network.BuildRoutedPath(startRef, egoGoalMarker.position,
+                                                         out _, out float routedGoalS);
+            if (routed != null)
+            {
+                EgoPath = routed;
+                goalS   = routedGoalS;
+            }
+            else
+            {
+                Debug.LogWarning("[TaxiScenarioManager] two-point mode: start and goal are not on " +
+                                 "a connected taxiway route — falling back to the start's nearest " +
+                                 "taxiway only (goal will clamp to that path's end).");
+                EgoPath = NearestTaxiway(startRef);
+                if (EgoPath == null) return;
+                goalS = network.GetRelativeState(egoGoalMarker.position, Vector3.forward, EgoPath).s;
+            }
+        }
+        else
+        {
+            EgoPath = NearestTaxiway(startRef);
+            if (EgoPath == null) return;
+            goalS = EgoPath.TotalLength;
+        }
 
         PathState startPs = network.GetRelativeState(startRef, Vector3.forward, EgoPath);
-        float goalS = egoGoalMarker != null
-            ? network.GetRelativeState(egoGoalMarker.position, Vector3.forward, EgoPath).s
-            : EgoPath.TotalLength;
-
         EgoPathSign = (goalS >= startPs.s) ? 1f : -1f;
         EgoGoalS    = egoGoalMarker != null ? goalS : (EgoPathSign > 0f ? EgoPath.TotalLength : 0f);
 
@@ -989,6 +1070,27 @@ public class TaxiScenarioManager : MonoBehaviour
             Gizmos.color = Color.cyan;
             Gizmos.DrawLine(conflictPoints[i].position - Vector3.forward * conflictZJitter,
                             conflictPoints[i].position + Vector3.forward * conflictZJitter);
+        }
+
+        // Two-point / routed EgoPath: draw the actual stitched route the ego will follow
+        // (magenta) plus an arrow at the spawn point showing EgoTravelDir, so a wrong route or
+        // reversed spawn heading is visible in the Scene view without needing Play mode logs.
+        if (EgoPath != null && EgoPath.Waypoints.Count > 1)
+        {
+            Gizmos.color = Color.magenta;
+            var wps = EgoPath.Waypoints;
+            for (int i = 0; i < wps.Count - 1; i++)
+                Gizmos.DrawLine(wps[i] + Vector3.up * 0.6f, wps[i + 1] + Vector3.up * 0.6f);
+            Gizmos.DrawSphere(wps[0] + Vector3.up * 0.6f, 1.2f);                 // route start
+            Gizmos.DrawWireSphere(wps[wps.Count - 1] + Vector3.up * 0.6f, 1.5f); // route end (goal)
+        }
+        if (EgoHasSpawn)
+        {
+            Gizmos.color = Color.green;
+            Vector3 from = EgoSpawnPos + Vector3.up * 0.8f;
+            Vector3 to   = from + EgoTravelDir.normalized * 10f;
+            Gizmos.DrawLine(from, to);
+            Gizmos.DrawSphere(to, 0.6f); // arrowhead marks travel direction
         }
     }
 }
