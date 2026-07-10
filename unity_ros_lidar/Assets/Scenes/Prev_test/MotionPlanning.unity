@@ -805,7 +805,7 @@ Transform:
   m_GameObject: {fileID: 678290689}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 118, y: 0, z: 311}
+  m_LocalPosition: {x: 74, y: 0, z: 311}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -2507,7 +2507,7 @@ Transform:
   m_GameObject: {fileID: 1746988845}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 63, y: 0, z: 81}
+  m_LocalPosition: {x: 73.7, y: 0, z: 83.4}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -2654,12 +2654,7 @@ MonoBehaviour:
   manualTwoPointMode: 1
   egoStartMarker: {fileID: 1746988846}
   egoGoalMarker: {fileID: 678290690}
-  manualObstacles:
-  - prefab: {fileID: 985866007}
-    start: {fileID: 283013732}
-    end: {fileID: 657058633}
-    speed: 8
-    loop: 1
+  manualObstacles: []
   incursionPrefab: {fileID: 985866007}
   maxAgents: 3
   conflictPoints:

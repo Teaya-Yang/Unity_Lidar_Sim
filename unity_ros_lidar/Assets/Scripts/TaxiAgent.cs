@@ -203,13 +203,12 @@ public class TaxiAgent : Unity.MLAgents.Agent
                 transform, incursionDt, ambulanceSpeed,
                 conflictZOffset, crossDirSign, scenarioType, headOnProb);
 
-            // Two-point sandbox: place the plane at the start marker facing down the lane toward
-            // the goal, overriding the spawn above. Movement/observations use transform.forward,
-            // which now points along the travel direction, so it drives toward the goal.
+            // Two-point sandbox: place the plane at the start marker with NO rotation applied
+            // (identity heading, facing world +Z). It no longer auto-faces the goal/lane tangent.
             if (scenarioManager.EgoHasSpawn)
                 transform.SetPositionAndRotation(
                     scenarioManager.EgoSpawnPos,
-                    Quaternion.LookRotation(scenarioManager.EgoTravelDir, Vector3.up));
+                    Quaternion.identity);
         }
         // ── Legacy single-agent path ──────────────────────────────────────────
         else if (incursionController != null && conflictPoint != null)
