@@ -89,7 +89,7 @@ MAX_STEER_RATE    = 0.6    # nose-wheel steering rate limit [rad/s]
 STEER_ROLLOFF_SPD = 15.0   # speed at which steering authority starts rolling off [m/s]
 STEER_ROLLOFF_MIN = 0.25   # minimum steering authority fraction at high speed
 
-H_MPPI    = 40           # planning horizon (steps)
+H_MPPI    = 60           # planning horizon (steps)
 K_MPPI    = 1500         # rollout samples
 LAMBDA    = 1.0          # MPPI temperature
 SIG_A     = 1.0          # noise std for acceleration samples
@@ -135,7 +135,7 @@ C_PROGRESS                  = 5.0
 # lands in a NON-free cell (occupied OR unknown) of the persistent 3-state LiDAR occupancy grid.
 # Penalising UNKNOWN too (per the paper) keeps the ego in observed-free space; drop it to OCC-only
 # via LidarCostmap.occupancy()==1 if that is too conservative while the map is still filling in.
-C_COLLISION                 = 100.0
+C_COLLISION                 = 300.0
 
 # Virtual-obstacle / forward-reachable-set (FRS) cost — occlusion safety. Assumes a worst-case
 # hidden agent sitting on the FREE↔UNKNOWN frontier (blind corner). As the rollout looks t_k =
@@ -147,15 +147,20 @@ C_COLLISION                 = 100.0
 # Effect: the ego swings wide around blind corners or slows so its future doesn't penetrate the
 # expanding bubble. Keep V_MAX_VIRTUAL realistic — too high and the bubble swallows the whole
 # horizon and the ego freezes ("freezing robot"). Gated on --visibility-cost.
-W_VIRTUAL       = 50.0   # weight of the virtual-bubble soft penalty
-V_MAX_VIRTUAL   = 5.0    # assumed max speed of a hidden agent [m/s]
-D_SAFE_VIRTUAL  = 8.0    # safety margin kept from the expanding bubble edge [m]
+W_VIRTUAL       = 40.0   # weight of the virtual-bubble soft penalty
+V_MAX_VIRTUAL   = 3.0    # assumed max speed of a hidden agent [m/s]
+D_SAFE_VIRTUAL  = 4.0    # safety margin kept from the expanding bubble edge [m]
 
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
 BIG = 200.0
 
 SIG_D_BYPASS  = 0.70  # genuinely wider steering noise (2× SIG_D) so rollouts sample real go-arounds
 
+
+N_SCEN = 10
+W_INFO = 10
+INFO_RANGE = 10
+W_TERM = 10
 # ── LiDAR static-obstacle costmap (lidar_costmap.py) ──────────────────────────
 # Optional: a 2-D distance field built from the published PointCloud2 each control
 # step. Gives walls / parked aircraft / buildings — objects the oracle observation
@@ -168,15 +173,15 @@ STATIC_AVOID   = False   # set True by --lidar-costmap: adds the static keep-out
                          # below to MPPI. Independent of VISIBILITY_COST (--visibility-cost),
                          # which only adds the "peek around blind corners" incentive and does
                          # NOT by itself avoid a collision with a static surface.
-W_STATIC       = 8.0     # weight of the static-surface soft ring
+W_STATIC       = 70.0     # weight of the static-surface soft ring
 # D_SAFE_STATIC is measured from the ego's centre/sensor origin, not the wingtip — size it as
 # (half the aircraft's actual width) + a small buffer, so the HARD keep-out alone guarantees at
 # least one aircraft-width of clearance from any surface. ~10 m wingspan -> half-width 5 m + 1 m
 # buffer = 6 m. D_INFL_STATIC kept only modestly above it (not the much larger 10 m used before)
 # so the soft ring starts the detour close to where it's actually needed instead of forcing a
 # wide early swerve that can require moving the goal well past the obstacle to reach it.
-D_SAFE_STATIC  = 8.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
-D_INFL_STATIC  = 15.0      # soft influence ring around static surfaces [m]
+D_SAFE_STATIC  = 14.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
+D_INFL_STATIC  = 20.0      # soft influence ring around static surfaces [m]
 
 # Active-perception (visibility) cost: per rollout point, the fraction of the
 # occluded, path-relevant region that stays HIDDEN from that position (from the
@@ -186,70 +191,6 @@ D_INFL_STATIC  = 15.0      # soft influence ring around static surfaces [m]
 # unless --visibility-cost. Enables the same LidarCostmap as --lidar-costmap.
 VISIBILITY_COST = False
 W_VIS           = 0.0    # weight on the per-step hidden-fraction. hidden ∈ [0,1] is bounded, so it.
-                         # needs a large weight AND the investigate-mode relaxation below to compete
-                         # with the quadratic lane cost.
-# Investigate mode: gates a temporary relaxation of lane-keeping AND steering-noise width (see
-# mppi()) when LIDAR_COSTMAP.peek_gain says a reachable position would meaningfully reduce the
-# hidden ROI fraction. Self-gating: no occlusion worth investigating → both stay nominal.
-INVESTIGATE_GAIN_MIN = 0.12   # min reachable hidden-fraction reduction to trigger investigate mode
-W_LAT_INVESTIGATE    = 0.2    # relaxed cross-track weight while investigating (vs W_LAT=3.0)
-
-# ── Learned terminal value (value_net.py) ─────────────────────────────────────
-# Optional: a belief-conditioned cost-to-go V(s,b) evaluated at each rollout's
-# ENDPOINT and added to the MPPI cost, so anticipation beyond the 4 s horizon is
-# learned from data instead of hand-tuned gates. Off unless --value-net is given.
-#   cost += W_TERM · GAMMA_VALUE^H_MPPI · V(terminal_features)
-VALUE_NET   = None    # ValueFunction instance, loaded from --value-net <ckpt.npz>
-W_TERM      = 0.5     # weight of the terminal term (0 = ignore the net; sweep upward)
-GAMMA_VALUE = 0.99    # discount used for the value targets — MUST match train_value.py --gamma
-ALPHA_W_GOAROUND = 0.2  # QP steering weight during go-around (vs ALPHA_W=6 normally)
-
-# ── Uncertainty-aware MPPI (scenario-based prediction + CVaR) ─────────────────
-# Off by default (UNCERTAINTY=False) so existing benchmarks are unchanged. When
-# enabled (--uncertainty) each MPPI call predicts every obstacle's future as a
-# DISTRIBUTION rather than a single constant-velocity ray:
-#
-#   route hypotheses × speed distribution  →  N_SCEN sampled futures per obstacle
-#
-# The obstacle cost is then aggregated with CVaR (mean of the worst CVAR_ALPHA
-# fraction of scenarios) instead of a single deterministic value, so the planner
-# is driven by the tail (a plausible bad branch/timing), not the average — the
-# right risk posture for aviation where rare conflicts, not typical ones, matter.
-#
-# Note on "planning to increase information": in this sim the ego observes full
-# state every step and its motion does NOT change other agents' scripted intent,
-# so there is no partial observability for the ego to *actively* resolve. The
-# honest analogue we implement is passive: W_INFO makes the ego slow down when it
-# is approaching an obstacle whose predicted future is spread out (ambiguous
-# route/timing), buying observation time before committing at a node. Set W_INFO>0
-# to enable; it is a cost term on approach speed scaled by prediction spread.
-UNCERTAINTY      = False              # master switch (set by --uncertainty)
-N_SCEN           = 8                  # obstacle future scenarios per MPPI call
-SIG_OBS_SPD      = 0.35               # relative std of obstacle speed (speed distribution)
-ROUTE_HYPOTHESES = (0.0, 0.45, -0.45) # heading offsets [rad]: straight / branch-L / branch-R
-ROUTE_PRIOR      = (0.6, 0.2, 0.2)    # prior prob of each route hypothesis (sums to 1)
-CVAR_ALPHA       = 0.2                # CVaR tail fraction: worst 20% of scenarios drive the cost
-W_INFO           = 0.0               # weight on uncertainty-caution term (0 = off)
-INFO_RANGE       = 40.0              # only apply the caution term to obstacles within this range [m]
-
-# ── Route-intent belief (live prior for the scenarios above) ──────────────────
-# ROUTE_PRIOR is only the belief at first sighting. As we watch an obstacle we
-# Bayes-update a per-obstacle posterior over {straight, branch-L, branch-R} from
-# its observed yaw rate (turning left/right ⇒ weight shifts to that branch), and
-# feed THAT posterior — not the fixed prior — into _sample_obstacle_scenarios.
-# Effect: an obstacle whose intent is still ambiguous keeps a spread-out, high-
-# entropy belief ⇒ scenarios fan out ⇒ CVaR stays cautious; once it commits to a
-# branch the belief sharpens ⇒ scenarios concentrate ⇒ the planner stops over-
-# braking. Belief entropy also drives the W_INFO caution term.
-# Obstacles are sorted nearest-first in the observation (TaxiAgent.cs), so slots
-# are NOT stable identities — a tiny nearest-neighbour tracker associates
-# obstacles across steps to carry each belief. Active info-gathering (the ego
-# MOVING to reduce entropy) still needs the environment to hide intent; this is
-# the passive half: observe → belief → prediction → risk.
-TURN_RATE_NOM = 0.20   # [rad/s] yaw rate a branching agent exhibits (vs ~0 for straight)
-SIG_OMEGA     = 0.15   # [rad/s] likelihood noise on the observed yaw-rate estimate
-BELIEF_FORGET = 0.05   # per-step relaxation of the posterior back toward the prior (stay adaptive)
-TRACK_GATE    = 6.0    # [m] max rel-position jump to associate an obstacle with a track across steps
 
 # Detection range — obstacles beyond this Euclidean distance [m] are masked from
 # MPPI and CBF, simulating finite LiDAR/sensor range. Oracle = inf (old behaviour).
@@ -277,62 +218,6 @@ SCENARIO_NAMES = ['standard', 'headon', 'follow_vehicle', 'intersection',
                   'runway_incursion', 'converging']
 
 rng = np.random.default_rng(42)
-
-
-# ── Offline-RL dataset recorder ───────────────────────────────────────────────
-
-class RLDataRecorder:
-    """
-    Accumulates (obs, action, reward, next_obs, done, task_id) transitions across all
-    episodes and writes them to a single compressed .npz for offline RL / TD-MPC2.
-
-    The MPPI+CBF controller is the expert policy; every control step it takes is one
-    recorded transition. Rewards are a light shaping signal (progress per step, plus a
-    terminal bonus/penalty) — downstream training can ignore or overwrite them since the
-    dataset is primarily behaviour-cloning / model-learning fodder.
-    """
-
-    def __init__(self):
-        self.obs, self.actions, self.rewards = [], [], []
-        self.next_obs, self.terminals, self.task_ids = [], [], []
-        self.beliefs = []   # (K_OBS, 3) per-slot route posteriors, for V(s,b) training
-
-    def store_step(self, obs, action, reward, next_obs, done, task_id, beliefs=None):
-        self.obs.append(np.asarray(obs, dtype=np.float32).copy())
-        self.actions.append(np.asarray(action, dtype=np.float32).copy())
-        self.rewards.append(float(reward))
-        self.next_obs.append(np.asarray(next_obs, dtype=np.float32).copy())
-        self.terminals.append(bool(done))
-        self.task_ids.append(int(task_id))
-        if beliefs is None:   # uniform prior for steps with no tracked obstacles
-            beliefs = np.full((K_OBS, len(ROUTE_HYPOTHESES)),
-                              1.0 / len(ROUTE_HYPOTHESES), dtype=np.float32)
-        self.beliefs.append(np.asarray(beliefs, dtype=np.float32).copy())
-
-    def __len__(self):
-        return len(self.obs)
-
-    def save(self, filename="taxi_expert_data.npz"):
-        if not self.obs:
-            print("[Recorder] No transitions collected — nothing to save.")
-            return
-        print(f"[Recorder] Saving {len(self.obs)} transitions to {filename} ...")
-        np.savez_compressed(
-            filename,
-            observations=np.array(self.obs,      dtype=np.float32),
-            actions=np.array(self.actions,       dtype=np.float32),
-            rewards=np.array(self.rewards,       dtype=np.float32),
-            next_observations=np.array(self.next_obs, dtype=np.float32),
-            terminals=np.array(self.terminals,   dtype=bool),
-            task_ids=np.array(self.task_ids,     dtype=np.int32),
-            beliefs=np.array(self.beliefs,       dtype=np.float32),
-        )
-        # Per-task transition counts help spot under-represented tasks in the dataset.
-        uniq, counts = np.unique(self.task_ids, return_counts=True)
-        summary = ", ".join(
-            f"{SCENARIO_NAMES[t] if t < len(SCENARIO_NAMES) else t}={c}"
-            for t, c in zip(uniq, counts))
-        print(f"[Recorder] Per-task transitions: {summary}")
 
 
 # ── Observation unpacking ────────────────────────────────────────────────────
@@ -378,31 +263,6 @@ def obs_to_state(obs: np.ndarray, prev_delta: float = 0.0, prev_accel: float = 0
         obstacles.append((rel_xy, obs_v))
 
     return s, obstacles, goal_xy
-
-
-def beliefs_to_slots(obs: np.ndarray, beliefs) -> np.ndarray:
-    """
-    Map the tracker's per-obstacle belief list (aligned with obs_to_state's FILTERED
-    obstacle list) back onto the K_OBS observation slots, for the dataset recorder.
-    Skipped slots (sentinel padding / beyond detection range) get the uniform prior —
-    the same convention value_net.features_from_obs uses for invalid slots.
-    """
-    n_route = len(ROUTE_HYPOTHESES)
-    M = np.full((K_OBS, n_route), 1.0 / n_route, dtype=np.float32)
-    if beliefs is None:
-        return M
-    j = 0   # index into the filtered obstacle/belief lists
-    for i in range(K_OBS):
-        base = 4 + i * 4
-        dx, dy = float(obs[base]), float(obs[base + 1])
-        if abs(dy) > 900:
-            continue                        # padded slot — never entered the list
-        if np.hypot(dx, dy) > DETECTION_RANGE:
-            continue                        # masked by sensor range — ditto
-        if j < len(beliefs) and beliefs[j] is not None:
-            M[i] = np.asarray(beliefs[j], dtype=np.float32)
-        j += 1
-    return M
 
 
 def inject_sensor_noise(obs: np.ndarray, noise_std: float, rng_local) -> np.ndarray:
@@ -458,127 +318,7 @@ def _rollout_step(st, a_cmd, delta_cmd):
     return st_new
 
 
-def _entropy(b):
-    """Shannon entropy [nats] of a belief vector; 0 = certain, log(n) = uniform."""
-    b = np.clip(np.asarray(b, dtype=float), 1e-9, 1.0)
-    return float(-(b * np.log(b)).sum())
-
-
-class ObstacleTracker:
-    """
-    Associates obstacles across control steps and maintains a per-obstacle route
-    belief over {straight, branch-L, branch-R}.
-
-    Obstacles arrive nearest-first (unstable slot order), so we associate by
-    greedy nearest-neighbour on the ego-relative position (gate = TRACK_GATE);
-    the small per-step drift from ego motion stays well inside the gate. A missed
-    association just starts a fresh track at ROUTE_PRIOR — graceful degradation.
-
-    The belief is updated from the obstacle's observed yaw rate (change of its
-    velocity heading), which is frame-independent, so association is the only part
-    that needs the relative position.
-    """
-
-    def __init__(self):
-        self.tracks = []   # each: {'rel': (2,), 'belief': (3,), 'head': float|None}
-
-    def reset(self):
-        self.tracks = []
-
-    def update(self, obstacles):
-        """Return a list of belief vectors aligned with `obstacles`."""
-        prior      = np.asarray(ROUTE_PRIOR, dtype=float)
-        used       = [False] * len(self.tracks)
-        beliefs    = []
-        new_tracks = []
-        for rel_xy, obs_v in obstacles:
-            best, best_d = -1, TRACK_GATE
-            for j, tr in enumerate(self.tracks):
-                if used[j]:
-                    continue
-                d = float(np.hypot(rel_xy[0] - tr['rel'][0], rel_xy[1] - tr['rel'][1]))
-                if d < best_d:
-                    best, best_d = j, d
-            if best >= 0:
-                tr = self.tracks[best]
-                used[best] = True
-            else:
-                tr = {'belief': prior.copy(), 'head': None}
-            b = self._update_belief(tr, obs_v)
-            tr['rel'] = np.asarray(rel_xy, dtype=float)
-            beliefs.append(b)
-            new_tracks.append(tr)
-        self.tracks = new_tracks
-        return beliefs
-
-    @staticmethod
-    def _update_belief(tr, obs_v):
-        prior = np.asarray(ROUTE_PRIOR, dtype=float)
-        b     = tr['belief']
-        speed = float(np.hypot(obs_v[0], obs_v[1]))
-        if speed > CBF_MOVER_MIN:
-            psi = float(np.arctan2(obs_v[1], obs_v[0]))   # observed heading
-            if tr['head'] is not None:
-                # wrapped heading change → yaw-rate estimate
-                dpsi  = float(np.arctan2(np.sin(psi - tr['head']), np.cos(psi - tr['head'])))
-                omega = dpsi / DT
-                omega_hyp = np.array([0.0, TURN_RATE_NOM, -TURN_RATE_NOM])
-                like = np.exp(-0.5 * ((omega - omega_hyp) / SIG_OMEGA) ** 2)  # Gaussian likelihood
-                b    = b * like
-                ssum = b.sum()
-                b    = b / ssum if ssum > 1e-12 else prior.copy()
-                # forget slightly toward the prior so the belief stays adaptive
-                b    = (1.0 - BELIEF_FORGET) * b + BELIEF_FORGET * prior
-                b   /= b.sum()
-            tr['head'] = psi
-        tr['belief'] = b
-        return b
-
-
-# Module-level tracker; reset per episode in run().
-_tracker = ObstacleTracker()
-
-
-def _sample_obstacle_scenarios(obs_v, route_prior=None):
-    """
-    Sample N_SCEN future velocity realizations for one obstacle, representing
-    (route hypotheses × speed distribution):
-
-      route  — draw a heading offset from ROUTE_HYPOTHESES and rotate the observed
-               velocity by it (a branch choice at the next node). The draw uses the
-               live route belief `route_prior` when given (else the fixed ROUTE_PRIOR).
-      speed  — multiply the speed by (1 + N(0, SIG_OBS_SPD)) (timing/speed spread).
-
-    For a (near-)stationary obstacle the rotation and speed noise both act on a
-    ~zero vector, so the scenarios collapse to "stays put" — a parked blocker
-    correctly carries no intent uncertainty.
-
-    Returns (ovx, ovy), each shape (N_SCEN,): the per-scenario constant velocity.
-    """
-    p    = ROUTE_PRIOR if route_prior is None else route_prior
-    idx  = rng.choice(len(ROUTE_HYPOTHESES), size=N_SCEN, p=p)
-    offs = np.asarray(ROUTE_HYPOTHESES)[idx]
-    fac  = 1.0 + rng.normal(0.0, SIG_OBS_SPD, N_SCEN)
-    c, s = np.cos(offs), np.sin(offs)
-    vx, vy = float(obs_v[0]), float(obs_v[1])
-    ovx = (c * vx - s * vy) * fac
-    ovy = (s * vx + c * vy) * fac
-    return ovx, ovy
-
-
-def _cvar(cost_kn, alpha):
-    """
-    CVaR_alpha of a per-rollout scenario-cost matrix (K, N_SCEN): for each rollout,
-    the mean of its worst ceil(alpha*N) scenario costs. alpha→0 is the single worst
-    case (robust); alpha→1 is the plain mean (risk-neutral).
-    """
-    n = cost_kn.shape[1]
-    k = max(1, int(np.ceil(alpha * n)))
-    worst = np.sort(cost_kn, axis=1)[:, -k:]   # k largest costs per rollout
-    return worst.mean(axis=1)
-
-
-def mppi(s0, mean, obstacles, goal_xy, beliefs=None, u_prev=None):
+def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     """
     Sample K_MPPI rollouts with realistic 6D state dynamics.
 
@@ -649,7 +389,7 @@ def mppi(s0, mean, obstacles, goal_xy, beliefs=None, u_prev=None):
 
         # ℓprogress = -C_PROGRESS · ||p_k - p_{k+1}||: reward the distance travelled between
         # consecutive positions (p_k = prev step, p_{k+1} = this step) — rewards making ground.
-        cost += -C_PROGRESS * np.hypot(fwd - prev_fwd, lat - prev_lat)
+        #cost += -C_PROGRESS * np.hypot(fwd - prev_fwd, lat - prev_lat)
         prev_fwd, prev_lat = fwd, lat
 
         # ℓvel = W_VEL · exp(-C_VEL · d_k²) · ||v_k||².  d_k already computed above; v_k = speed vv.
@@ -666,18 +406,19 @@ def mppi(s0, mean, obstacles, goal_xy, beliefs=None, u_prev=None):
         # clipping it. The continuous distance field can't be skipped like that: it penalises
         # proximity smoothly, so even a rollout that steps OVER the obstacle cell still registers
         # a large cost from being close to it on either side of the gap.
-        # if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-        #     d_static = LIDAR_COSTMAP.distance(fwd, lat)
-        #     cost += np.where(d_static < D_INFL_STATIC,
-        #                      W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
-        #     cost += np.where(d_static < D_SAFE_STATIC, C_COLLISION, 0.)
+        if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            d_static = LIDAR_COSTMAP.distance(fwd, lat)
+            print(d_static)
+            cost += np.where(d_static < D_INFL_STATIC,
+                             W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
+            cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
 
         # ℓvirtual (forward-reachable-set / occlusion safety): a worst-case phantom sits on the
         # FREE↔UNKNOWN frontier and could have reached V_MAX_VIRTUAL·t_k out of it by this step.
         # Penalise the rollout for entering within D_SAFE_VIRTUAL of that expanding bubble's edge.
         if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             t_elapsed  = (k + 1) * DT
-            r_bubble   = V_MAX_VIRTUAL * t_elapsed                       # bubble radius at step k
+            r_bubble   = (V_MAX_VIRTUAL * t_elapsed)                       # bubble radius at step k
             d_frontier = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)     # dist to blind-corner edge
             d_virtual  = d_frontier - r_bubble                          # dist to the bubble's edge
             cost += np.where(d_virtual < D_SAFE_VIRTUAL,
@@ -882,15 +623,14 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         min_difficulty=0.0, max_difficulty=1.0,
         noise_std=0.0, scenario_type=SCENARIO_STANDARD, detect_range=float("inf"), dataset_path=None,
-        uncertainty=False, cvar_alpha=CVAR_ALPHA, n_scenarios=N_SCEN, w_info=W_INFO,
+        uncertainty=False, n_scenarios=N_SCEN, w_info=W_INFO,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         value_net_path=None, w_term=W_TERM, pin_episode=None,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False):
-    global DETECTION_RANGE, UNCERTAINTY, CVAR_ALPHA, N_SCEN, W_INFO
+    global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
-    CVAR_ALPHA      = cvar_alpha
     N_SCEN          = n_scenarios
     W_INFO          = w_info
     D_INFL          = d_infl
@@ -902,14 +642,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
     print(f"[Controller] Connecting to Unity on port {port} ...")
     if detect_range < float("inf"):
         print(f"[Controller] Detection range : {detect_range:.1f} m  (obstacles beyond masked)")
-    if uncertainty:
-        print(f"[Controller] Uncertainty    : ON  (N_SCEN={n_scenarios}, CVaR α={cvar_alpha}, "
-              f"W_INFO={w_info})  scenario-based prediction + CVaR obstacle cost")
-    if value_net_path is not None:
-        VALUE_NET = ValueFunction.load(value_net_path)
-        W_TERM    = w_term
-        print(f"[Controller] Terminal value : ON  ({value_net_path}, W_TERM={w_term}, "
-              f"γ^H={GAMMA_VALUE**H_MPPI:.2f})  learned cost-to-go at rollout endpoints")
     if lidar_costmap or visibility_cost:
         VISIBILITY_COST = visibility_cost
         STATIC_AVOID    = lidar_costmap
@@ -978,8 +710,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         print(f"[Controller] Pinned episode  : seed={pin_episode} — identical scenario every "
               f"episode (ego path, obstacles, timings all repeat)")
     episode_stats = []
-    recorder      = RLDataRecorder()   # accumulates (s,a,r,s') transitions for offline RL
-
     # Unity (Editor or build) can exit mid-run — most often the Editor drops Play mode because a
     # script recompiled, or the window was closed. That surfaces as UnityCommunicatorStoppedException
     # from env.step(); catch it so we still print the summary for the episodes that DID complete
@@ -987,7 +717,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
     unity_stopped = False
     for ep in range(n_episodes):
         mean   = np.zeros((H_MPPI, 2))
-        _tracker.reset()   # clear per-obstacle route beliefs at episode start
         sc     = scenarios[ep]
         task_id = int(sc["scenario_type"])
         ep_log = {"min_h": np.inf, "min_dist": np.inf,
@@ -995,11 +724,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                   "incursion_dt": sc["incursion_dt"],
                   "difficulty": sc["difficulty"],
                   "scenario": SCENARIO_NAMES[task_id]}
-        # RL transition bookkeeping: hold the previous (obs, action, beliefs) until the
-        # next obs arrives, so we can emit a complete (obs, action, reward, next_obs) tuple.
         prev_obs = None
         prev_act = None
-        prev_beliefs = None   # (K_OBS, 3) slot matrix paired with prev_obs
 
         for key, val in sc.items():
             env_params.set_float_parameter(key, val)
@@ -1035,8 +761,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                 if prev_obs is not None:
                     term_reward = -20.0 if ep_log["collided"] else 10.0
                     final_obs   = terminal_steps.obs[0][0]
-                    recorder.store_step(prev_obs, prev_act, term_reward,
-                                        final_obs, True, task_id, prev_beliefs)
                 episode_done = True
                 break
 
@@ -1051,25 +775,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             obs_n = inject_sensor_noise(obs, noise_std, rng)
             s, obstacles, goal_xy = obs_to_state(obs_n, delta_actual, accel_actual)
 
-            # Emit the previous transition now that its next_obs (obs_n) is available.
-            # Reward: light progress shaping (forward speed); terminal bonus is added at
-            # episode end. Downstream RL can ignore/overwrite this — it's mainly BC data.
-            if prev_obs is not None:
-                step_reward = 0.05 * float(s[3])   # s[3] = current forward speed
-                recorder.store_step(prev_obs, prev_act, step_reward,
-                                    obs_n, False, task_id, prev_beliefs)
-
             if ep_steps % 20 == 0:
                 print(f"[DEBUG] [global] fwd={s[0]:.1f} lat={s[1]:.2f} "
                       f"th={s[2]:.3f} v={s[3]:.2f} δ={s[4]:.3f} a_act={s[5]:.2f}  "
                       f"{len(obstacles)} obs  goal_dist={np.hypot(goal_xy[0]-s[0], goal_xy[1]-s[1]):.1f}")
-
-            # Update the per-obstacle route belief from this step's observations. The
-            # tracker now runs in EVERY mode (not just --uncertainty): the beliefs feed
-            # MPPI's scenario prediction when uncertainty is on, condition the terminal
-            # value V(s,b) when --value-net is set, and are logged with each recorded
-            # transition so V(s,b) can be trained from any dataset.
-            beliefs = _tracker.update(obstacles)
 
             # Rebuild the LiDAR map from the latest cloud+pose, scrubbing returns near
             # the known dynamic agents (the oracle handles those). ego_fwd (world a0,a1)
@@ -1089,7 +798,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                           f"ego(vehicle)=({s[0]:.1f},{s[1]:.1f})  "
                           f"ego(sensor_pose)={sensor_pose}  offset={offset}")
 
-            u_nom, mean = mppi(s, mean, obstacles, goal_xy, beliefs, u_prev)
+            u_nom, mean = mppi(s, mean, obstacles, goal_xy, u_prev)
 
             
             u_cmd      = u_nom
@@ -1124,10 +833,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             action = ActionTuple(
                 continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)
             )
-            # Stash this (obs, action, beliefs) so the next iteration can close the transition.
             prev_obs = obs_n.copy()
             prev_act = np.array([a_cmd, delta_cmd], dtype=np.float32)
-            prev_beliefs = beliefs_to_slots(obs_n, beliefs)
+
 
             env.set_actions(behavior_name, action)
             try:
@@ -1205,10 +913,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         print(f"  {e['incursion_dt']:+5.2f}  {e['scenario']:<12s}  {e['difficulty']:.2f}  "
               f"{e['min_dist']:8.2f}   {e['min_h']:8.2f}   "
               f"{'COLLISION' if e['collided'] else 'safe'}")
-
-    # ── Persist the offline-RL dataset ────────────────────────────────────────
-    if dataset_path:
-        recorder.save(dataset_path)
 
     return episode_stats
 

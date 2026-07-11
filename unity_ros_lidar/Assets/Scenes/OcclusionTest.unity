@@ -419,7 +419,7 @@ Transform:
   m_GameObject: {fileID: 283013731}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 112.6, y: 0, z: 163.4}
+  m_LocalPosition: {x: 133.2, y: 0, z: 163.4}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -774,7 +774,7 @@ Transform:
   m_GameObject: {fileID: 657058632}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -18.3, y: 0, z: 163.4}
+  m_LocalPosition: {x: 0.8, y: 0, z: 163.4}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -805,7 +805,7 @@ Transform:
   m_GameObject: {fileID: 678290689}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 74, y: 0, z: 311}
+  m_LocalPosition: {x: 100, y: 0, z: 255}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -2104,7 +2104,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 400000, guid: 8b3eca4c34b9e1148a3c4d42a48dd5b8, type: 3}
       propertyPath: m_LocalScale.x
-      value: 10
+      value: 5
       objectReference: {fileID: 0}
     - target: {fileID: 400000, guid: 8b3eca4c34b9e1148a3c4d42a48dd5b8, type: 3}
       propertyPath: m_LocalPosition.x
@@ -2507,7 +2507,7 @@ Transform:
   m_GameObject: {fileID: 1746988845}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 73.7, y: 0, z: 83.4}
+  m_LocalPosition: {x: 101, y: 0, z: 65}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -2654,7 +2654,12 @@ MonoBehaviour:
   manualTwoPointMode: 1
   egoStartMarker: {fileID: 1746988846}
   egoGoalMarker: {fileID: 678290690}
-  manualObstacles: []
+  manualObstacles:
+  - prefab: {fileID: 0}
+    start: {fileID: 0}
+    end: {fileID: 0}
+    speed: 0
+    loop: 0
   incursionPrefab: {fileID: 985866007}
   maxAgents: 3
   conflictPoints:
