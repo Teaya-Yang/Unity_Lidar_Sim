@@ -89,7 +89,7 @@ MAX_STEER_RATE    = 0.6    # nose-wheel steering rate limit [rad/s]
 STEER_ROLLOFF_SPD = 15.0   # speed at which steering authority starts rolling off [m/s]
 STEER_ROLLOFF_MIN = 0.25   # minimum steering authority fraction at high speed
 
-H_MPPI    = 80           # planning horizon (steps)
+H_MPPI    = 60           # planning horizon (steps)
 K_MPPI    = 1500         # rollout samples
 LAMBDA    = 1.0          # MPPI temperature
 SIG_A     = 1.0          # noise std for acceleration samples
@@ -139,8 +139,8 @@ C_PROGRESS                  = 10.0
 # expanding bubble. Keep V_MAX_VIRTUAL realistic — too high and the bubble swallows the whole
 # horizon and the ego freezes ("freezing robot"). Gated on --visibility-cost.
 W_VIRTUAL       = 10.0   # weight of the virtual-bubble soft penalty
-V_MAX_VIRTUAL   = 8.0    # assumed max speed of a hidden agent [m/s]
-D_SAFE_VIRTUAL  = 14.0    # safety margin kept from the expanding bubble edge [m]
+V_MAX_VIRTUAL   = 2.0    # assumed max speed of a hidden agent [m/s]
+D_SAFE_VIRTUAL  = 6.0    # safety margin kept from the expanding bubble edge [m]
 
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
 BIG = 50.0
@@ -158,10 +158,12 @@ STATIC_AVOID   = False   # set True by --lidar-costmap: adds the static keep-out
                          # NOT by itself avoid a collision with a static surface.
 W_STATIC       = 20.0     # weight of the static-surface soft ring
 D_SAFE_STATIC  = 8.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
-D_INFL_STATIC  = 15.0      # soft influence ring around static surfaces [m]
+D_INFL_STATIC  = 20.0      # soft influence ring around static surfaces [m]
 
 VISIBILITY_COST = False
-W_VIS           = 0.0    # weight on the per-step hidden-fraction. hidden ∈ [0,1] is bounded, so it.
+W_VIS           = 20.0   # weight on the per-step hidden-fraction ∈[0,1]. Summed over H_MPPI steps
+                         # its worst case is ~H·W_VIS, kept comparable to the goal terms so the pull
+                         # to reveal a blind corner competes without overriding goal-seeking. 0=off.
 
 DETECTION_RANGE = float("inf")   # default: oracle (off). Set via --detect-range.
 
@@ -368,8 +370,7 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
             cost += np.where(d_static < D_INFL_STATIC,
                              W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
             cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
-        occ = LIDAR_COSTMAP.occupancy(fwd, lat)
-        cost += np.where(occ == 1, BIG, 0.0)
+
 
         # ℓvirtual (forward-reachable-set / occlusion safety): a worst-case phantom sits on the
         # FREE↔UNKNOWN frontier and could have reached V_MAX_VIRTUAL·t_k out of it by this step.
@@ -381,6 +382,14 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         #     d_virtual  = d_frontier - r_bubble                          # dist to the bubble's edge
         #     cost += np.where(d_virtual < D_SAFE_VIRTUAL,
         #                      W_VIRTUAL * (D_SAFE_VIRTUAL - d_virtual)**2, 0.0)
+
+        # ℓhidden: penalise rollout positions from which the occluded ROI stays hidden, so the
+        # ego arcs toward viewpoints that reveal the blind corner. hidden_fraction() expects
+        # EGO-RELATIVE offsets (Δa0, Δa1) into its candidate window (built around the ego at this
+        # control step), so subtract the rollout start s0 from the absolute rollout position.
+        if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
+            cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(rel_pts)
 
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
         # t_elapsed = (k + 1) * DT
