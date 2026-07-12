@@ -203,15 +203,16 @@ class LidarCostmap:
     def __init__(self,
                  size_m: float = 100.0, res: float = 0.5,
                  sensor_height: float = 3.45,
-                 min_obstacle_height: float = 0.4, max_obstacle_height: float = 12.0,
+                 min_obstacle_height: float = 1.0, max_obstacle_height: float = 12.0,
                  min_range: float = 1.0, dyn_mask_radius: float = 6.0,
                  max_age: float = 0.5,
                  free_ttl: float = 4.0, occ_ttl: float = 12.0, carve_samples: int = 80,
                  # visibility params
-                 roi_range: float = 40.0, roi_half_angle_deg: float = 180.0,
-                 max_roi_cells: int = 30,
-                 cand_reach: float = 30.0, cand_res: float = 2.0,
-                 los_samples: int = 40):
+                 roi_range: float = 30.0, roi_half_angle_deg: float = 70.0,
+                 max_roi_cells: int = 48,
+                 cand_reach: float = 20.0, cand_res: float = 2.0,
+                 los_samples: int = 20, enable_visibility: bool = False):
+        self.enable_visibility = bool(enable_visibility)
         self.res  = float(res)
         self.half = float(size_m) / 2.0
         self.z_lo = -sensor_height + min_obstacle_height
@@ -387,7 +388,12 @@ class LidarCostmap:
         else:
             self._dist_unknown = _chamfer_distance(unknown, self.res)
 
-        self._build_visibility(ego0, ego1, ego_fwd, occ)
+        # Skip the O(candidates × ROI cells × LOS samples) visibility build entirely when
+        # nothing consumes it — it ran unconditionally before, so tuning cand_reach silently
+        # changed ingest() latency (and therefore how stale _dist/_dist_unknown are for the
+        # ACTIVE static/sightline costs) even with the hidden-fraction term disabled.
+        if self.enable_visibility:
+            self._build_visibility(ego0, ego1, ego_fwd, occ)
         self._ready = True
 
     # ── Visibility (active perception) ────────────────────────────────────────
