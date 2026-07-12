@@ -93,7 +93,7 @@ H_MPPI    = 60           # planning horizon (steps)
 K_MPPI    = 1500         # rollout samples
 LAMBDA    = 1.0          # MPPI temperature
 SIG_A     = 1.0          # noise std for acceleration samples
-SIG_D     = 1.00         # noise std for steering samples
+SIG_D     = 0.70         # noise std for steering samples
 
 # MPPI stage costs
 W_LAT, W_HEAD, W_V, W_CTRL = 0.05, 4.0, 1.2, 0.05
@@ -138,9 +138,23 @@ C_PROGRESS                  = 10.0
 # Effect: the ego swings wide around blind corners or slows so its future doesn't penetrate the
 # expanding bubble. Keep V_MAX_VIRTUAL realistic — too high and the bubble swallows the whole
 # horizon and the ego freezes ("freezing robot"). Gated on --visibility-cost.
-W_VIRTUAL       = 10.0   # weight of the virtual-bubble soft penalty
+W_VIRTUAL       = 2.0   # weight of the virtual-bubble soft penalty
 V_MAX_VIRTUAL   = 2.0    # assumed max speed of a hidden agent [m/s]
-D_SAFE_VIRTUAL  = 6.0    # safety margin kept from the expanding bubble edge [m]
+D_SAFE_VIRTUAL  = 2.0    # safety margin kept from the expanding bubble edge [m]
+
+# Sightline-bounded velocity (RSS / "lookaround") — kinematic speed limit that GUARANTEES the ego
+# can brake to a stop before reaching the nearest visual occlusion, rather than guessing where a
+# hidden agent might go. d_vis = distance to the closest occlusion (the FREE↔UNKNOWN frontier).
+# The max safe speed to still stop within d_vis under max deceleration |A_MIN| is
+#   v_safe = sqrt(2·|A_MIN|·d_vis)
+# and the rollout is penalised (soft, one-sided) whenever its sampled speed exceeds v_safe:
+#   ℓsightline = W_SIGHTLINE · max(0, v_k − v_safe)²
+# Effect: the ego slows approaching blind corners just enough to stop for anything that could
+# emerge, and speeds back up as the sightline opens. Gated on the costmap being ready.
+SIGHTLINE_LIMIT = True   # enable the RSS sightline speed cap
+W_SIGHTLINE     = 5.0    # weight on the over-speed² penalty
+A_BRAKE         = abs(A_MIN)   # max deceleration used for the stopping-distance bound [m/s²]
+V_SIGHT_FLOOR   = 1.5    # min v_safe floor [m/s] so the ego doesn't freeze right at a frontier
 
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
 BIG = 50.0
@@ -364,6 +378,15 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         # ℓvel = W_VEL · exp(-C_VEL · d_k²) · ||v_k||².  d_k already computed above; v_k = speed vv.
         cost += np.exp(-C_VEL * d_k**2) * vv**2
 
+        # ℓsightline (RSS sightline-bounded velocity): cap speed so the ego can always stop before
+        # the nearest occlusion. d_vis = distance to the FREE↔UNKNOWN frontier at this rollout pose;
+        # v_safe = sqrt(2·A_BRAKE·d_vis) is the fastest speed that still stops within d_vis. Penalise
+        # (one-sided) the amount by which the rollout speed exceeds v_safe.
+        if SIGHTLINE_LIMIT and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            d_vis   = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)      # closest occlusion [m]
+            v_safe  = np.maximum(np.sqrt(2.0 * A_BRAKE * d_vis), V_SIGHT_FLOOR)
+            cost   += W_SIGHTLINE * np.maximum(0.0, vv - v_safe)**2
+
         if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             d_static = LIDAR_COSTMAP.distance(fwd, lat)
             #print(d_static)
@@ -390,7 +413,6 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
             cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(rel_pts)
-
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
         # t_elapsed = (k + 1) * DT
         # if scen is not None:
@@ -742,11 +764,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             obs_n = inject_sensor_noise(obs, noise_std, rng)
             s, obstacles, goal_xy = obs_to_state(obs_n, delta_actual, accel_actual)
 
-            if ep_steps % 20 == 0:
-                print(f"[DEBUG] [global] fwd={s[0]:.1f} lat={s[1]:.2f} "
-                      f"th={s[2]:.3f} v={s[3]:.2f} δ={s[4]:.3f} a_act={s[5]:.2f}  "
-                      f"{len(obstacles)} obs  goal_dist={np.hypot(goal_xy[0]-s[0], goal_xy[1]-s[1]):.1f}")
-
             # Rebuild the LiDAR map from the latest cloud+pose, scrubbing returns near
             # the known dynamic agents (the oracle handles those). ego_fwd (world a0,a1)
             # orients the visibility ROI wedge — same axes as the mppi rollout frame.
@@ -759,13 +776,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                     sensor_pose = LIDAR_COSTMAP._pose
                     offset = (None if sensor_pose is None else
                               (sensor_pose[0] - s[0], sensor_pose[1] - s[1]))
-                    print(f"[DEBUG lidar] ready={LIDAR_COSTMAP.ready}  cloud_age={age:.2f}s  "
-                          f"OCC={int((st==2).sum())}  FREE={int((st==1).sum())}  "
-                          f"UNKNOWN={int((st==0).sum())}  "
-                          f"ego(vehicle)=({s[0]:.1f},{s[1]:.1f})  "
-                          f"ego(sensor_pose)={sensor_pose}  offset={offset}")
-
             u_nom, mean = mppi(s, mean, obstacles, goal_xy, u_prev)
+            print("acc = ", u_nom)
 
             
             u_cmd      = u_nom
