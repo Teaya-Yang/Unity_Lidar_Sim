@@ -57,7 +57,7 @@ except ImportError:
     _HAS_RCLPY = False
 
 try:
-    from scipy.ndimage import distance_transform_edt
+    from scipy.ndimage import distance_transform_edt, binary_dilation
     _HAS_SCIPY = True
 except ImportError:
     _HAS_SCIPY = False
@@ -66,6 +66,12 @@ except ImportError:
 UNKNOWN = np.int8(0)
 FREE    = np.int8(1)
 OCC     = np.int8(2)
+
+# Sightline frontier: an UNKNOWN cell counts as an occlusion shadow only if it lies within this
+# many metres of an OCCUPIED cell. Excludes the open sensor-range rim (far from any object) so the
+# sightline speed cap responds to real blind spots, not to the edge of the observed area. Larger =
+# treats more of the deep shadow behind big occluders as a frontier (slows earlier/further out).
+SHADOW_RADIUS = 4.0
 
 
 def _chamfer_distance(occ: np.ndarray, res: float) -> np.ndarray:
@@ -374,19 +380,29 @@ class LidarCostmap:
         else:
             self._dist = _chamfer_distance(occ, self.res)
 
-        # Frontier distance field: distance from every cell to the nearest UNKNOWN cell. For a
-        # query point in observed FREE space the nearest UNKNOWN cell lies on the FREE↔UNKNOWN
-        # boundary (the frontier / blind-corner edge), so this doubles as the distance to the
-        # frontier that the virtual-obstacle (forward-reachable-set) cost expands its bubble from.
-        # NOTE: the map's outer border is also UNKNOWN, so far from any real occlusion this returns
-        # the (large) distance to the window edge — harmless as long as size_m >> the horizon reach.
+        # Frontier distance field: distance from every cell to the nearest OCCLUSION-SHADOW cell,
+        # i.e. an UNKNOWN cell that is a genuine blind spot BEHIND an obstacle — NOT the open
+        # sensor-range rim. Plain "nearest UNKNOWN" is wrong here: every un-observed cell (beyond
+        # sensor range, the lateral/rear gaps, the map's outer border) is UNKNOWN, so in open
+        # terrain the nearest UNKNOWN is just the edge of what's been seen (~sensor range), and the
+        # sightline cap would fire everywhere. We instead keep only UNKNOWN cells within
+        # SHADOW_RADIUS of an OCCUPIED cell (an occluder's shadow); the open rim, far from any
+        # object, is excluded, so d_vis is large in the clear and only shrinks near real occlusions.
         unknown = (self.grid.state == UNKNOWN)
-        if not unknown.any():
+        occ_for_shadow = (self.grid.state == OCC)
+        if not occ_for_shadow.any():
+            shadow = np.zeros_like(unknown)
+        elif _HAS_SCIPY:
+            r_cells = max(1, int(round(SHADOW_RADIUS / self.res)))
+            shadow = unknown & binary_dilation(occ_for_shadow, iterations=r_cells)
+        else:
+            shadow = unknown & occ_for_shadow  # no scipy: fall back to edge-adjacency only
+        if not shadow.any():
             self._dist_unknown = np.full((self.grid.n, self.grid.n), 1e6)
         elif _HAS_SCIPY:
-            self._dist_unknown = distance_transform_edt(~unknown) * self.res
+            self._dist_unknown = distance_transform_edt(~shadow) * self.res
         else:
-            self._dist_unknown = _chamfer_distance(unknown, self.res)
+            self._dist_unknown = _chamfer_distance(shadow, self.res)
 
         # Skip the O(candidates × ROI cells × LOS samples) visibility build entirely when
         # nothing consumes it — it ran unconditionally before, so tuning cand_reach silently

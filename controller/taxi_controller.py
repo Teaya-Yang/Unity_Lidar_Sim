@@ -152,9 +152,13 @@ D_SAFE_VIRTUAL  = 2.0    # safety margin kept from the expanding bubble edge [m]
 # Effect: the ego slows approaching blind corners just enough to stop for anything that could
 # emerge, and speeds back up as the sightline opens. Gated on the costmap being ready.
 SIGHTLINE_LIMIT = True   # enable the RSS sightline speed cap
-W_SIGHTLINE     = 8.0    # weight on the over-speed² penalty
-A_BRAKE         = abs(A_MIN)   # max deceleration used for the stopping-distance bound [m/s²]
-V_SIGHT_FLOOR   = 1.0    # min v_safe floor [m/s] so the ego doesn't freeze right at a frontier
+W_SIGHTLINE     = 60.0    # weight on the over-speed² penalty
+# Deceleration used for the stopping-distance bound [m/s²]. Deliberately LOWER than the true |A_MIN|
+# (=4.0): a conservative (gentle) assumed brake makes v_safe = sqrt(2·A_BRAKE·d_vis) smaller at every
+# frontier distance, so the ego eases off EARLY as it nears a blind spot instead of only inside ~8 m.
+# Lower this further to slow sooner/harder near occlusions.
+A_BRAKE         = 0.25
+V_SIGHT_FLOOR   = 0.5    # min v_safe floor [m/s] so the ego doesn't freeze right at a frontier
 
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
 BIG = 50.0
@@ -357,6 +361,16 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
 
     s0_theta = float(s0[2])              # initial heading — the straight-line lock reference
 
+    # ── TEMP sightline diagnostic: is the cap even active at the ego's current pose? ──
+    if SIGHTLINE_LIMIT and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+        _dv = float(LIDAR_COSTMAP.distance_to_unknown(
+            np.array([s0_fwd]), np.array([s0_lat]))[0])
+        _vs = max((2.0 * A_BRAKE * _dv) ** 0.5, V_SIGHT_FLOOR)
+        print(f"[sightline] ready d_vis(ego)={_dv:8.2f}  v_safe={_vs:5.2f}  v={s0[3]:5.2f}")
+    else:
+        print(f"[sightline] INACTIVE  ready="
+              f"{None if LIDAR_COSTMAP is None else LIDAR_COSTMAP.ready}")
+
     for k in range(H_MPPI):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
@@ -389,9 +403,8 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         # (one-sided) the amount by which the rollout speed exceeds v_safe.
         if SIGHTLINE_LIMIT and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
-            d_vis   = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)      # closest occlusion [m]
+            d_vis   = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)      # dist to nearest occlusion frontier [m]
             v_safe  = np.maximum(np.power(2.0 * A_BRAKE * d_vis, 0.5), V_SIGHT_FLOOR)
-            #print(v_safe)
             cost   += W_SIGHTLINE * np.maximum(0.0, vv - v_safe)**2
 
         if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
@@ -401,9 +414,9 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
                              W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
             cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
 
-        if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
-            cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(rel_pts)
+        # if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+        #     rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
+        #     cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(rel_pts)
         # ℓvirtual (forward-reachable-set / occlusion safety): a worst-case phantom sits on the
         # FREE↔UNKNOWN frontier and could have reached V_MAX_VIRTUAL·t_k out of it by this step.
         # Penalise the rollout for entering within D_SAFE_VIRTUAL of that expanding bubble's edge.
