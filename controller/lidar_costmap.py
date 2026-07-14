@@ -207,16 +207,16 @@ class LidarCostmap:
     """
 
     def __init__(self,
-                 size_m: float = 100.0, res: float = 0.5,
+                 size_m: float = 300.0, res: float = 0.5,
                  sensor_height: float = 3.45,
-                 min_obstacle_height: float = 1.0, max_obstacle_height: float = 12.0,
+                 min_obstacle_height: float = 0.5, max_obstacle_height: float = 12.0,
                  min_range: float = 1.0, dyn_mask_radius: float = 6.0,
                  max_age: float = 0.5,
                  free_ttl: float = 4.0, occ_ttl: float = 12.0, carve_samples: int = 80,
                  # visibility params
-                 roi_range: float = 30.0, roi_half_angle_deg: float = 70.0,
+                 roi_range: float = 70.0, roi_half_angle_deg: float = 70.0,
                  max_roi_cells: int = 48,
-                 cand_reach: float = 20.0, cand_res: float = 2.0,
+                 cand_reach: float = 70.0, cand_res: float = 3.0,
                  los_samples: int = 20, enable_visibility: bool = False):
         self.enable_visibility = bool(enable_visibility)
         self.res  = float(res)
@@ -409,6 +409,7 @@ class LidarCostmap:
         # changed ingest() latency (and therefore how stale _dist/_dist_unknown are for the
         # ACTIVE static/sightline costs) even with the hidden-fraction term disabled.
         if self.enable_visibility:
+            print(f"[DEBUG occ] occ_cells={int(occ.sum())} unknown_cells={int((self.grid.state == UNKNOWN).sum())}")
             self._build_visibility(ego0, ego1, ego_fwd, occ)
         self._ready = True
 

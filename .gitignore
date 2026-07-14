@@ -32,6 +32,11 @@ nuscenes*
 # Remove logging
 logs/*
 
+# colcon build artifacts
+/build/
+/install/
+/log/
+
 # Remove venv
 venv/
 
@@ -43,3 +48,7 @@ TODO_CLAUDE.md
 unity_ros_lidar/Assets/AirportPack*
 
 *.claude/
+
+install/*
+build/*
+log/*
