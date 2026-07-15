@@ -407,17 +407,16 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
             v_safe  = np.maximum(np.power(2.0 * A_BRAKE * d_vis, 0.5), V_SIGHT_FLOOR)
             cost   += W_SIGHTLINE * np.maximum(0.0, vv - v_safe)**2
 
-        # if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-        #     d_static = LIDAR_COSTMAP.distance(fwd, lat)
-        #     #print(d_static)
-        #     cost += np.where(d_static < D_INFL_STATIC,
-        #                      W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
-        #     cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
+        if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            d_static = LIDAR_COSTMAP.distance(fwd, lat)
+            #print(d_static)
+            cost += np.where(d_static < D_INFL_STATIC,
+                             W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
+            cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
 
         if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
             cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(rel_pts)
-            print(LIDAR_COSTMAP.hidden_fraction(rel_pts))
         # # ℓvirtual (forward-reachable-set / occlusion safety): a worst-case phantom sits on the
         # FREE↔UNKNOWN frontier and could have reached V_MAX_VIRTUAL·t_k out of it by this step.
         # Penalise the rollout for entering within D_SAFE_VIRTUAL of that expanding bubble's edge.
