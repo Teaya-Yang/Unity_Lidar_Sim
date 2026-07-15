@@ -392,7 +392,7 @@ public class TaxiAgent : Unity.MLAgents.Agent
             _stoppedAtGoal = true;
         }
 
-        if (_collided || timeout || offRoad)
+        if (_collided || timeout || offRoad || reached)
             EndEpisode();
     }
 

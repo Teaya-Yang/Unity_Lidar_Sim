@@ -200,7 +200,7 @@ class LidarCostmap:
     See module docstring. Public API used by taxi_controller.py:
 
         cm = LidarCostmap(); cm.start()
-        cm.update(ego_fwd, dyn_positions)       # once per control step
+        cm.update(ego_fwd)                      # once per control step
         d   = cm.distance(w0, w1)               # (N,) static-surface distance [m], ABSOLUTE world
         occ = cm.occupancy(w0, w1)              # (N,) {occupied:1, free:0, unknown:-1}, ABS world
         hidden = cm.hidden_fraction(pts)        # (N,) occluded-ROI fraction [0..1], ego-relative Δ
@@ -224,7 +224,6 @@ class LidarCostmap:
         self.z_lo = -sensor_height + min_obstacle_height
         self.z_hi = -sensor_height + max_obstacle_height
         self.min_range = float(min_range)
-        self.dyn_mask_radius = float(dyn_mask_radius)
         self.max_age = float(max_age)
 
         self.grid = PersistentGrid(size_m, res, free_ttl, occ_ttl, carve_samples)
@@ -329,23 +328,21 @@ class LidarCostmap:
 
     # ── Per-control-step build ────────────────────────────────────────────────
 
-    def update(self, ego_fwd=None, dyn_positions=None) -> bool:
+    def update(self, ego_fwd=None) -> bool:
         """
         Integrate the latest scan into the persistent map and rebuild the static
         distance + visibility fields. ego_fwd: (a0,a1) ego forward unit vector in
-        world axes (for the ROI wedge); None → 360° ROI. dyn_positions: ego-
-        relative (a0,a1) of known agents, scrubbed so their returns don't become
-        static/unknown structure. Returns readiness.
+        world axes (for the ROI wedge); None → 360° ROI. Returns readiness.
         """
         with self._lock:
             pts, pose, stamp = self._pts, self._pose, self._stamp
         if pts is None or pose is None or (time.monotonic() - stamp) > self.max_age:
             self._ready = False
             return False
-        self._ingest(pts, pose, ego_fwd, dyn_positions, now=stamp)
+        self._ingest(pts, pose, ego_fwd, now=stamp)
         return self._ready
 
-    def _ingest(self, pts_ros, pose, ego_fwd, dyn_positions, now) -> None:
+    def _ingest(self, pts_ros, pose, ego_fwd, now) -> None:
         ego0, ego1 = pose
         x, y, z = pts_ros[:, 0], pts_ros[:, 1], pts_ros[:, 2]
 
@@ -358,13 +355,6 @@ class LidarCostmap:
         # Obstacle-height subset of the carve set → OCCUPIED cells.
         obst = inb & (z > self.z_lo) & (z < self.z_hi)
         oa0, oa1 = a0[obst], a1[obst]
-
-        # Scrub dynamic-agent returns from the OCC set (oracle handles those; don't
-        # let a moving agent freeze into static structure). They still carve FREE.
-        if dyn_positions is not None and len(oa0):
-            for p in dyn_positions:
-                k = (oa0 - float(p[0])) ** 2 + (oa1 - float(p[1])) ** 2 > self.dyn_mask_radius ** 2
-                oa0, oa1 = oa0[k], oa1[k]
 
         # LOCAL → WORLD (pure translation; axes are world-aligned).
         self.grid.update(ego0, ego1,

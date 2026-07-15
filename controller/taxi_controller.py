@@ -157,11 +157,11 @@ W_SIGHTLINE     = 60.0    # weight on the over-speed² penalty
 # (=4.0): a conservative (gentle) assumed brake makes v_safe = sqrt(2·A_BRAKE·d_vis) smaller at every
 # frontier distance, so the ego eases off EARLY as it nears a blind spot instead of only inside ~8 m.
 # Lower this further to slow sooner/harder near occlusions.
-A_BRAKE         = 0.25
+A_BRAKE         = 0.50
 V_SIGHT_FLOOR   = 0.5    # min v_safe floor [m/s] so the ego doesn't freeze right at a frontier
 
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
-BIG = 50.0
+BIG = 50
 
 
 N_SCEN = 10
@@ -177,7 +177,7 @@ STATIC_AVOID   = False   # set True by --lidar-costmap: adds the static keep-out
                          # NOT by itself avoid a collision with a static surface.
 W_STATIC       = 20.0     # weight of the static-surface soft ring
 D_SAFE_STATIC  = 8.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
-D_INFL_STATIC  = 30.0      # soft influence ring around static surfaces [m]
+D_INFL_STATIC  = 10.0      # soft influence ring around static surfaces [m]
 
 VISIBILITY_COST = False
 W_VIS           = 20.0   # weight on the per-step hidden-fraction ∈[0,1]. Summed over H_MPPI steps
@@ -326,7 +326,6 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     sig_d_eff  = SIG_D
     w_off_eff  = W_OFF
     w_lat_eff  = W_LAT
-    w_head_eff = W_HEAD
     a_min_eff  = A_MIN
     lane_bias  = 0.0
     d_infl_arr = np.full(len(obstacles), D_INFL)   # per-obstacle influence ring
@@ -376,7 +375,7 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
 
         # Keeping only heading cost at the moment, no lane cost used
-        #cost += w_head_eff * th**2
+        #cost += W_HEAD * th**2
 
         # ℓgoal = -C_GOAL * max(0, d0 - d_k): reward net closure toward the goal by this stage,
         # d_k = ||p_k - p_goal|| the true Euclidean distance to the goal at stage k.
@@ -410,23 +409,25 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             d_static = LIDAR_COSTMAP.distance(fwd, lat)
             #print(d_static)
-            cost += np.where(d_static < D_INFL_STATIC,
-                             W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
-            cost += np.where(d_static < D_SAFE_STATIC, BIG, 0.)
+            # cost += np.where(d_static < D_INFL_STATIC,
+            #                  W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
+            print(np.where(d_static < D_INFL_STATIC, BIG, 0.))
+            cost += np.where(d_static < D_INFL_STATIC, BIG, 0.)
 
         if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)
+            rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
             cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(rel_pts)
-        # # ℓvirtual (forward-reachable-set / occlusion safety): a worst-case phantom sits on the
+            print(LIDAR_COSTMAP.hidden_fraction(rel_pts))
+        # ℓvirtual (forward-reachable-set / occlusion safety): a worst-case phantom sits on the
         # FREE↔UNKNOWN frontier and could have reached V_MAX_VIRTUAL·t_k out of it by this step.
         # Penalise the rollout for entering within D_SAFE_VIRTUAL of that expanding bubble's edge.
-        # if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-        #     t_elapsed  = (k + 1) * DT
-        #     r_bubble   = (V_MAX_VIRTUAL * t_elapsed)                       # bubble radius at step k
-        #     d_frontier = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)     # dist to blind-corner edge
-        #     d_virtual  = d_frontier - r_bubble                          # dist to the bubble's edge
-        #     cost += np.where(d_virtual < D_SAFE_VIRTUAL,
-        #                      W_VIRTUAL * (D_SAFE_VIRTUAL - d_virtual)**2, 0.0)
+        if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            t_elapsed  = (k + 1) * DT
+            r_bubble   = (V_MAX_VIRTUAL * t_elapsed)                       # bubble radius at step k
+            d_frontier = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)     # dist to blind-corner edge
+            d_virtual  = d_frontier - r_bubble                          # dist to the bubble's edge
+            cost += np.where(d_virtual < D_SAFE_VIRTUAL,
+                             W_VIRTUAL * (D_SAFE_VIRTUAL - d_virtual)**2, 0.0)
 
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
         # t_elapsed = (k + 1) * DT
@@ -625,13 +626,55 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 
 # ── Main control loop ─────────────────────────────────────────────────────────
 
+def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj):
+    """Persist one episode's ego trajectory as CSV + a top-down PNG plot.
+
+    traj columns: t, x, y, theta, v, a_cmd, delta_cmd  (x=Unity Z, y=Unity X).
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    verdict = "collision" if ep_log["collided"] else ("reached" if ep_log["reached"] else "timeout")
+    stem = os.path.join(out_dir, f"ep{ep+1:03d}_{ep_log['scenario']}_{verdict}")
+
+    header = "t,x,y,theta,v,a_cmd,delta_cmd"
+    np.savetxt(f"{stem}.csv", traj, delimiter=",", header=header, comments="")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(f"[traj] saved {stem}.csv (matplotlib missing — no plot)")
+        return
+
+    x, y, v = traj[:, 1], traj[:, 2], traj[:, 4]
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sc = ax.scatter(x, y, c=v, cmap="viridis", s=10, zorder=3)
+    ax.plot(x, y, "-", color="0.6", lw=0.8, zorder=2)
+    ax.plot(x[0], y[0], "o", color="tab:green", ms=10, label="start", zorder=4)
+    ax.plot(x[-1], y[-1], "s", color="tab:red", ms=10, label="end", zorder=4)
+    if goal_xy is not None:
+        ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18,
+                markeredgecolor="k", label="goal", zorder=5)
+    fig.colorbar(sc, ax=ax, label="speed [m/s]")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
+    ax.set_title(f"Ep {ep+1} — {ep_log['scenario']} — {verdict}")
+    ax.legend(loc="best"); ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(f"{stem}.png", dpi=120)
+    plt.close(fig)
+    print(f"[traj] saved {stem}.csv and {stem}.png")
+
+
 def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         min_difficulty=0.0, max_difficulty=1.0,
         noise_std=0.0, scenario_type=SCENARIO_STANDARD, detect_range=float("inf"), dataset_path=None,
         uncertainty=False, n_scenarios=N_SCEN, w_info=W_INFO,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         value_net_path=None, w_term=W_TERM, pin_episode=None,
-        lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False):
+        lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
+        save_traj=None):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     DETECTION_RANGE = detect_range
@@ -729,6 +772,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                   "incursion_dt": sc["incursion_dt"],
                   "difficulty": sc["difficulty"],
                   "scenario": SCENARIO_NAMES[task_id]}
+        traj = []   # per-step ego pose log for this episode: (t, x, y, theta, v, a_cmd, delta_cmd)
         prev_obs = None
         prev_act = None
 
@@ -785,7 +829,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             # orients the visibility ROI wedge — same axes as the mppi rollout frame.
             if LIDAR_COSTMAP is not None:
                 ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
-                LIDAR_COSTMAP.update(ego_fwd, [rel for rel, _ in obstacles])
+                LIDAR_COSTMAP.update(ego_fwd)
                 if ep_steps % 20 == 0:
                     st  = LIDAR_COSTMAP.grid.state
                     age = time.monotonic() - LIDAR_COSTMAP._stamp
@@ -839,6 +883,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             ep_log["steps"]    = ep_steps
 
 
+            # Record ego pose this step (world frame: x=Unity Z, y=Unity X).
+            traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd))
+
             action = ActionTuple(
                 continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)
             )
@@ -857,6 +904,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         if unity_stopped:      # Unity exited mid-episode — don't log a partial episode
             break
         episode_stats.append(ep_log)
+
+        if save_traj is not None and traj:
+            _save_trajectory(save_traj, ep, ep_log, goal_xy, np.asarray(traj))
 
         verdict = "COLLISION" if ep_log["collided"] else "safe"
         print(f"[Ep {ep+1:3d}] Δt={ep_log['incursion_dt']:+.2f}s  "
@@ -985,6 +1035,8 @@ if __name__ == "__main__":
                         "rollout endpoints from which occluded path-relevant space stays hidden, "
                         "so the ego arcs wider to see into blind corners (self-terminating via "
                         "memory + decay). Enables the LiDAR map; needs ROS 2 sourced.")
+    p.add_argument("--save-traj", default=None, metavar="DIR",
+                   help="Save each episode's ego trajectory as CSV + a top-down PNG plot into DIR.")
     args = p.parse_args()
 
     if args.d_infl < args.d_safe:
@@ -1011,4 +1063,5 @@ if __name__ == "__main__":
         pin_episode=args.pin_episode,
         lidar_costmap=args.lidar_costmap,
         lidar_topic=args.lidar_topic,
-        visibility_cost=args.visibility_cost)
+        visibility_cost=args.visibility_cost,
+        save_traj=args.save_traj)
