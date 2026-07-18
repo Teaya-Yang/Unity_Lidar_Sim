@@ -52,3 +52,5 @@ unity_ros_lidar/Assets/AirportPack*
 install/*
 build/*
 log/*
+
+out*

@@ -57,7 +57,8 @@ except ImportError:
     _HAS_RCLPY = False
 
 try:
-    from scipy.ndimage import distance_transform_edt, binary_dilation
+    from scipy.ndimage import (distance_transform_edt, binary_dilation,
+                               binary_closing)
     _HAS_SCIPY = True
 except ImportError:
     _HAS_SCIPY = False
@@ -72,6 +73,14 @@ OCC     = np.int8(2)
 # sightline speed cap responds to real blind spots, not to the edge of the observed area. Larger =
 # treats more of the deep shadow behind big occluders as a frontier (slows earlier/further out).
 SHADOW_RADIUS = 4.0
+
+# Occluder gap-sealing for the OCCLUSION-SHADOW computation only. Real walls come back
+# from the LiDAR as broken clusters of OCC cells; every sub-vehicle gap is a little
+# "corner" the ego can peek through, which would seed a spurious occlusion mouth all
+# along the wall. Morphologically CLOSE the OCC mask (dilate then erode) by this radius
+# so gaps narrower than it are sealed before shadows are traced. Only the shadow trace
+# sees the closed mask — the real OCC state, distance field and keep-out are untouched.
+OCC_CLOSE_RADIUS = 1.5
 
 
 def _chamfer_distance(occ: np.ndarray, res: float) -> np.ndarray:
@@ -241,6 +250,7 @@ class LidarCostmap:
         self._stamp = 0.0
         self._dist = None           # (n,n) static distance field [m]
         self._dist_unknown = None   # (n,n) distance-to-nearest-UNKNOWN (frontier) field [m]
+        self._shadow = None         # (n,n) bool: occlusion-shadow cells (blind spots behind occluders)
         self._ready = False
         self._node = self._thread = None
         # visibility lookup (ego-relative candidate offsets → hidden fraction)
@@ -370,23 +380,63 @@ class LidarCostmap:
         else:
             self._dist = _chamfer_distance(occ, self.res)
 
-        # Frontier distance field: distance from every cell to the nearest OCCLUSION-SHADOW cell,
-        # i.e. an UNKNOWN cell that is a genuine blind spot BEHIND an obstacle — NOT the open
-        # sensor-range rim. Plain "nearest UNKNOWN" is wrong here: every un-observed cell (beyond
-        # sensor range, the lateral/rear gaps, the map's outer border) is UNKNOWN, so in open
-        # terrain the nearest UNKNOWN is just the edge of what's been seen (~sensor range), and the
-        # sightline cap would fire everywhere. We instead keep only UNKNOWN cells within
-        # SHADOW_RADIUS of an OCCUPIED cell (an occluder's shadow); the open rim, far from any
-        # object, is excluded, so d_vis is large in the clear and only shrinks near real occlusions.
-        unknown = (self.grid.state == UNKNOWN)
+        # Occlusion-shadow field (LINE-OF-SIGHT). An occlusion boundary is where a
+        # hidden agent could actually emerge into the ego's path — the MOUTH of a
+        # blind corner, not the whole back face of every wall the ego drives past.
+        # A cell qualifies only if it is ALL of:
+        #   (1) UNKNOWN and within SHADOW_RADIUS of an OCCUPIED cell (near a surface,
+        #       excluding the open sensor-range rim);
+        #   (2) genuinely OCCLUDED from the ego — the straight segment ego→cell is
+        #       broken by a nearer OCC cell (it lies in the geometric shadow the
+        #       occluder casts from the ego's viewpoint, not on the visible near face);
+        #   (3) on the VISIBLE frontier — adjacent to a known-FREE cell that is ITSELF
+        #       currently visible from the ego (clear LOS). This picks the near lip of
+        #       the shadow that the ego looks across into the blind region — the corner
+        #       opening a hidden agent rounds. Requiring the neighbour be *visible*
+        #       (not merely known-FREE) is what stops the leak across a thin/irregular
+        #       wall: the FREE in FRONT of a wall is not reached by a clear ray to a
+        #       cell BEHIND it, so the whole back face no longer lights up.
+        # (The old pure OCC-dilation used none of the ego geometry, so every wall's
+        # back face lit up all along the path — the artefact this replaces.)
+        unknown        = (self.grid.state == UNKNOWN)
         occ_for_shadow = (self.grid.state == OCC)
-        if not occ_for_shadow.any():
-            shadow = np.zeros_like(unknown)
-        elif _HAS_SCIPY:
-            r_cells = max(1, int(round(SHADOW_RADIUS / self.res)))
-            shadow = unknown & binary_dilation(occ_for_shadow, iterations=r_cells)
-        else:
-            shadow = unknown & occ_for_shadow  # no scipy: fall back to edge-adjacency only
+        free_cells     = (self.grid.state == FREE)
+        shadow = np.zeros_like(unknown)
+        if occ_for_shadow.any() and _HAS_SCIPY:
+            # Seal sub-vehicle gaps in the fragmented LiDAR OCC so a broken wall doesn't
+            # read as a row of little peek-through corners (shadow trace only — the real
+            # OCC state stays untouched). A morphological close fills only concave pockets
+            # BETWEEN nearby OCC fragments; with this small radius it cannot bridge a real
+            # drivable opening (those are several metres wide) nor invent an occluder out
+            # in open space, so it is safe to seal even cells the ego currently sees FREE.
+            c_cells = max(1, int(round(OCC_CLOSE_RADIUS / self.res)))
+            occ_for_shadow = binary_closing(occ_for_shadow, iterations=c_cells)
+            r_cells  = max(1, int(round(SHADOW_RADIUS / self.res)))
+            near_occ = unknown & binary_dilation(occ_for_shadow, iterations=r_cells)
+            # (2) occluded candidates: near-surface UNKNOWN cells the ego cannot see.
+            ci, cj = np.where(near_occ)
+            occluded = np.zeros_like(unknown)
+            if len(ci):
+                r0 = self.grid._o0 + (ci + 0.5) * self.res
+                r1 = self.grid._o1 + (cj + 0.5) * self.res
+                blk = self._los_blocked(ego0, ego1, r0, r1, occ_for_shadow, self.grid)
+                occluded[ci[blk], cj[blk]] = True
+            # (3) frontier: only FREE cells that TOUCH the occluded set and are
+            # themselves visible from the ego count as the open lip. Restricting the
+            # (costly) visibility raycast to those border FREE cells keeps this cheap.
+            border_free = free_cells & binary_dilation(occluded, iterations=1)
+            fi, fj = np.where(border_free)
+            vis_free = np.zeros_like(unknown)
+            if len(fi):
+                f0 = self.grid._o0 + (fi + 0.5) * self.res
+                f1 = self.grid._o1 + (fj + 0.5) * self.res
+                fvis = ~self._los_blocked(ego0, ego1, f0, f1, occ_for_shadow, self.grid)
+                vis_free[fi[fvis], fj[fvis]] = True
+            shadow = occluded & binary_dilation(vis_free, iterations=1)
+        elif occ_for_shadow.any():
+            # No scipy: fall back to edge-adjacency (no LOS/frontier refinement).
+            shadow = unknown & occ_for_shadow
+        self._shadow = shadow
         if not shadow.any():
             self._dist_unknown = np.full((self.grid.n, self.grid.n), 1e6)
         elif _HAS_SCIPY:
@@ -565,6 +615,24 @@ class LidarCostmap:
         w0/w1: ABSOLUTE world (a0,a1) — see occupancy()/distance() docstrings.
         """
         return self.occupancy(w0, w1) != 0
+
+    def occlusion_points(self) -> Optional[np.ndarray]:
+        """
+        (M,2) ABSOLUTE world (a0,a1) cell centres of the current occlusion-shadow set:
+        line-of-sight blind-corner MOUTHS — UNKNOWN cells near an occluder that are
+        both occluded from the ego (LOS to the ego is broken by a nearer OCC cell)
+        AND on the visible FREE↔shadow frontier (the opening a hidden agent rounds),
+        NOT the open sensor-range rim nor the walled-off interior behind a surface.
+        These are the occlusion BOUNDARY points from which a hidden agent is assumed
+        to emerge in the Firoozi forward-reachable-set formulation. Returns None when
+        the map isn't ready or there is no shadow (⇒ no occlusion keep-out this step).
+        """
+        if not self._ready or self._shadow is None or not self._shadow.any():
+            return None
+        g = self.grid
+        si, sj = np.where(self._shadow)
+        return np.column_stack((g._o0 + (si + 0.5) * self.res,
+                                g._o1 + (sj + 0.5) * self.res))
 
     def hidden_fraction(self, pts: np.ndarray) -> np.ndarray:
         """

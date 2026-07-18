@@ -52,8 +52,8 @@ GOAL_SLOWDOWN_DIST = 15.0   # [m] remaining distance at which speed target start
 GOAL_MIN_SPEED     = 1.5    # [m/s] speed target floor right at the goal (not 0 — avoid stalling
                             # the bicycle model's steering authority, which rolls off toward 0 speed)
 W_HALF    = 10.0         # taxiway half-width [m]
-D_SAFE    = 10.0          # keep-out radius [m]
-D_INFL    = 16.0         # MPPI obstacle influence radius [m]
+D_SAFE    = 14.0          # keep-out radius [m]
+D_INFL    = 30.0         # MPPI obstacle influence radius [m]
 UNC_GROWTH  = 1.0        # influence-ring inflation rate [m/s of prediction time], applied ONLY to
                          # frontal blockers being passed (see the deterministic obstacle branch).
                          # The constant-velocity prediction degrades with t, so the pass clearance
@@ -175,9 +175,16 @@ STATIC_AVOID   = False   # set True by --lidar-costmap: adds the static keep-out
                          # below to MPPI. Independent of VISIBILITY_COST (--visibility-cost),
                          # which only adds the "peek around blind corners" incentive and does
                          # NOT by itself avoid a collision with a static surface.
-W_STATIC       = 20.0     # weight of the static-surface soft ring
-D_SAFE_STATIC  = 8.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
-D_INFL_STATIC  = 10.0      # soft influence ring around static surfaces [m]
+W_STATIC       = 20.0     # weight of the static-surface soft influence ring (graded, gives a gradient)
+D_SAFE_STATIC  = 10.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
+D_INFL_STATIC  = 14.0      # soft influence ring around static surfaces [m]
+# Exact-penalty weights on a keep-out VIOLATION (d < D_SAFE_STATIC), mirroring the MPC's
+# RHO_SLACK/RHO_SLACK2 on (d_safe² − d²)_+. Unlike the old flat `BIG`, this is graded and
+# grows unbounded (quadratically) as d→0, so it (a) always has a gradient the sampler can
+# follow away from the wall — even when every rollout is inside D_INFL — and (b) cannot be
+# outweighed by the accumulated goal/progress reward. This is what stops the corner clip.
+RHO_STATIC     = 10.0
+RHO_STATIC2    = 5.0
 
 VISIBILITY_COST = False
 W_VIS           = 20.0   # weight on the per-step hidden-fraction ∈[0,1]. Summed over H_MPPI steps
@@ -408,16 +415,20 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
 
         if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             d_static = LIDAR_COSTMAP.distance(fwd, lat)
-            #print(d_static)
-            # cost += np.where(d_static < D_INFL_STATIC,
-            #                  W_STATIC * (D_INFL_STATIC - d_static)**2, 0.)
-            print(np.where(d_static < D_INFL_STATIC, BIG, 0.))
-            cost += np.where(d_static < D_INFL_STATIC, BIG, 0.)
+            # Soft influence ring: smooth deflection BEFORE the keep-out. Graded, so
+            # even when every rollout sits inside D_INFL (rounding a concave corner)
+            # the samples closer to the wall cost more and the sampler prefers the
+            # ones farther out — the steering signal the old flat `BIG` washed out.
+            cost += W_STATIC * np.maximum(0.0, D_INFL_STATIC - d_static)**2
+            # Steep exact-penalty keep-out inside D_SAFE (linear + quadratic on the
+            # squared-distance violation): unbounded as d→0, so no rollout buys its
+            # way through the surface. Mirrors the MPC's static keep-out.
+            viol = np.maximum(0.0, D_SAFE_STATIC**2 - d_static**2)
+            cost += RHO_STATIC * viol + RHO_STATIC2 * viol**2
 
         if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
             cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(rel_pts)
-            print(LIDAR_COSTMAP.hidden_fraction(rel_pts))
         # ℓvirtual (forward-reachable-set / occlusion safety): a worst-case phantom sits on the
         # FREE↔UNKNOWN frontier and could have reached V_MAX_VIRTUAL·t_k out of it by this step.
         # Penalise the rollout for entering within D_SAFE_VIRTUAL of that expanding bubble's edge.
@@ -626,10 +637,18 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 
 # ── Main control loop ─────────────────────────────────────────────────────────
 
-def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj):
+def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts=None,
+                     occ_boundary=None):
     """Persist one episode's ego trajectory as CSV + a top-down PNG plot.
 
     traj columns: t, x, y, theta, v, a_cmd, delta_cmd  (x=Unity Z, y=Unity X).
+    obs_track (optional): (N, 3) array of per-step dynamic-obstacle world
+    positions (t, x, y), same frame as traj — overlaid on the plot.
+    occ_pts (optional): (M, 2) array of static occluder (OCC) cell centres
+    (x, y) from the LiDAR costmap, same frame — the buildings/walls.
+    occ_boundary (optional): (K, 2) array of occlusion-boundary (blind-spot)
+    points the occlusion-aware MPC actually constrained (x, y), same frame —
+    each seeds an expanding forward-reachable-set keep-out.
     """
     import os
     os.makedirs(out_dir, exist_ok=True)
@@ -648,16 +667,34 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj):
         return
 
     x, y, v = traj[:, 1], traj[:, 2], traj[:, 4]
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(14, 14))
+    if occ_pts is not None and len(occ_pts):
+        ax.scatter(occ_pts[:, 0], occ_pts[:, 1], c="0.35", s=8, marker="s",
+                   alpha=0.5, label="static occluders", zorder=1)
+    if occ_boundary is not None and len(occ_boundary):
+        ax.scatter(occ_boundary[:, 0], occ_boundary[:, 1], c="tab:purple", s=14,
+                   marker="D", alpha=0.5, label="occlusion boundaries", zorder=2)
     sc = ax.scatter(x, y, c=v, cmap="viridis", s=10, zorder=3)
     ax.plot(x, y, "-", color="0.6", lw=0.8, zorder=2)
     ax.plot(x[0], y[0], "o", color="tab:green", ms=10, label="start", zorder=4)
     ax.plot(x[-1], y[-1], "s", color="tab:red", ms=10, label="end", zorder=4)
+    if obs_track is not None and len(obs_track):
+        ax.scatter(obs_track[:, 1], obs_track[:, 2], c="tab:orange", s=18, alpha=0.6,
+                   marker="x", linewidths=1.2, label="dynamic obstacles", zorder=6)
     if goal_xy is not None:
         ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18,
                 markeredgecolor="k", label="goal", zorder=5)
     fig.colorbar(sc, ax=ax, label="speed [m/s]")
-    ax.set_aspect("equal", adjustable="datalim")
+    # Frame the view on the EGO trajectory (not the full scatter of occluders, which
+    # can sit hundreds of metres away and would shrink the path to a dot). Square,
+    # equal-scale box centred on the path extent with a fixed margin; far occluders
+    # simply clip out.
+    TRAJ_MARGIN = 20.0                     # [m] padding around the ego path
+    cx, cy = 0.5 * (x.min() + x.max()), 0.5 * (y.min() + y.max())
+    half = 0.5 * max(x.max() - x.min(), y.max() - y.min()) + TRAJ_MARGIN
+    ax.set_xlim(cx - half, cx + half)
+    ax.set_ylim(cy - half, cy + half)
+    ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
     ax.set_title(f"Ep {ep+1} — {ep_log['scenario']} — {verdict}")
     ax.legend(loc="best"); ax.grid(True, alpha=0.3)
@@ -773,6 +810,14 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                   "difficulty": sc["difficulty"],
                   "scenario": SCENARIO_NAMES[task_id]}
         traj = []   # per-step ego pose log for this episode: (t, x, y, theta, v, a_cmd, delta_cmd)
+        obs_track = []   # per-step obstacle world positions: list of (t, x, y) rows
+        # Union across the episode (deduped by rounded world cell) of the static
+        # occluders and occlusion boundaries the perception produced. The OA-MPC
+        # perception is frame-based (no memory), so a single end-of-run snapshot only
+        # shows what is visible at the goal — accumulate to show the full extent the
+        # ego actually reacted to, matching the MPC controller's trajectory plot.
+        occ_seen = {}    # static occluder points  → plotted as "static occluders"
+        occ_track = {}   # occlusion boundary points → plotted as "occlusion boundaries"
         prev_obs = None
         prev_act = None
 
@@ -830,12 +875,18 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             if LIDAR_COSTMAP is not None:
                 ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
                 LIDAR_COSTMAP.update(ego_fwd)
-                if ep_steps % 20 == 0:
-                    st  = LIDAR_COSTMAP.grid.state
-                    age = time.monotonic() - LIDAR_COSTMAP._stamp
-                    sensor_pose = LIDAR_COSTMAP._pose
-                    offset = (None if sensor_pose is None else
-                              (sensor_pose[0] - s[0], sensor_pose[1] - s[1]))
+                # Accumulate the persistent-grid perception into the episode-wide union
+                # (deduped by rounded world cell) for the trajectory plot: OCC cells as
+                # static occluders, occlusion_points() as blind-corner boundaries.
+                if save_traj is not None and LIDAR_COSTMAP.ready:
+                    g = LIDAR_COSTMAP.grid
+                    oi, oj = np.where(g.state == 2)
+                    for wx, wy in zip(g._o0 + (oi + 0.5) * g.res, g._o1 + (oj + 0.5) * g.res):
+                        occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
+                    op = LIDAR_COSTMAP.occlusion_points()
+                    if op is not None:
+                        for wx, wy in op:
+                            occ_track[(round(float(wx), 1), round(float(wy), 1))] = None
             u_nom, mean = mppi(s, mean, obstacles, goal_xy, u_prev)
 
             u_cmd      = u_nom
@@ -848,17 +899,16 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             if LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready and ep_steps % 20 == 0:
                 g = LIDAR_COSTMAP.grid
                 oi, oj = np.where(g.state == 2)                     # OCC cells
+                op = LIDAR_COSTMAP.occlusion_points()
+                n_occ = 0 if op is None else len(op)
                 if len(oi):
-                    w0 = g._o0 + (oi + 0.5) * g.res                 # OCC world a0 (Unity Z)
-                    w1 = g._o1 + (oj + 0.5) * g.res                 # OCC world a1 (Unity X)
-                    # true nearest-OCC distance from the ego, brute force (ground truth for the EDT)
-                    d_true = np.min(np.hypot(w0 - s[0], w1 - s[1]))
+                    w0 = g._o0 + (oi + 0.5) * g.res
+                    w1 = g._o1 + (oj + 0.5) * g.res
+                    d_true  = np.min(np.hypot(w0 - s[0], w1 - s[1]))
                     d_field = LIDAR_COSTMAP.distance(np.array([s[0]]), np.array([s[1]]))[0]
-                    # nearest OCC cell itself
                     k = np.argmin(np.hypot(w0 - s[0], w1 - s[1]))
-                    print(f"[CHK] ego=({s[0]:.1f},{s[1]:.1f})  nearest OCC world=({w0[k]:.1f},{w1[k]:.1f})  "
-                        f"d_true={d_true:.1f}  d_field={d_field:.1f}  nOCC={len(oi)}  "
-                        f"OCC a0∈[{w0.min():.1f},{w0.max():.1f}] a1∈[{w1.min():.1f},{w1.max():.1f}]")
+                    print(f"[CHK] ego=({s[0]:.1f},{s[1]:.1f})  nearest OCC=({w0[k]:.1f},{w1[k]:.1f})  "
+                        f"d_true={d_true:.1f}  d_field={d_field:.1f}  nOCC={len(oi)}  nOcc_bnd={n_occ}")
 
 
             # Advance Python-side kinematic state to match what Unity will compute
@@ -885,6 +935,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
 
             # Record ego pose this step (world frame: x=Unity Z, y=Unity X).
             traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd))
+            # Record obstacle world positions this step (rel_xy is ego-relative world coords).
+            for rel, _ov in obstacles:
+                obs_track.append((ep_steps * DT, s[0] + rel[0], s[1] + rel[1]))
 
             action = ActionTuple(
                 continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)
@@ -906,7 +959,16 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         episode_stats.append(ep_log)
 
         if save_traj is not None and traj:
-            _save_trajectory(save_traj, ep, ep_log, goal_xy, np.asarray(traj))
+            # Overlay the episode-wide UNION of static occluders and occlusion
+            # boundaries the perception produced (not a single decaying end-of-run
+            # frame), so the plot shows every wall/blind corner the ego reacted to —
+            # matching the MPC controller's trajectory plot. obs_track dynamic slots
+            # are often empty when the crosser never enters range.
+            occ_pts      = np.array(list(occ_seen.keys()))  if occ_seen  else None
+            occ_boundary = np.array(list(occ_track.keys())) if occ_track else None
+            _save_trajectory(save_traj, ep, ep_log, goal_xy, np.asarray(traj),
+                             np.asarray(obs_track) if obs_track else None,
+                             occ_pts, occ_boundary=occ_boundary)
 
         verdict = "COLLISION" if ep_log["collided"] else "safe"
         print(f"[Ep {ep+1:3d}] Δt={ep_log['incursion_dt']:+.2f}s  "
