@@ -54,3 +54,5 @@ build/*
 log/*
 
 out*
+
+mono_crash.*
