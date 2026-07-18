@@ -60,6 +60,8 @@ from taxi_controller import (
     DRAG_COEFF, ACCEL_TAU, MAX_STEER_RATE, STEER_ROLLOFF_SPD, STEER_ROLLOFF_MIN,
     D_SAFE, D_INFL, K_OBS, OBS_SIZE, DUD_DIST,
     D_SAFE_STATIC, D_INFL_STATIC,
+    V_TARGET, D_SAFE_OCC, D_INFL_OCC, W_OCC,
+    W_SIGHT, A_BRAKE_SIGHT, V_SIGHT_FLOOR,
     SCENARIO_STANDARD, SCENARIO_NAMES,
     obs_to_state, inject_sensor_noise, make_scenarios,
     identify_bicycle_model, _save_trajectory,
@@ -132,22 +134,14 @@ SYM_BIAS_FRAC   = 0.5    # fraction of the horizon over which the bias is applie
 # forbidden radius grows along the prediction horizon as V_TARGET · t_k. The
 # ego therefore gives occluded corners a wider berth the further ahead it plans.
 # Enabled only with --lidar-costmap (needs the map); off ⇒ k_occ=0, zero cost.
+#
+# The occlusion model + constants (V_TARGET, D_SAFE_OCC, D_INFL_OCC, W_OCC, and the
+# sightline cap W_SIGHT / A_BRAKE_SIGHT / V_SIGHT_FLOOR) are imported from
+# taxi_controller so the MPC and MPPI controllers stay in lock-step. Only the two
+# NLP-specific knobs below are local: K_OCC (number of solver slots) and OCC_QUERY_R.
 K_OCC       = 10        # nearest occlusion-boundary points constrained per step (0 ⇒ off)
-V_TARGET    = 5.0      # assumed max speed of a hidden agent emerging from occlusion [m/s]
-D_SAFE_OCC  = 16.0      # base (t=0) hard keep-out radius around an occlusion boundary [m] — wider arc
-D_INFL_OCC  = 24.0      # base (t=0) soft-influence radius (early deflection). Must stay >= D_SAFE_OCC.
-W_OCC       = 25.0      # soft-influence ring penalty weight for occlusion boundaries
 OCC_QUERY_R = 60.0     # only consider occlusion boundaries within this radius of the ego [m]
 
-# Sightline (RSS) speed cap for the occlusion-aware MPC — mirrors the MPPI's W_SIGHTLINE.
-# Widening the arc alone lets the ego blaze around a blind corner at cruise speed; this
-# caps the speed so it can always brake to a stop before the nearest occlusion boundary:
-#   v_safe = sqrt(2 · A_BRAKE_SIGHT · d_vis),  d_vis = distance to nearest occlusion point,
-# and (v − v_safe)_+² is penalised. Floored at V_SIGHT_FLOOR so it never crawls. Active
-# only with --occlusion-aware (k_occ>0); with no real boundary near, d_vis is huge ⇒ no cap.
-W_SIGHT       = 8.0     # weight on the over-speed² penalty (compare W_V=2 speed-tracking)
-A_BRAKE_SIGHT = 1.0     # assumed braking decel for the RSS stopping distance [m/s²]
-V_SIGHT_FLOOR = 2.5     # never cap below this speed [m/s]
 
 class TaxiMPC:
     """Nonlinear MPC for the taxiing aircraft, built once and re-solved each step.

@@ -128,37 +128,25 @@ C_GOAL                      = 20.0
 C_GOAL_TERM                 = 10.0
 C_PROGRESS                  = 10.0
 
-# Virtual-obstacle / forward-reachable-set (FRS) cost — occlusion safety. Assumes a worst-case
-# hidden agent sitting on the FREE↔UNKNOWN frontier (blind corner). As the rollout looks t_k =
-# (k+1)·DT into the future, that phantom could have travelled up to V_MAX_VIRTUAL·t_k in any
-# direction, so a bubble of that radius grows out of the frontier. The rollout is penalised for
-# entering within D_SAFE_VIRTUAL of the bubble's edge:
-#   d_virtual = distance_to_frontier − V_MAX_VIRTUAL·t_k
-#   ℓvirtual  = W_VIRTUAL · max(0, D_SAFE_VIRTUAL − d_virtual)²
-# Effect: the ego swings wide around blind corners or slows so its future doesn't penetrate the
-# expanding bubble. Keep V_MAX_VIRTUAL realistic — too high and the bubble swallows the whole
-# horizon and the ego freezes ("freezing robot"). Gated on --visibility-cost.
-W_VIRTUAL       = 2.0   # weight of the virtual-bubble soft penalty
-V_MAX_VIRTUAL   = 2.0    # assumed max speed of a hidden agent [m/s]
-D_SAFE_VIRTUAL  = 2.0    # safety margin kept from the expanding bubble edge [m]
-
-# Sightline-bounded velocity (RSS / "lookaround") — kinematic speed limit that GUARANTEES the ego
-# can brake to a stop before reaching the nearest visual occlusion, rather than guessing where a
-# hidden agent might go. d_vis = distance to the closest occlusion (the FREE↔UNKNOWN frontier).
-# The max safe speed to still stop within d_vis under max deceleration |A_MIN| is
-#   v_safe = sqrt(2·|A_MIN|·d_vis)
-# and the rollout is penalised (soft, one-sided) whenever its sampled speed exceeds v_safe:
-#   ℓsightline = W_SIGHTLINE · max(0, v_k − v_safe)²
-# Effect: the ego slows approaching blind corners just enough to stop for anything that could
-# emerge, and speeds back up as the sightline opens. Gated on the costmap being ready.
-SIGHTLINE_LIMIT = True   # enable the RSS sightline speed cap
-W_SIGHTLINE     = 60.0    # weight on the over-speed² penalty
-# Deceleration used for the stopping-distance bound [m/s²]. Deliberately LOWER than the true |A_MIN|
-# (=4.0): a conservative (gentle) assumed brake makes v_safe = sqrt(2·A_BRAKE·d_vis) smaller at every
-# frontier distance, so the ego eases off EARLY as it nears a blind spot instead of only inside ~8 m.
-# Lower this further to slow sooner/harder near occlusions.
-A_BRAKE         = 0.50
-V_SIGHT_FLOOR   = 0.5    # min v_safe floor [m/s] so the ego doesn't freeze right at a frontier
+# ── Occlusion-aware safety: forward-reachable-set keep-out + RSS sightline speed cap ──
+# SHARED with taxi_controller_mpc.py (the MPC imports these), so both controllers use the SAME
+# occlusion model and constants. A worst-case hidden agent sits on the FREE↔UNKNOWN frontier (a
+# blind corner; LidarCostmap.distance_to_unknown gives the distance to it) and could be anywhere
+# within V_TARGET·t_k of it after t_k = (k+1)·DT. Two coupled terms, gated on --occlusion-aware:
+#   * expanding keep-out circle:  r_keep = D_SAFE_OCC + V_TARGET·t_k  (soft ring at D_INFL_OCC,
+#     steep exact penalty inside r_keep) — the ego swings wide around the blind corner;
+#   * RSS sightline speed cap:     v_safe = sqrt(2·A_BRAKE_SIGHT·d_vis), floored at V_SIGHT_FLOOR —
+#     the ego slows so it can always stop before the nearest occlusion.
+# Keep V_TARGET realistic — too high and the bubble swallows the horizon and the ego freezes.
+V_TARGET       = 5.0    # assumed max speed of a hidden agent emerging from occlusion [m/s]
+D_SAFE_OCC     = 16.0   # base (t=0) hard keep-out radius around an occlusion boundary [m]
+D_INFL_OCC     = 24.0   # base (t=0) soft-influence radius (early deflection). Must stay >= D_SAFE_OCC.
+W_OCC          = 25.0   # soft-influence ring penalty weight for occlusion boundaries
+W_SIGHT        = 8.0    # sightline over-speed² penalty weight
+A_BRAKE_SIGHT  = 1.0    # assumed braking decel for the RSS stopping distance [m/s²] (gentle ⇒ slows early)
+V_SIGHT_FLOOR  = 2.5    # never cap the sightline speed below this [m/s]
+GOAL_OCC_CLEAR = 31.0   # within this distance of the goal, fade the (repelling) keep-out to 0 — the
+                        # goal is known-safe, so the expanding circle must not push the ego off it
 
 LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
 BIG = 50
@@ -186,6 +174,8 @@ D_INFL_STATIC  = 14.0      # soft influence ring around static surfaces [m]
 RHO_STATIC     = 10.0
 RHO_STATIC2    = 5.0
 
+OCCLUSION_AWARE = False   # set True by --occlusion-aware (needs --lidar-costmap): enables the
+                          # FRS keep-out + sightline speed cap above (mirrors the MPC controller).
 VISIBILITY_COST = False
 W_VIS           = 20.0   # weight on the per-step hidden-fraction ∈[0,1]. Summed over H_MPPI steps
                          # its worst case is ~H·W_VIS, kept comparable to the goal terms so the pull
@@ -368,10 +358,10 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     s0_theta = float(s0[2])              # initial heading — the straight-line lock reference
 
     # ── TEMP sightline diagnostic: is the cap even active at the ego's current pose? ──
-    if SIGHTLINE_LIMIT and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+    if OCCLUSION_AWARE and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
         _dv = float(LIDAR_COSTMAP.distance_to_unknown(
             np.array([s0_fwd]), np.array([s0_lat]))[0])
-        _vs = max((2.0 * A_BRAKE * _dv) ** 0.5, V_SIGHT_FLOOR)
+        _vs = max((2.0 * A_BRAKE_SIGHT * _dv) ** 0.5, V_SIGHT_FLOOR)
         print(f"[sightline] ready d_vis(ego)={_dv:8.2f}  v_safe={_vs:5.2f}  v={s0[3]:5.2f}")
     else:
         print(f"[sightline] INACTIVE  ready="
@@ -403,15 +393,28 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         # ℓvel = W_VEL · exp(-C_VEL · d_k²) · ||v_k||².  d_k already computed above; v_k = speed vv.
         cost += np.exp(-C_VEL * d_k**2) * vv**2
 
-        # ℓsightline (RSS sightline-bounded velocity): cap speed so the ego can always stop before
-        # the nearest occlusion. d_vis = distance to the FREE↔UNKNOWN frontier at this rollout pose;
-        # v_safe = sqrt(2·A_BRAKE·d_vis) is the fastest speed that still stops within d_vis. Penalise
-        # (one-sided) the amount by which the rollout speed exceeds v_safe.
-        if SIGHTLINE_LIMIT and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
-            d_vis   = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)      # dist to nearest occlusion frontier [m]
-            v_safe  = np.maximum(np.power(2.0 * A_BRAKE * d_vis, 0.5), V_SIGHT_FLOOR)
-            cost   += W_SIGHTLINE * np.maximum(0.0, vv - v_safe)**2
+        # ── Occlusion-aware safety (mirrors the MPC): FRS keep-out + RSS sightline cap ──
+        # d_occ = distance to the nearest occlusion frontier (FREE↔UNKNOWN edge) at this rollout
+        # pose. A worst-case hidden agent could be anywhere within V_TARGET·t_k of that edge by
+        # t_k, so an EXPANDING keep-out circle r_keep = D_SAFE_OCC + V_TARGET·t_k (soft ring at
+        # D_INFL_OCC) pushes the ego wide, and the sightline cap v_safe = sqrt(2·A_BRAKE_SIGHT·d_occ)
+        # slows it so it can stop before the corner. Both use the shared constants (== the MPC).
+        if OCCLUSION_AWARE and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            d_occ  = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)   # (K,) dist to nearest occlusion [m]
+            t_k    = (k + 1) * DT
+            r_grow = V_TARGET * t_k
+            r_infl = D_INFL_OCC + r_grow
+            r_keep = D_SAFE_OCC + r_grow
+            # Goal is known-safe: fade the (repelling) keep-out to 0 within GOAL_OCC_CLEAR of the
+            # goal so the expanding circle can't push the ego off its own goal (MPPI analogue of
+            # the MPC's goal-masking of occlusion points). d_k = dist to goal, computed above.
+            goal_fade = np.clip(d_k / GOAL_OCC_CLEAR, 0.0, 1.0)
+            cost += goal_fade * W_OCC * np.maximum(0.0, r_infl - d_occ)**2   # soft ring
+            violc = np.maximum(0.0, r_keep**2 - d_occ**2)                     # steep keep-out
+            cost += goal_fade * (RHO_STATIC * violc + RHO_STATIC2 * violc**2)
+            # RSS sightline speed cap (not faded — slowing never repels the ego from the goal).
+            v_safe = np.maximum(np.sqrt(2.0 * A_BRAKE_SIGHT * d_occ), V_SIGHT_FLOOR)
+            cost  += W_SIGHT * np.maximum(0.0, vv - v_safe)**2
 
         if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             d_static = LIDAR_COSTMAP.distance(fwd, lat)
@@ -429,16 +432,8 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
             cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(rel_pts)
-        # ℓvirtual (forward-reachable-set / occlusion safety): a worst-case phantom sits on the
-        # FREE↔UNKNOWN frontier and could have reached V_MAX_VIRTUAL·t_k out of it by this step.
-        # Penalise the rollout for entering within D_SAFE_VIRTUAL of that expanding bubble's edge.
-        if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            t_elapsed  = (k + 1) * DT
-            r_bubble   = (V_MAX_VIRTUAL * t_elapsed)                       # bubble radius at step k
-            d_frontier = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)     # dist to blind-corner edge
-            d_virtual  = d_frontier - r_bubble                          # dist to the bubble's edge
-            cost += np.where(d_virtual < D_SAFE_VIRTUAL,
-                             W_VIRTUAL * (D_SAFE_VIRTUAL - d_virtual)**2, 0.0)
+        # (The forward-reachable-set keep-out now lives in the unified occlusion-aware block
+        # above, gated on OCCLUSION_AWARE with the shared constants — see the MPC for parity.)
 
         # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
         # t_elapsed = (k + 1) * DT
@@ -711,9 +706,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         value_net_path=None, w_term=W_TERM, pin_episode=None,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
-        save_traj=None):
+        occlusion_aware=False, save_traj=None):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
+    global OCCLUSION_AWARE
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     N_SCEN          = n_scenarios
@@ -730,6 +726,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
     if lidar_costmap or visibility_cost:
         VISIBILITY_COST = visibility_cost
         STATIC_AVOID    = lidar_costmap
+        OCCLUSION_AWARE = occlusion_aware and lidar_costmap   # occlusion terms need the map
         from lidar_costmap import LidarCostmap
         # max_age raised from the 0.5s default: Unity's PointCloudPublisher is configured well
         # below 10Hz (measured ~1Hz cloud_age via [DEBUG lidar]), so 0.5s made `ready` permanently
@@ -739,15 +736,20 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         if cm.start(topic=lidar_topic):
             LIDAR_COSTMAP = cm
             feats = []
-            if lidar_costmap:   feats.append(f"static(D_SAFE={D_SAFE_STATIC:.1f}m)")
-            if visibility_cost: feats.append(f"visibility(W_VIS={W_VIS:.1f})")
+            if lidar_costmap:    feats.append(f"static(D_SAFE={D_SAFE_STATIC:.1f}m)")
+            if OCCLUSION_AWARE:  feats.append(f"occlusion(D_SAFE_OCC={D_SAFE_OCC:.1f}m, "
+                                             f"v_target={V_TARGET:.1f}m/s, sightline)")
+            if visibility_cost:  feats.append(f"visibility(W_VIS={W_VIS:.1f})")
             print(f"[Controller] LiDAR map     : ON  (topic={lidar_topic}) — {' + '.join(feats)} "
                   f"in the MPPI cost; persistent 3-state map")
         else:
             VISIBILITY_COST = False
             STATIC_AVOID    = False
+            OCCLUSION_AWARE = False
             print("[Controller] LiDAR map     : requested but unavailable (no rclpy) — "
                   "running WITHOUT LiDAR-based costs")
+    elif occlusion_aware:
+        print("[Controller] Occlusion-aware : requested but needs --lidar-costmap — DISABLED")
     env_params = EnvironmentParametersChannel()
     env = UnityEnvironment(
         file_name=unity_exec_path,
@@ -1097,6 +1099,12 @@ if __name__ == "__main__":
                         "rollout endpoints from which occluded path-relevant space stays hidden, "
                         "so the ego arcs wider to see into blind corners (self-terminating via "
                         "memory + decay). Enables the LiDAR map; needs ROS 2 sourced.")
+    p.add_argument("--occlusion-aware", action="store_true",
+                   help="Add occlusion-aware forward-reachable-set keep-outs + an RSS sightline "
+                        "speed cap (same model/constants as the MPC controller): a worst-case "
+                        "hidden agent on each blind-corner frontier seeds an EXPANDING keep-out "
+                        "(radius grows as v_target·t) and the ego is speed-capped so it can stop "
+                        "before the nearest occlusion. Requires --lidar-costmap.")
     p.add_argument("--save-traj", default=None, metavar="DIR",
                    help="Save each episode's ego trajectory as CSV + a top-down PNG plot into DIR.")
     args = p.parse_args()
@@ -1126,4 +1134,5 @@ if __name__ == "__main__":
         lidar_costmap=args.lidar_costmap,
         lidar_topic=args.lidar_topic,
         visibility_cost=args.visibility_cost,
+        occlusion_aware=args.occlusion_aware,
         save_traj=args.save_traj)
