@@ -141,16 +141,12 @@ C_PROGRESS                  = 10.0
 V_TARGET       = 5.0    # assumed max speed of a hidden agent emerging from occlusion [m/s]
 D_SAFE_OCC     = 16.0   # base (t=0) hard keep-out radius around an occlusion boundary [m]
 D_INFL_OCC     = 24.0   # base (t=0) soft-influence radius (early deflection). Must stay >= D_SAFE_OCC.
-W_OCC          = 25.0   # soft-influence ring penalty weight for occlusion boundaries
-W_SIGHT        = 8.0    # sightline over-speed² penalty weight
-A_BRAKE_SIGHT  = 1.0    # assumed braking decel for the RSS stopping distance [m/s²] (gentle ⇒ slows early)
+W_OCC          = 20.0   # soft-influence ring penalty weight for occlusion boundaries
+W_SIGHT        = 15.0    # sightline over-speed² penalty weight
+A_BRAKE_SIGHT  = 0.4    # assumed braking decel for the RSS stopping distance [m/s²] (gentle ⇒ slows early)
 V_SIGHT_FLOOR  = 2.5    # never cap the sightline speed below this [m/s]
 GOAL_OCC_CLEAR = 31.0   # within this distance of the goal, fade the (repelling) keep-out to 0 — the
                         # goal is known-safe, so the expanding circle must not push the ego off it
-
-LAT_GOAROUND = 1.5    # lateral offset [m] at which ego is considered committed to a go-around
-BIG = 50
-
 
 N_SCEN = 10
 W_INFO = 10
