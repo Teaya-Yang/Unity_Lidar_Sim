@@ -58,7 +58,7 @@ except ImportError:
 
 try:
     from scipy.ndimage import (distance_transform_edt, binary_dilation,
-                               binary_closing)
+                               binary_closing, label as _cc_label)
     _HAS_SCIPY = True
 except ImportError:
     _HAS_SCIPY = False
@@ -81,6 +81,37 @@ SHADOW_RADIUS = 4.0
 # so gaps narrower than it are sealed before shadows are traced. Only the shadow trace
 # sees the closed mask — the real OCC state, distance field and keep-out are untouched.
 OCC_CLOSE_RADIUS = 1.5
+
+# DENSITY filter for the occlusion-shadow lip. The frontier lip is a 1-cell-thick
+# speckle that grazing-angle LOS shatters into 1-few-cell fragments everywhere (real
+# mouth AND wall), so raw fragment size can't separate them (measured: largest ~7
+# cells anywhere). What separates a real mouth is DENSITY — many fragments packed into
+# a small area vs. sparse specks along a wall. So the fragments are first DILATED by
+# SHADOW_MERGE_RADIUS to fuse neighbours into clusters, and clusters below
+# MIN_SHADOW_AREA (measured on the MERGED, dilation-inflated cluster) are dropped.
+#   * SHADOW_MERGE_RADIUS — how far apart fragments still count as the same mouth [m].
+#   * MIN_SHADOW_AREA     — merged-cluster area [m²] to survive. Because dilation
+#     inflates area, a single isolated speck already merges to ~7 m²; set this ABOVE
+#     that so lone specks drop but a dense mouth (tens of m² merged) survives.
+# Set env LIDAR_SHADOW_DEBUG=1 to print per-frame MERGED-cluster sizes and tune both.
+SHADOW_MERGE_RADIUS = 1.5
+MIN_SHADOW_AREA = 12.0
+
+# PATH-RELEVANCE gate. A straight wall the ego drives PARALLEL to is a legitimately
+# dense occlusion frontier that no shape/density test can call "not a boundary", so
+# instead of trying to distinguish it geometrically we keep only the shadow a hidden
+# agent could actually round INTO the ego's route: cells within OCC_PATH_CORRIDOR of
+# the ego→goal segment, from just behind the ego (OCC_PATH_BEHIND) to just past the
+# goal (OCC_PATH_PAST_GOAL). This drops the long wall stretches the ego merely passes
+# alongside and the wall behind/beside the goal (the near-goal repulsion/orbit), while
+# keeping the corner the path actually rounds. Only applied when a goal is set via
+# set_goal(); with no goal the full shadow is kept (unchanged behaviour).
+OCC_PATH_CORRIDOR  = 22.0   # [m] lateral half-width of the kept corridor around ego→goal
+OCC_PATH_BEHIND    = 8.0    # [m] keep shadow up to this far behind the ego along the path
+OCC_PATH_PAST_GOAL = 8.0    # [m] keep shadow up to this far past the goal along the path
+
+import os as _os
+_SHADOW_DEBUG = _os.environ.get("LIDAR_SHADOW_DEBUG", "0") not in ("0", "", "false", "False")
 
 
 def _chamfer_distance(occ: np.ndarray, res: float) -> np.ndarray:
@@ -251,6 +282,7 @@ class LidarCostmap:
         self._dist = None           # (n,n) static distance field [m]
         self._dist_unknown = None   # (n,n) distance-to-nearest-UNKNOWN (frontier) field [m]
         self._shadow = None         # (n,n) bool: occlusion-shadow cells (blind spots behind occluders)
+        self._goal = None           # (g0, g1) world goal for the path-relevance shadow gate, or None
         self._ready = False
         self._node = self._thread = None
         # visibility lookup (ego-relative candidate offsets → hidden fraction)
@@ -338,6 +370,12 @@ class LidarCostmap:
 
     # ── Per-control-step build ────────────────────────────────────────────────
 
+    def set_goal(self, g0: float, g1: float) -> None:
+        """Set the world goal (a0, a1) used by the path-relevance shadow gate. Pass
+        None-equivalent by omitting to keep the full shadow. Call each control step
+        before update() so the gate uses the current goal."""
+        self._goal = None if g0 is None or g1 is None else (float(g0), float(g1))
+
     def update(self, ego_fwd=None) -> bool:
         """
         Integrate the latest scan into the persistent map and rebuild the static
@@ -396,6 +434,10 @@ class LidarCostmap:
         #       (not merely known-FREE) is what stops the leak across a thin/irregular
         #       wall: the FREE in FRONT of a wall is not reached by a clear ray to a
         #       cell BEHIND it, so the whole back face no longer lights up.
+        #   (4) part of a connected shadow blob of at least MIN_SHADOW_AREA (below).
+        #       Grazing-incidence LiDAR undersampling still leaks tiny raster-gap
+        #       shadows along a wall the ego drives parallel to; a real mouth is a
+        #       larger coherent cluster, so small components are dropped as noise.
         # (The old pure OCC-dilation used none of the ego geometry, so every wall's
         # back face lit up all along the path — the artefact this replaces.)
         unknown        = (self.grid.state == UNKNOWN)
@@ -433,9 +475,61 @@ class LidarCostmap:
                 fvis = ~self._los_blocked(ego0, ego1, f0, f1, occ_for_shadow, self.grid)
                 vis_free[fi[fvis], fj[fvis]] = True
             shadow = occluded & binary_dilation(vis_free, iterations=1)
+            # (4) DENSITY filter (merge-then-size). The frontier lip is a 1-cell-thick
+            # speckle: grazing-angle LOS shatters it into 1-few-cell fragments EVERY-
+            # where — at the real mouth AND along the wall — so raw component size has
+            # no signal (measured: largest blob ~5-7 cells anywhere). What separates a
+            # genuine mouth is DENSITY: many fragments packed into a small area, versus
+            # sparse specks strung along a wall. So first DILATE by SHADOW_MERGE_RADIUS
+            # to fuse nearby fragments into clusters, size-filter the MERGED clusters,
+            # then keep only original lip cells falling in a surviving cluster.
+            if shadow.any():
+                merge_cells = max(1, int(round(SHADOW_MERGE_RADIUS / self.res)))
+                merged = binary_dilation(shadow, iterations=merge_cells)
+                lbl, n_lbl = _cc_label(merged, structure=np.ones((3, 3), bool))
+                min_cells = MIN_SHADOW_AREA / (self.res * self.res)
+                if n_lbl:
+                    counts = np.bincount(lbl.ravel())
+                    counts[0] = 0                       # background label
+                    keep_lbl = counts >= min_cells
+                    if _SHADOW_DEBUG:
+                        sizes = np.sort(counts[counts > 0])[::-1]
+                        cell_a = self.res * self.res
+                        print(f"[shadow] {n_lbl} merged clusters  "
+                              f"sizes[cells]={sizes[:12].tolist()}"
+                              f"  min_cells={min_cells:.0f} ({MIN_SHADOW_AREA:.1f} m²)"
+                              f"  clusters_kept={int(keep_lbl.sum())}"
+                              f"  largest={sizes[0] * cell_a:.1f} m²")
+                    shadow = shadow & keep_lbl[lbl]
         elif occ_for_shadow.any():
             # No scipy: fall back to edge-adjacency (no LOS/frontier refinement).
             shadow = unknown & occ_for_shadow
+
+        # (5) PATH-RELEVANCE gate. Keep only shadow a hidden agent could round INTO the
+        # ego's route: within OCC_PATH_CORRIDOR of the ego→goal segment, from just
+        # behind the ego to just past the goal. Drops the long wall the ego drives
+        # alongside and the wall behind/beside the goal (near-goal orbit). See constants.
+        if self._goal is not None and shadow.any():
+            g0, g1 = self._goal
+            dx, dy = g0 - ego0, g1 - ego1
+            seg_len = float(np.hypot(dx, dy))
+            if seg_len > 1e-3:
+                ux, uy = dx / seg_len, dy / seg_len          # ego→goal unit vector
+                si, sj = np.where(shadow)
+                w0 = self.grid._o0 + (si + 0.5) * self.res
+                w1 = self.grid._o1 + (sj + 0.5) * self.res
+                rx, ry = w0 - ego0, w1 - ego1
+                along = rx * ux + ry * uy                     # signed progress along path
+                perp  = np.abs(rx * (-uy) + ry * ux)          # lateral offset from path
+                keep = ((along >= -OCC_PATH_BEHIND) &
+                        (along <= seg_len + OCC_PATH_PAST_GOAL) &
+                        (perp <= OCC_PATH_CORRIDOR))
+                gated = np.zeros_like(shadow)
+                gated[si[keep], sj[keep]] = True
+                if _SHADOW_DEBUG:
+                    print(f"[shadow] path-gate: {int(shadow.sum())} → {int(gated.sum())} cells"
+                          f"  (corridor={OCC_PATH_CORRIDOR:.0f}m, seg={seg_len:.0f}m)")
+                shadow = gated
         self._shadow = shadow
         if not shadow.any():
             self._dist_unknown = np.full((self.grid.n, self.grid.n), 1e6)

@@ -203,12 +203,18 @@ public class TaxiAgent : Unity.MLAgents.Agent
                 transform, incursionDt, ambulanceSpeed,
                 conflictZOffset, crossDirSign, scenarioType, headOnProb);
 
-            // Two-point sandbox: place the plane at the start marker with NO rotation applied
-            // (identity heading, facing world +Z). It no longer auto-faces the goal/lane tangent.
+            // Two-point sandbox: place the plane at the start marker. Default is NO rotation
+            // (identity heading, facing world +Z) — it no longer auto-faces the goal/lane
+            // tangent. Python can override the spawn yaw per-episode via 'spawn_heading_deg'
+            // (world yaw, degrees) for testing approach angles into a corner/occlusion.
             if (scenarioManager.EgoHasSpawn)
-                transform.SetPositionAndRotation(
-                    scenarioManager.EgoSpawnPos,
-                    Quaternion.identity);
+            {
+                float spawnHeadingDeg = ep.GetWithDefault("spawn_heading_deg", float.NaN);
+                Quaternion spawnRot = float.IsNaN(spawnHeadingDeg)
+                    ? Quaternion.identity
+                    : Quaternion.Euler(0f, spawnHeadingDeg, 0f);
+                transform.SetPositionAndRotation(scenarioManager.EgoSpawnPos, spawnRot);
+            }
         }
         // ── Legacy single-agent path ──────────────────────────────────────────
         else if (incursionController != null && conflictPoint != null)

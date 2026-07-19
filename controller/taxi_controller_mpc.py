@@ -71,7 +71,7 @@ from taxi_controller import (
 # Horizon: MPPI uses H=60 (6 s) because sampling is cheap. IPOPT solves a real NLP
 # each step, so a shorter horizon keeps the per-step solve well under the DT budget
 # while still seeing far enough ahead for taxi-speed avoidance. 25 steps = 2.5 s.
-N_MPC   = 30
+N_MPC   = 40
 
 # Goal capture zone. The imported speed taper floors the target at GOAL_MIN_SPEED so
 # the ego never stalls mid-course — but right at the goal that floor means it can't
@@ -102,8 +102,8 @@ R_DACT      = np.array([0.10, 0.7])   # control rate  ‖Δu‖²_RΔ; steering-
 # bounded goal pull, so no rollout buys its way through the keep-out. A soft
 # influence ring gives smooth early deflection before the hard radius is reached.
 W_OBS      = 8.0      # soft influence ring:  W_OBS · max(0, D_INFL − d)²
-RHO_SLACK  = 10.0     # linear exact-penalty weight on a keep-out violation [per m²]
-RHO_SLACK2 = 5.0      # quadratic penalty on the violation (curves the exact penalty)
+RHO_SLACK  = 7.0     # linear exact-penalty weight on a keep-out violation [per m²]
+RHO_SLACK2 = 3.0      # quadratic penalty on the violation (curves the exact penalty)
 
 # Static-obstacle (LiDAR costmap) avoidance. Enabled with --lidar-costmap. Each
 # control step the K_STATIC nearest occupied (OCC) cell centres to the ego are fed
@@ -213,6 +213,7 @@ class TaxiMPC:
         g_eq   = [X[0] - P_s0]   # equalities: initial state + multiple-shooting defects
         g_rate = []              # inequalities: |Δdelta_cmd| ≤ max_dstep  (linear)
         cost   = 0
+        v_safe_list = []         # per-stage sightline speed cap, for debug printing
 
         for k in range(Nh):
             xk, uk = X[k], U[k]
@@ -295,6 +296,7 @@ class TaxiMPC:
             # no real boundary is near.
             if self.k_occ:
                 v_safe = ca.fmax(ca.sqrt(2.0 * A_BRAKE_SIGHT * d_vis + 1e-6), V_SIGHT_FLOOR)
+                v_safe_list.append(v_safe)
                 cost += W_SIGHT * ca.fmax(0.0, v - v_safe) ** 2
 
         # Terminal goal pull (LINEAR distance) — anchors the END of the horizon at
@@ -310,6 +312,13 @@ class TaxiMPC:
         p = ca.vertcat(P_s0, P_goal, P_vdes, P_uprev, *P_opos, *P_ovel, *P_spos, *P_occ)
         g = ca.vertcat(*g_eq, *g_rate)
         nlp = {"x": w, "p": p, "f": cost, "g": g}
+
+        # Debug helper: evaluate the per-stage sightline speed cap numerically
+        # after solving (v_safe is symbolic here and can't be printed directly).
+        if v_safe_list:
+            self.v_safe_fn = ca.Function("v_safe_fn", [w, p], [ca.vertcat(*v_safe_list)])
+        else:
+            self.v_safe_fn = None
 
         opts = {
             "print_time": False,
@@ -557,6 +566,10 @@ class TaxiMPC:
         ok    = stats.get("success", False)
         w_opt = np.asarray(sol["x"]).flatten()
 
+        if self.v_safe_fn is not None:
+            v_safe_vals = np.asarray(self.v_safe_fn(sol["x"], p)).flatten()
+            #print("v_safe:", v_safe_vals)
+
         # Unpack states/controls from the flat solution.
         Xopt = w_opt[:self.n_x].reshape(Nh + 1, nx)
         Uopt = w_opt[self.n_x:self.n_x + self.n_u].reshape(Nh, nu)
@@ -632,7 +645,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
         scenario_type=SCENARIO_STANDARD, detect_range=float("inf"),
         d_infl=D_INFL, d_safe=D_SAFE, horizon=N_MPC, pin_episode=None,
         lidar_costmap=False, lidar_topic="/point_cloud", save_traj=None,
-        occlusion_aware=False):
+        occlusion_aware=False, spawn_heading_deg=None, spawn_heading_jitter_deg=0.0):
     # Detection range lives as a module global inside taxi_controller (obs_to_state
     # reads it), so set it there rather than shadowing a local copy.
     tc.DETECTION_RANGE = detect_range
@@ -705,12 +718,16 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
 
     scenarios = make_scenarios(n_episodes, min_difficulty=min_difficulty,
                                max_difficulty=max_difficulty,
-                               scenario_type=scenario_type)
+                               scenario_type=scenario_type,
+                               spawn_heading_deg=spawn_heading_deg,
+                               spawn_heading_jitter_deg=spawn_heading_jitter_deg)
     if pin_episode is not None:
         pinned = make_scenarios(1, base_seed=pin_episode,
                                 min_difficulty=min_difficulty,
                                 max_difficulty=max_difficulty,
-                                scenario_type=scenario_type)[0]
+                                scenario_type=scenario_type,
+                                spawn_heading_deg=spawn_heading_deg,
+                                spawn_heading_jitter_deg=spawn_heading_jitter_deg)[0]
         scenarios = [dict(pinned) for _ in range(n_episodes)]
         print(f"[MPC] Pinned episode  : seed={pin_episode} — identical scenario every episode")
 
@@ -788,6 +805,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
             n_occ      = 0
             if costmap is not None:
                 ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
+                # Path-relevance gate: keep only occlusion shadow within a corridor of
+                # the ego→goal route (drops the wall driven alongside / beside the goal).
+                costmap.set_goal(goal_xy[0], goal_xy[1])
                 costmap.update(ego_fwd)
                 if costmap.ready:
                     g = costmap.grid
@@ -890,7 +910,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
             occ_boundary = (np.array(list(occ_track.keys())) if occ_track else None)
             _save_trajectory(save_traj, ep, ep_log, goal_xy, np.asarray(traj),
                              np.asarray(obs_track) if obs_track else None, occ_pts,
-                             occ_boundary=occ_boundary)
+                             occ_boundary=occ_boundary, occ_horizon_s=mpc.N * DT)
 
         verdict   = "COLLISION" if ep_log["collided"] else "safe"
         mean_ms   = solve_ms_acc / max(ep_log["steps"], 1)
@@ -985,6 +1005,12 @@ if __name__ == "__main__":
                         "so the ego gives occluded corners a wider berth. Requires --lidar-costmap.")
     p.add_argument("--save-traj",      default=None, metavar="DIR",
                    help="Save each episode's ego trajectory as CSV + a top-down PNG plot into DIR.")
+    p.add_argument("--spawn-heading-deg", default=None, type=float, metavar="DEG",
+                   help="Fixed ego spawn heading [deg, world yaw] at the start marker. Omit to keep "
+                        "Unity's default spawn behaviour (identity heading).")
+    p.add_argument("--spawn-heading-jitter-deg", default=0.0, type=float, metavar="DEG",
+                   help="+/- random jitter added to --spawn-heading-deg each episode (reproducible, "
+                        "seeded off episode_seed). No effect unless --spawn-heading-deg is set.")
     args = p.parse_args()
 
     if args.d_infl < args.d_safe:
@@ -1007,4 +1033,6 @@ if __name__ == "__main__":
         lidar_costmap=args.lidar_costmap,
         lidar_topic=args.lidar_topic,
         save_traj=args.save_traj,
-        occlusion_aware=args.occlusion_aware)
+        occlusion_aware=args.occlusion_aware,
+        spawn_heading_deg=args.spawn_heading_deg,
+        spawn_heading_jitter_deg=args.spawn_heading_jitter_deg)

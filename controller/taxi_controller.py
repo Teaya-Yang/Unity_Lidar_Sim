@@ -138,12 +138,12 @@ C_PROGRESS                  = 10.0
 #   * RSS sightline speed cap:     v_safe = sqrt(2·A_BRAKE_SIGHT·d_vis), floored at V_SIGHT_FLOOR —
 #     the ego slows so it can always stop before the nearest occlusion.
 # Keep V_TARGET realistic — too high and the bubble swallows the horizon and the ego freezes.
-V_TARGET       = 5.0    # assumed max speed of a hidden agent emerging from occlusion [m/s]
+V_TARGET       = 3.0    # assumed max speed of a hidden agent emerging from occlusion [m/s]
 D_SAFE_OCC     = 16.0   # base (t=0) hard keep-out radius around an occlusion boundary [m]
 D_INFL_OCC     = 24.0   # base (t=0) soft-influence radius (early deflection). Must stay >= D_SAFE_OCC.
 W_OCC          = 20.0   # soft-influence ring penalty weight for occlusion boundaries
 W_SIGHT        = 15.0    # sightline over-speed² penalty weight
-A_BRAKE_SIGHT  = 0.4    # assumed braking decel for the RSS stopping distance [m/s²] (gentle ⇒ slows early)
+A_BRAKE_SIGHT  = 0.5    # assumed braking decel for the RSS stopping distance [m/s²] (gentle ⇒ slows early)
 V_SIGHT_FLOOR  = 2.5    # never cap the sightline speed below this [m/s]
 GOAL_OCC_CLEAR = 31.0   # within this distance of the goal, fade the (repelling) keep-out to 0 — the
                         # goal is known-safe, so the expanding circle must not push the ego off it
@@ -358,6 +358,7 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         _dv = float(LIDAR_COSTMAP.distance_to_unknown(
             np.array([s0_fwd]), np.array([s0_lat]))[0])
         _vs = max((2.0 * A_BRAKE_SIGHT * _dv) ** 0.5, V_SIGHT_FLOOR)
+
         print(f"[sightline] ready d_vis(ego)={_dv:8.2f}  v_safe={_vs:5.2f}  v={s0[3]:5.2f}")
     else:
         print(f"[sightline] INACTIVE  ready="
@@ -565,7 +566,8 @@ MAX_GOAL_DIST         = 180.0  # cap the ego goal [m] so long (runway-length) pa
 
 
 def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_difficulty=1.0,
-                   scenario_type=SCENARIO_STANDARD):
+                   scenario_type=SCENARIO_STANDARD, spawn_heading_deg=None,
+                   spawn_heading_jitter_deg=0.0):
     """
     Build a reproducible list of per-episode scenario parameter dicts.
 
@@ -577,6 +579,13 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 
     min_difficulty / max_difficulty clamp the ramp so you can test a specific
     difficulty band. E.g. min_difficulty=0.85 forces 3-agent Erratic scenarios.
+
+    spawn_heading_deg (optional): fixed ego spawn heading [deg, world yaw] at
+    the start marker. When None (default), the key is left out of the dict
+    entirely and Unity falls back to its own spawn behaviour (identity heading
+    in the two-point-sandbox / scenario-manager path). When set, every episode
+    spawns the ego rotated to this heading, +/- a per-episode random jitter of
+    spawn_heading_jitter_deg (still seeded off episode_seed, so reproducible).
     """
     # Lever 3: power-warp a uniform [-1, 1] grid so density concentrates near 0
     # while the extremes still reach ±DT_SPAN (full timing coverage preserved).
@@ -623,13 +632,17 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
             "converge_spawn_dist":    CONVERGE_SPAWN_DIST,   # ring radius; only used by SCENARIO_CONVERGING
             "head_on_gap":            HEADON_APPROACH_GAP,   # meet/spawn distance; only used by SCENARIO_HEADON
         })
+        if spawn_heading_deg is not None:
+            jitter = float(r.uniform(-spawn_heading_jitter_deg, spawn_heading_jitter_deg))
+            scenarios[-1]["spawn_heading_deg"] = float(spawn_heading_deg) + jitter
     return scenarios
 
 
 # ── Main control loop ─────────────────────────────────────────────────────────
 
 def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts=None,
-                     occ_boundary=None):
+                     occ_boundary=None, occ_horizon_s=None, occ_max_circles=16,
+                     occ_n_rings=4, occ_cluster_m=D_SAFE_OCC):
     """Persist one episode's ego trajectory as CSV + a top-down PNG plot.
 
     traj columns: t, x, y, theta, v, a_cmd, delta_cmd  (x=Unity Z, y=Unity X).
@@ -638,8 +651,15 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
     occ_pts (optional): (M, 2) array of static occluder (OCC) cell centres
     (x, y) from the LiDAR costmap, same frame — the buildings/walls.
     occ_boundary (optional): (K, 2) array of occlusion-boundary (blind-spot)
-    points the occlusion-aware MPC actually constrained (x, y), same frame —
-    each seeds an expanding forward-reachable-set keep-out.
+    points the occlusion-aware controller actually constrained (x, y), same
+    frame — each seeds an expanding forward-reachable-set keep-out.
+    occ_horizon_s (optional): planning horizon [s] (N_steps * DT) used to grow
+    the keep-out — pass this to also draw the EXPANDING circle r_keep =
+    D_SAFE_OCC + V_TARGET*t at occ_n_rings times spread across [0, occ_horizon_s].
+    The dense occlusion-boundary cloud is first clustered onto a coarse grid of
+    cell size occ_cluster_m and ONE ring-set is drawn per cluster centroid (capped
+    at occ_max_circles), so the plot reads like the paper's per-obstacle capsule
+    sets instead of a solid band of overlapping circles along the wall.
     """
     import os
     os.makedirs(out_dir, exist_ok=True)
@@ -665,6 +685,34 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
     if occ_boundary is not None and len(occ_boundary):
         ax.scatter(occ_boundary[:, 0], occ_boundary[:, 1], c="tab:purple", s=14,
                    marker="D", alpha=0.5, label="occlusion boundaries", zorder=2)
+        if occ_horizon_s:
+            from matplotlib.patches import Circle
+            # The occlusion-boundary set is a DENSE cloud (hundreds of cells strung
+            # along the wall), so drawing rings on every point — or a raw decimation —
+            # smears into overlapping tubes. Cluster onto a coarse grid (one cell ≈
+            # occ_cluster_m) and draw ONE concentric ring-set per cluster centroid, so
+            # the plot reads like the paper's per-obstacle capsule sets rather than a
+            # solid band. (When the detection is fixed to fire only at the true corner,
+            # this collapses to a single clean ring-set there.)
+            pts = np.asarray(occ_boundary)
+            cell = max(1e-3, occ_cluster_m)
+            keys = np.round(pts / cell).astype(np.int64)
+            uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+            cents = np.array([pts[inv == u].mean(axis=0) for u in range(len(uniq))])
+            if len(cents) > occ_max_circles:
+                sel = np.linspace(0, len(cents) - 1, occ_max_circles).astype(int)
+                cents = cents[sel]
+            pts = cents
+            times = np.linspace(0.0, occ_horizon_s, occ_n_rings)
+            cmap = plt.get_cmap("autumn_r")
+            for ti, t in enumerate(times):
+                r = D_SAFE_OCC + V_TARGET * t
+                color = cmap(0.15 + 0.85 * ti / max(1, occ_n_rings - 1))
+                for px, py in pts:
+                    ax.add_patch(Circle((px, py), r, fill=False, lw=0.6, alpha=0.35,
+                                         edgecolor=color, zorder=1.5))
+                ax.plot([], [], "-", color=color, lw=1.5,
+                        label=f"occ keep-out t={t:.1f}s (r={r:.0f}m)")
     sc = ax.scatter(x, y, c=v, cmap="viridis", s=10, zorder=3)
     ax.plot(x, y, "-", color="0.6", lw=0.8, zorder=2)
     ax.plot(x[0], y[0], "o", color="tab:green", ms=10, label="start", zorder=4)
@@ -702,7 +750,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         value_net_path=None, w_term=W_TERM, pin_episode=None,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
-        occlusion_aware=False, save_traj=None):
+        occlusion_aware=False, save_traj=None,
+        spawn_heading_deg=None, spawn_heading_jitter_deg=0.0):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE
@@ -779,7 +828,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
 
     scenarios     = make_scenarios(n_episodes, min_difficulty=min_difficulty,
                                               max_difficulty=max_difficulty,
-                                              scenario_type=scenario_type)
+                                              scenario_type=scenario_type,
+                                              spawn_heading_deg=spawn_heading_deg,
+                                              spawn_heading_jitter_deg=spawn_heading_jitter_deg)
     # --pin-episode: replay ONE fixed scenario every episode. The pinned episode_seed makes
     # Unity's per-episode RNG (ego path pick, obstacle assignment, timings) fully deterministic,
     # so the ego spawns at the SAME map location each episode — for hand-placing occluders /
@@ -788,7 +839,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         pinned = make_scenarios(1, base_seed=pin_episode,
                                 min_difficulty=min_difficulty,
                                 max_difficulty=max_difficulty,
-                                scenario_type=scenario_type)[0]
+                                scenario_type=scenario_type,
+                                spawn_heading_deg=spawn_heading_deg,
+                                spawn_heading_jitter_deg=spawn_heading_jitter_deg)[0]
         scenarios = [dict(pinned) for _ in range(n_episodes)]
         print(f"[Controller] Pinned episode  : seed={pin_episode} — identical scenario every "
               f"episode (ego path, obstacles, timings all repeat)")
@@ -872,6 +925,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             # orients the visibility ROI wedge — same axes as the mppi rollout frame.
             if LIDAR_COSTMAP is not None:
                 ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
+                # Path-relevance gate: keep only occlusion shadow within a corridor of
+                # the ego→goal route (drops the wall driven alongside / beside the goal).
+                if goal_xy is not None:
+                    LIDAR_COSTMAP.set_goal(goal_xy[0], goal_xy[1])
                 LIDAR_COSTMAP.update(ego_fwd)
                 # Accumulate the persistent-grid perception into the episode-wide union
                 # (deduped by rounded world cell) for the trajectory plot: OCC cells as
@@ -966,7 +1023,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             occ_boundary = np.array(list(occ_track.keys())) if occ_track else None
             _save_trajectory(save_traj, ep, ep_log, goal_xy, np.asarray(traj),
                              np.asarray(obs_track) if obs_track else None,
-                             occ_pts, occ_boundary=occ_boundary)
+                             occ_pts, occ_boundary=occ_boundary,
+                             occ_horizon_s=H_MPPI * DT)
 
         verdict = "COLLISION" if ep_log["collided"] else "safe"
         print(f"[Ep {ep+1:3d}] Δt={ep_log['incursion_dt']:+.2f}s  "
@@ -1103,6 +1161,12 @@ if __name__ == "__main__":
                         "before the nearest occlusion. Requires --lidar-costmap.")
     p.add_argument("--save-traj", default=None, metavar="DIR",
                    help="Save each episode's ego trajectory as CSV + a top-down PNG plot into DIR.")
+    p.add_argument("--spawn-heading-deg", default=None, type=float, metavar="DEG",
+                   help="Fixed ego spawn heading [deg, world yaw] at the start marker. Omit to keep "
+                        "Unity's default spawn behaviour (identity heading).")
+    p.add_argument("--spawn-heading-jitter-deg", default=0.0, type=float, metavar="DEG",
+                   help="+/- random jitter added to --spawn-heading-deg each episode (reproducible, "
+                        "seeded off episode_seed). No effect unless --spawn-heading-deg is set.")
     args = p.parse_args()
 
     if args.d_infl < args.d_safe:
@@ -1131,4 +1195,6 @@ if __name__ == "__main__":
         lidar_topic=args.lidar_topic,
         visibility_cost=args.visibility_cost,
         occlusion_aware=args.occlusion_aware,
-        save_traj=args.save_traj)
+        save_traj=args.save_traj,
+        spawn_heading_deg=args.spawn_heading_deg,
+        spawn_heading_jitter_deg=args.spawn_heading_jitter_deg)
