@@ -39,6 +39,10 @@ from mlagents_envs.side_channel.environment_parameters_channel import (
 import quadprog
 
 from occlusion_capsules import occlusion_stage_cost
+import taxi_cost as tcost
+# MPC-reference weights — single definition in taxi_cost, imported by both controllers.
+from taxi_cost import (W_GOAL_RUN, W_GOAL_TERM, W_HEAD, W_V, W_OBS, W_STATIC_RING,
+                       R_ACT, R_DACT)
 
 # ── Parameters — keep in sync with TaxiAgent.cs inspector fields ─────────────
 DT        = 0.1          # Fixed Timestep in Unity (Project Settings → Time)
@@ -103,8 +107,7 @@ W_LAT, W_HEAD, W_V, W_CTRL = 0.05, 4.0, 1.2, 0.05
 #   R  (R_ACT)  — diagonal effort weight: penalises large commands (energy/effort).
 #   RΔ (R_DACT) — diagonal rate weight: penalises command CHANGE (smoothness, no jerk).
 # Stored as the diagonals of the R / RΔ matrices, per channel [a, delta].
-R_ACT  = np.array([0.05, 0.20])
-R_DACT = np.array([0.10, 0.40])
+# R_ACT / R_DACT now come from taxi_cost (MPC reference) — see the import below.
 # Velocity cost  ℓvel = W_VEL · exp(-C_VEL · d_k²) · ||v_k||²,  d_k = distance to goal, v_k = speed.
 # The exp(-C_VEL·d_k²) envelope is ~0 far from the goal (speed unpenalised while transiting) and
 # →1 as d_k→0, so the ego is driven to bleed off speed and arrive stopped at the goal. C_VEL sets
@@ -118,7 +121,7 @@ W_VEL  = 3.0
 # penalty. On a head-on pass the ego can't keep D_SAFE either way (the oncoming agent comes to it),
 # so an over-weighted W_OBS made "stop and wait" the cheapest option; a stronger progress pull makes
 # driving through win. Trade-off: the ego is slightly less conservative around crossers/convergers.
-W_OBS, W_OFF, W_PROG        = 2.0, 2.0, 1.0
+W_OFF, W_PROG               = 2.0, 1.0   # (W_OBS now imported from taxi_cost)
 # Goal-approach reward (paper's ℓgoal). Per stage k:  ℓgoal = -C_GOAL * max(0, d0 - d_k), with
 # d0 = Euclidean distance to the goal at the rollout start and d_k = ||p_k - p_goal|| the true
 # Euclidean distance to the goal at stage k. A heavier TERMINAL copy at the last stage H-1
@@ -430,39 +433,36 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
 
-        # Keeping only heading cost at the moment, no lane cost used
-        #cost += W_HEAD * th**2
-
-        # ℓgoal = -C_GOAL * max(0, d0 - d_k): reward net closure toward the goal by this stage,
-        # d_k = ||p_k - p_goal|| the true Euclidean distance to the goal at stage k.
-        d_k = np.hypot(goal_fwd - fwd, goal_lat - lat)
-        cost += -C_GOAL * np.maximum(0.0, d0 - d_k)
+        d_k = np.hypot(goal_fwd - fwd, goal_lat - lat)   # used by the occlusion goal-fade
 
         u_k   = na[:, k, :]                                  # (K, 2)
         u_km1 = u_prev[None, :] if k == 0 else na[:, k - 1, :]
-        du    = u_k - u_km1
-        cost += (R_ACT  * u_k**2).sum(axis=1)
-        cost += (R_DACT * du**2 ).sum(axis=1)
 
-        # ℓprogress = -C_PROGRESS · ||p_k - p_{k+1}||: reward the distance travelled between
-        # consecutive positions (p_k = prev step, p_{k+1} = this step) — rewards making ground.
-        cost += -C_PROGRESS * np.hypot(fwd - prev_fwd, lat - prev_lat)
-        prev_fwd, prev_lat = fwd, lat
+        # MPC-REFERENCE stage cost (taxi_cost.stage_cost): bounded linear goal pull,
+        # heading alignment, speed tracking, control effort + rate, dynamic-obstacle and
+        # static keep-outs. This REPLACES MPPI's former closure/progress rewards and the
+        # exp-weighted velocity term: those applied ~400x more goal pressure than the MPC,
+        # so the identical occlusion penalty was far weaker in relative terms and the ego
+        # cut corners the MPC would not. Obstacles are advanced by a constant-velocity ray
+        # to t_k, exactly as the MPC's P_opos + P_ovel*t_k does.
+        _obs_world = [(s0_fwd + rel[0] + ov[0] * ((k + 1) * DT),
+                       s0_lat + rel[1] + ov[1] * ((k + 1) * DT))
+                      for rel, ov in obstacles]
+        _d_static = None
+        if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            _d_static = LIDAR_COSTMAP.distance(fwd - s0_fwd, lat - s0_lat)
+        cost += tcost.stage_cost(
+            fwd, lat, th, vv, u_k, u_km1,
+            goal_xy=(goal_fwd, goal_lat), v_des=v_des_eff, t_k=(k + 1) * DT,
+            obstacles=_obs_world, d_infl=D_INFL, d_safe=D_SAFE, w_obs=W_OBS,
+            rho=RHO_STATIC, rho2=RHO_STATIC2, r_act=R_ACT, r_dact=R_DACT,
+            w_goal_run=W_GOAL_RUN, w_head=W_HEAD, w_v=W_V,
+            d_static=_d_static, d_infl_static=D_INFL_STATIC,
+            d_safe_static=D_SAFE_STATIC, w_static_ring=W_STATIC_RING)
 
-        # ℓvel = W_VEL · exp(-C_VEL · d_k²) · ||v_k||².  d_k already computed above; v_k = speed vv.
-        cost += np.exp(-C_VEL * d_k**2) * vv**2
-
-        # ── Occlusion-aware safety (mirrors the MPC): FRS keep-out + RSS sightline cap ──
-        # d_occ = distance to the nearest discrete occlusion BOUNDARY point at this rollout pose
-        # (the same P_occ set the MPC constrains). A worst-case hidden agent could be anywhere
-        # within V_TARGET·t_k of that point by t_k, so an EXPANDING keep-out circle
-        # r_keep = D_SAFE_OCC + V_TARGET·t_k (soft ring at
-        # D_INFL_OCC) pushes the ego wide, and the sightline cap v_safe = sqrt(2·A_BRAKE_SIGHT·d_occ)
-        # slows it so it can stop before the corner. Both use the shared constants (== the MPC).
+        # ── Occlusion-aware safety: FRS keep-out + RSS sightline cap ──────────
+        # Canonical formula shared with the MPC (occlusion_capsules.occlusion_stage_cost).
         if occ_x is not None:
-            # Canonical occlusion stage cost — the SAME formula the MPC evaluates
-            # symbolically (occlusion_capsules.occlusion_stage_cost), so the two
-            # controllers cannot drift apart. d_k = distance to goal, computed above.
             cost += occlusion_stage_cost(
                 _dist_to_occ(fwd, lat), vv, (k + 1) * DT, d_k,
                 v_target=V_TARGET, d_safe_occ=D_SAFE_OCC, d_infl_occ=D_INFL_OCC,
@@ -470,19 +470,6 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
                 w_sight=W_SIGHT, a_brake_sight=A_BRAKE_SIGHT,
                 v_sight_floor=V_SIGHT_FLOOR, goal_occ_clear=GOAL_OCC_CLEAR,
                 occ_horizon=OCC_HORIZON)
-
-        if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            d_static = LIDAR_COSTMAP.distance(fwd, lat)
-            # Soft influence ring: smooth deflection BEFORE the keep-out. Graded, so
-            # even when every rollout sits inside D_INFL (rounding a concave corner)
-            # the samples closer to the wall cost more and the sampler prefers the
-            # ones farther out — the steering signal the old flat `BIG` washed out.
-            cost += W_STATIC * np.maximum(0.0, D_INFL_STATIC - d_static)**2
-            # Steep exact-penalty keep-out inside D_SAFE (linear + quadratic on the
-            # squared-distance violation): unbounded as d→0, so no rollout buys its
-            # way through the surface. Mirrors the MPC's static keep-out.
-            viol = np.maximum(0.0, D_SAFE_STATIC**2 - d_static**2)
-            cost += RHO_STATIC * viol + RHO_STATIC2 * viol**2
 
         if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
@@ -518,8 +505,9 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     # goal reward evaluated at the FINAL rollout state, so a rollout that ENDS closer to the goal
     # wins even if it detoured en route (lets the planner go around obstacles instead of stopping
     # short). st is the final rollout state here.
-    d_H1 = np.hypot(goal_fwd - st[:, 0], goal_lat - st[:, 1])
-    cost += -C_GOAL_TERM * np.maximum(0.0, d0 - d_H1)
+    # MPC-reference terminal cost: bounded (linear) pull on the FINAL state.
+    cost += tcost.terminal_cost(st[:, 0], st[:, 1],
+                                goal_xy=(goal_fwd, goal_lat), w_goal_term=W_GOAL_TERM)
 
     # Leave -cost.min() to avoid underflow, softmax to compute the weights
     w   = np.exp(-(cost - cost.min()) / LAMBDA)

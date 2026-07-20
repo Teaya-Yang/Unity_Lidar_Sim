@@ -88,14 +88,10 @@ GOAL_STOP_DIST = 5.0    # [m] remaining distance within which the speed target r
 # ‖p − p_goal‖², whose gradient blows up far from the goal and dwarfs the obstacle
 # terms) — so that near an obstacle the keep-out reliably wins and the ego brakes
 # or steers rather than buying its way through.
-W_GOAL_RUN  = 0.05    # gentle running pull toward the goal (LINEAR in distance)
-W_GOAL_TERM = 2.0     # terminal pull on the FINAL state (LINEAR in distance)
-W_HEAD      = 6.0     # heading alignment toward the goal bearing  (1 − cos(θ − ψ)); raised to
-                      # commit to the goal bearing and damp the lateral S-oscillation
-W_V         = 2.0     # speed tracking toward the (goal-tapered) desired speed
-R_ACT       = np.array([0.05, 0.20])   # control effort  ‖u‖²_R
-R_DACT      = np.array([0.10, 0.7])   # control rate  ‖Δu‖²_RΔ; steering-rate weight raised
-                                       # (0.40→1.0) to smooth steering reversals (anti-oscillation)
+# Stage weights come from taxi_cost, the single definition shared with MPPI. They live
+# there (not here) only because taxi_controller_mpc imports taxi_controller, so making the
+# MPC the import source would create a cycle — the VALUES remain the MPC's reference ones.
+from taxi_cost import (W_GOAL_RUN, W_GOAL_TERM, W_HEAD, W_V, R_ACT, R_DACT)
 
 # Obstacle avoidance. Predicted with a constant-velocity ray (same as MPPI's
 # deterministic branch). The keep-out is a HARD constraint  d ≥ D_SAFE, softened
@@ -103,9 +99,7 @@ R_DACT      = np.array([0.10, 0.7])   # control rate  ‖Δu‖²_RΔ; steering-
 # hit with a well-scaled exact (linear + quadratic) penalty that dominates the
 # bounded goal pull, so no rollout buys its way through the keep-out. A soft
 # influence ring gives smooth early deflection before the hard radius is reached.
-W_OBS      = 8.0      # soft influence ring:  W_OBS · max(0, D_INFL − d)²
-RHO_SLACK  = 10.0     # linear exact-penalty weight on a keep-out violation [per m²]
-RHO_SLACK2 = 5.0      # quadratic penalty on the violation (curves the exact penalty)
+from taxi_cost import W_OBS, RHO_SLACK, RHO_SLACK2
 
 # Static-obstacle (LiDAR costmap) avoidance. Enabled with --lidar-costmap. Each
 # control step the K_STATIC nearest occupied (OCC) cell centres to the ego are fed
@@ -113,7 +107,7 @@ RHO_SLACK2 = 5.0      # quadratic penalty on the violation (curves the exact pen
 # above with the static radii D_SAFE_STATIC / D_INFL_STATIC (imported from the MPPI
 # controller). K_STATIC trades coverage of nearby walls against solve time.
 K_STATIC       = 12       # number of nearest static OCC points constrained per step
-W_STATIC_RING  = 15.0      # soft influence ring weight for static surfaces
+from taxi_cost import W_STATIC_RING
 STATIC_QUERY_R = 35.0     # only consider OCC cells within this radius of the ego [m]
 
 # Dead-ahead symmetry breaking (warm-start only — constraints are untouched, so
