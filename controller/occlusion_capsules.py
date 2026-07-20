@@ -71,12 +71,14 @@ def segments_from_ordered_cloud(
     min_jump: float = 2.0,
     sigma: float = 0.0,
     wraps: bool = True,
-    merge_radius: float = 1.5,
+    merge_radius: float = 5,
     max_seg_len: float = 30.0,
     elev_row: Optional[int] = None,
     ego_fwd: Optional[Tuple[float, float]] = None,
-    fwd_half_angle_deg: float = 100.0,
+    fwd_half_angle_deg: float = 180.0,
     min_corner_range: float = 1.0,
+    trend_window: int = 4,
+    min_far_run: int = 10,
 ) -> Optional[np.ndarray]:
     """Occlusion boundary segments in WORLD (a0, a1) coordinates.
 
@@ -93,6 +95,19 @@ def segments_from_ordered_cloud(
               or the ground under the sensor jump hugely at ~0 m, and the resulting corner
               sits ON the sensor where its bearing is meaningless — so it passes the
               forward wedge at ANY half-angle. Mirrors LidarCostmap's min_range.
+    min_far_run: consecutive beams that must STAY on the far side for a jump to count as
+              a corner. A fragmented wall (dropouts, or returns that slip between OCC
+              fragments) produces isolated beams that fly past and then the surface
+              resumes immediately — a real corner instead has the far range PERSIST.
+              This is what removes the column of spurious corners along a wall face.
+              0 or 1 disables the check.
+    trend_window: beams used to estimate the LOCAL RANGE TREND before each candidate.
+              A surface seen at grazing incidence produces a large but *steady* range step
+              per beam, indistinguishable from a corner by |Δr| alone — which is why a wall
+              viewed nearly edge-on lights up along its whole length. Comparing each step
+              against the trend extrapolated from the preceding beams removes that: a flat
+              wall (any incidence) has ~zero residual, a true depth break has a large one.
+              0 disables, falling back to the raw |Δr| test.
     fwd_half_angle_deg: half-width of that wedge. 180 is equivalent to no filter; 90
               keeps everything strictly ahead; the 100 default keeps a little past
               abeam so a corner is not dropped the instant it draws level.
@@ -133,8 +148,33 @@ def segments_from_ordered_cloud(
     # the test valid at distance, where the same physical gap subtends fewer beams.
     thresh = np.maximum(near * math.radians(res_h) / math.tan(math.radians(grazing_deg))
                         + 3.0 * sigma, min_jump)
+
+    if trend_window and trend_window >= 2:
+        # Predict each beam's range by extrapolating the mean per-beam slope of the
+        # preceding trend_window beams; the residual is what a grazing surface cannot
+        # explain. Wrap-around indexing keeps the 360-degree seam continuous.
+        prev = np.stack([rng[(cur - k) % n_h] for k in range(trend_window + 1)])
+        slope = np.mean(np.diff(prev[::-1], axis=0), axis=0)      # per-beam range change
+        predicted = rng[cur] + slope
+        residual = np.abs(rng[nxt] - predicted)
+        # A real break must exceed the trend AND still be a large absolute step.
+        detect = (residual > thresh) & (delta > thresh)
+    else:
+        detect = delta > thresh
+
+    if min_far_run and min_far_run > 1:
+        # Past a genuine corner the escaping beams keep flying; past a dropout the surface
+        # comes straight back. Require the far side to hold for min_far_run beams.
+        far_side = np.maximum(rA, rB)
+        persist = np.ones(len(cur), dtype=bool)
+        for m in range(1, min_far_run):
+            # Beams beyond the jump, on whichever side is the far one.
+            ahead = np.where(rB >= rA, rng[(nxt + m) % n_h], rng[(cur - m) % n_h])
+            persist &= ahead > (near + 0.5 * (far_side - near))
+        detect = detect & persist
+
     # Drop degenerate near-sensor corners before the wedge test, for the reason above.
-    hit = np.where((delta > thresh) & (near > min_corner_range))[0]
+    hit = np.where(detect & (near > min_corner_range))[0]
     if len(hit) == 0:
         return None
 
@@ -271,3 +311,142 @@ def point_segment_distance_np(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> np
     t = np.clip(((p - a) @ v) / L2, 0.0, 1.0)
     proj = a + t[:, None] * v
     return np.linalg.norm(p - proj, axis=1)
+
+
+class OcclusionCornerTracker:
+    """Gives detected occlusion corners TEMPORAL IDENTITY across scans.
+
+    segments_from_ordered_cloud() re-derives corners from scratch every scan, so the
+    SAME physical corner lands on a slightly different beam each time and comes back
+    displaced by up to the beam spacing (~r·Δθ, e.g. 0.5 m at 30 m with 1° resolution).
+    Downstream that looks like a stream of brand-new boundaries: the plot accumulates a
+    smear of near-duplicate keep-outs, and the MPC's constraint centre jitters every
+    step, which shows up as steering chatter.
+
+    This associates each detection to the nearest live track within assoc_radius and
+    smooths it (exponential moving average) instead of creating a new one. A track that
+    goes unseen for ttl seconds is dropped, so corners genuinely left behind do expire.
+
+    Deliberately a nearest-neighbour tracker, not a Kalman filter: occlusion corners are
+    static world features (it is the EGO that moves), so there is no motion model worth
+    estimating — only measurement noise worth averaging down.
+    """
+
+    def __init__(self, assoc_radius: float = 3.0, alpha: float = 0.35,
+                 ttl: float = 0.6, min_hits: int = 2):
+        self.assoc_radius = float(assoc_radius)
+        self.alpha = float(alpha)          # EMA weight on the NEW measurement
+        self.ttl = float(ttl)
+        self.min_hits = int(min_hits)      # suppress one-off flickers
+        self._tracks = []                  # list of dicts: id, pos, far, last_seen, hits
+        self._next_id = 0                  # stable identity, so consumers can key on it
+
+    def reset(self) -> None:
+        self._tracks = []
+        self._next_id = 0
+
+    def update(self, segs: Optional[np.ndarray], now: float) -> Optional[np.ndarray]:
+        """Fold this scan's segments into the tracks; return the STABLE segments.
+
+        segs: (M,2,2) as produced by segments_from_ordered_cloud, or None.
+        Returns (K,2,2) smoothed segments for confirmed tracks, or None if none.
+        Pair with ids() to key downstream state on a STABLE identity rather than on
+        coordinates, which keep drifting slightly as the EMA settles.
+        """
+        if segs is not None and len(segs):
+            segs = np.asarray(segs, float).reshape(-1, 2, 2)
+            claimed = set()
+            for seg in segs:
+                corner, far = seg[0], seg[1]
+                # Nearest unclaimed track within the association gate.
+                best, best_d = None, self.assoc_radius
+                for ti, tr in enumerate(self._tracks):
+                    if ti in claimed:
+                        continue
+                    d = float(np.hypot(*(tr["pos"] - corner)))
+                    if d < best_d:
+                        best, best_d = ti, d
+                if best is None:
+                    self._tracks.append({"id": self._next_id,
+                                         "pos": corner.copy(), "far": far.copy(),
+                                         "last_seen": now, "hits": 1})
+                    self._next_id += 1
+                    claimed.add(len(self._tracks) - 1)
+                else:
+                    tr = self._tracks[best]
+                    a = self.alpha
+                    tr["pos"] = (1.0 - a) * tr["pos"] + a * corner
+                    tr["far"] = (1.0 - a) * tr["far"] + a * far
+                    tr["last_seen"] = now
+                    tr["hits"] += 1
+                    claimed.add(best)
+
+        # Expire tracks not re-observed recently.
+        self._tracks = [t for t in self._tracks if (now - t["last_seen"]) <= self.ttl]
+
+        out = [np.stack([t["pos"], t["far"]]) for t in self._tracks
+               if t["hits"] >= self.min_hits]
+        return np.array(out) if out else None
+
+    def ids(self):
+        """Track ids aligned with the rows returned by the last update()."""
+        return [t["id"] for t in self._tracks if t["hits"] >= self.min_hits]
+
+    @property
+    def n_tracks(self) -> int:
+        return len(self._tracks)
+
+
+# ── Canonical occlusion stage cost ────────────────────────────────────────────
+# ONE definition of the occlusion-aware stage cost, so the MPPI and MPC controllers
+# cannot drift apart. MPPI calls occlusion_stage_cost() directly on its rollout arrays;
+# the MPC re-expresses the SAME formula in CasADi symbolics (it needs differentiable
+# fmax/sqrt for IPOPT), and test parity is asserted by evaluating both on equal inputs.
+#
+#   r_grow = v_target · min(t_k, occ_horizon)
+#   r_infl = d_infl_occ + r_grow            soft influence ring (early deflection)
+#   r_keep = d_safe_occ + r_grow            hard keep-out (exact penalty)
+#   fade   = clip(d_goal / goal_occ_clear, 0, 1)
+#
+#   cost = fade · w_occ · max(0, r_infl − d)²
+#        + fade · (rho · viol + rho2 · viol²),      viol = max(0, r_keep² − d²)
+#        + w_sight · max(0, v − v_safe)²,           v_safe = max(√(2·a_brake·d), v_floor)
+#
+# fade exists because the goal is known-safe: without it the expanding circle can cover
+# the ego's own destination and repel it (the orbit failure mode). The sightline term is
+# NOT faded — slowing down never pushes the ego away from its goal.
+# The horizon cap keeps both controllers' keep-out the same size even though their
+# PLANNING horizons differ (MPPI 6 s, MPC 3 s); without it MPPI is far more conservative.
+
+def occlusion_stage_cost(d, v, t_k, d_goal, *, v_target, d_safe_occ, d_infl_occ,
+                         w_occ, rho, rho2, w_sight, a_brake_sight, v_sight_floor,
+                         goal_occ_clear, occ_horizon,
+                         fmax=None, sqrt=None, clip=None):
+    """Occlusion stage cost. Backend-agnostic: pass numpy or CasADi primitives.
+
+    d      : distance from the (rollout/predicted) pose to the nearest occlusion boundary
+    v      : speed at this stage
+    t_k    : horizon time of this stage [s]
+    d_goal : distance from this pose to the goal (drives the fade)
+    Returns the scalar/array stage cost contribution.
+    """
+    import numpy as _np
+    fmax = _np.maximum if fmax is None else fmax
+    sqrt = _np.sqrt if sqrt is None else sqrt
+
+    r_grow = v_target * min(t_k, occ_horizon)      # t_k is a PYTHON float in both callers
+    r_infl = d_infl_occ + r_grow
+    r_keep = d_safe_occ + r_grow
+
+    if clip is None:
+        fade = _np.clip(d_goal / goal_occ_clear, 0.0, 1.0)
+    else:
+        fade = clip(d_goal / goal_occ_clear)
+
+    cost = fade * w_occ * fmax(0.0, r_infl - d) ** 2
+    viol = fmax(0.0, r_keep * r_keep - d * d)
+    cost = cost + fade * (rho * viol + rho2 * viol * viol)
+
+    v_safe = fmax(sqrt(2.0 * a_brake_sight * d + 1e-6), v_sight_floor)
+    cost = cost + w_sight * fmax(0.0, v - v_safe) ** 2
+    return cost

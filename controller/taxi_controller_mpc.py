@@ -61,12 +61,13 @@ from taxi_controller import (
     D_SAFE, D_INFL, K_OBS, OBS_SIZE, DUD_DIST,
     D_SAFE_STATIC, D_INFL_STATIC,
     V_TARGET, D_SAFE_OCC, D_INFL_OCC, W_OCC,
-    W_SIGHT, A_BRAKE_SIGHT, V_SIGHT_FLOOR,
+    W_SIGHT, A_BRAKE_SIGHT, V_SIGHT_FLOOR, GOAL_OCC_CLEAR, OCC_HORIZON,
     SCENARIO_STANDARD, SCENARIO_NAMES,
     obs_to_state, inject_sensor_noise, make_scenarios,
     identify_bicycle_model, _save_trajectory,
 )
-from occlusion_capsules import point_segment_distance_sym, point_segment_distance_np
+from occlusion_capsules import (point_segment_distance_sym, point_segment_distance_np,
+                                OcclusionCornerTracker)
 
 # ── MPC-specific tuning ───────────────────────────────────────────────────────
 # Horizon: MPPI uses H=60 (6 s) because sampling is cheap. IPOPT solves a real NLP
@@ -166,18 +167,34 @@ OCC_FWD_HALF_ANGLE = 90.0   # [deg]
 # this only changes the geometry fed in, never the solver.
 OCC_USE_CAPSULES = False
 
-# Algorithm 1 (single-circle) mode. True ⇒ each detected boundary gets exactly ONE
-# keep-out circle of radius D_SAFE_OCC + d_target, regenerated from scratch at every
-# LiDAR scan — no nested set growing along the horizon.
+# Per-step circle enlargement (the paper's Algorithm 1 + Fig. 6). The circle seeded at
+# each occlusion boundary is enlarged by d_target = V_TARGET · DT — the furthest an
+# invisible agent can travel in ONE timestep — at every step of the prediction horizon.
+# Stage k is therefore constrained against ITS OWN radius
 #
-# d_target = V_TARGET · OCC_D_TARGET_HORIZON. Because a SINGLE circle must stay valid
-# for the whole prediction window, the horizon used is the full N·DT: a hidden agent
-# moving at V_TARGET can cover that much ground by the end of the horizon, so a smaller
-# radius would be weaker than the nested formulation at its late stages. (The paper's
-# literal d_target = v_target/Δt is dimensionally acceleration — 30 m per step here —
-# so distance = speed · time is used instead.)
-OCC_SINGLE_CIRCLE     = True
-OCC_D_TARGET_HORIZON  = N_MPC * DT     # [s] → d_target = 3.0 · 3.0 s = 9.0 m
+#     r_k = D_SAFE_OCC + V_TARGET · t_k ,   t_k = (k+1)·DT
+#
+# so the ego is checked against the reachable set as it stands at that future instant,
+# NOT against the horizon-end maximum. Over N_MPC steps this grows 16.0 → 25.0 m.
+#
+# True here would instead apply one fixed radius at every stage — more conservative
+# early in the horizon and not what the paper describes. Kept only as an A/B switch.
+OCC_SINGLE_CIRCLE     = False
+OCC_D_TARGET_HORIZON  = N_MPC * DT     # [s] only used when OCC_SINGLE_CIRCLE is True
+
+# Per-step enlargement increment, for reference/printing: 3.0 m/s · 0.1 s = 0.3 m.
+D_TARGET_PER_STEP     = V_TARGET * DT
+
+# Corner tracking. Detection re-derives corners from scratch each scan, so the same
+# physical corner returns displaced by up to the beam spacing. Without association that
+# jitters the constraint centre every step (steering chatter) and smears the plot with
+# near-duplicate keep-outs. Associate within OCC_TRACK_ASSOC and smooth; expire after
+# OCC_TRACK_TTL unseen. OCC_TRACK_ASSOC must exceed the beam-quantisation displacement
+# (~r·Δθ ≈ 0.5 m at 30 m / 1°) but stay under the spacing of genuinely distinct corners.
+OCC_TRACK_ASSOC = 3.0    # [m] association gate
+OCC_TRACK_ALPHA = 0.35   # EMA weight on each new measurement
+OCC_TRACK_TTL   = 0.6    # [s] drop a track unseen this long
+OCC_TRACK_HITS  = 2      # confirmations before a track is used (kills one-off flickers)
 
 K_OCC       = 10        # nearest occlusion-boundary points constrained per step (0 ⇒ off)
 OCC_QUERY_R = 60.0     # only consider occlusion boundaries within this radius of the ego [m]
@@ -321,8 +338,11 @@ class TaxiMPC:
             # Single-circle mode (Algorithm 1): ONE circle of radius d_target per detected
             # boundary, rebuilt from scratch at every LiDAR scan, rather than a nested set
             # growing along the horizon. The radius is therefore stage-INDEPENDENT.
+            # Canonical formula (occlusion_capsules.occlusion_stage_cost), expressed in
+            # CasADi so IPOPT gets differentiable fmax/sqrt. The horizon cap is what keeps
+            # this the same SIZE as MPPI's keep-out despite the shorter planning horizon.
             r_grow = (self.occ_d_target if self.occ_d_target is not None
-                      else self.v_target * t_k)
+                      else self.v_target * min(t_k, OCC_HORIZON))
             d_vis  = ca.MX(1e6)          # distance to the NEAREST occlusion boundary this stage
             for i in range(self.k_occ):
                 oc = P_occ[i]
@@ -335,11 +355,13 @@ class TaxiMPC:
                 d_vis = ca.fmin(d_vis, dc)
                 r_infl_occ = self.d_infl_occ + r_grow
                 r_keep_occ = self.d_safe_occ + r_grow
-                # Soft influence ring (smooth early deflection around the corner).
-                cost += W_OCC * ca.fmax(0.0, r_infl_occ - dc) ** 2
-                # Expanding keep-out d ≥ r_keep_occ as a smooth exact penalty.
+                # Goal is known-safe: fade the repelling terms out near it, matching MPPI,
+                # so the expanding circle can't cover the ego's own destination. (The
+                # hard pre-filter in _pack_params remains as a coarser first line.)
+                goal_fade = ca.fmin(1.0, ca.fmax(0.0, d_goal / GOAL_OCC_CLEAR))
+                cost += goal_fade * W_OCC * ca.fmax(0.0, r_infl_occ - dc) ** 2
                 violc = ca.fmax(0.0, r_keep_occ * r_keep_occ - d2c)
-                cost += RHO_SLACK * violc + RHO_SLACK2 * violc * violc
+                cost += goal_fade * (RHO_SLACK * violc + RHO_SLACK2 * violc * violc)
 
             # Sightline (RSS) speed cap: slow so the ego can brake to a stop before the
             # nearest occlusion boundary. Widening the arc alone would let it round a
@@ -825,8 +847,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
         # Occlusion-boundary points actually constrained by the MPC, deduped by rounded
         # world cell (a mouth that sweeps as the ego moves would otherwise paint a whole
         # line across many steps even when each step is corner-only).
-        occ_track = {}
-        seg_track = {}   # deduped occlusion boundary SEGMENTS seen this episode (for the plot)
+        seg_track = {}   # occlusion boundary SEGMENTS seen this episode, keyed on TRACK ID
+        corner_tracker = OcclusionCornerTracker(
+            assoc_radius=OCC_TRACK_ASSOC, alpha=OCC_TRACK_ALPHA,
+            ttl=OCC_TRACK_TTL, min_hits=OCC_TRACK_HITS)
         # Union of every OCC cell seen across the episode. The costmap is a rolling,
         # DECAYING, ego-centered grid (occ_ttl≈12s), so a single end-of-run snapshot
         # only shows walls still in view at the goal — walls the ego passed earlier
@@ -906,6 +930,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                         occ_segs = costmap.occlusion_segments(
                             ego_fwd=ego_fwd,
                             fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
+                        # Associate + smooth against previous scans so the same physical
+                        # corner keeps one stable centre instead of a fresh jittered one.
+                        occ_segs = corner_tracker.update(occ_segs, time.monotonic())
                         if occ_segs is not None and not OCC_USE_CAPSULES:
                             # Collapse each boundary line onto its CORNER, so the keep-out
                             # is an expanding CIRCLE about that point. Done here, at the
@@ -971,24 +998,25 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
             traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd))
             for rel, _ov in obstacles:
                 obs_track.append((ep_steps * DT, s[0] + rel[0], s[1] + rel[1]))
-            # Record the occlusion-boundary points the MPC actually constrained this
-            # step (the k_occ nearest within OCC_QUERY_R) so the plot shows what is
-            # pushing the ego. _nearest_points pads unused slots to 1e6 — drop those.
-            # Same for the boundary SEGMENTS actually constrained, keyed on rounded
-            # endpoints so a corner re-detected every scan doesn't stack duplicates.
+            # Record the boundary SEGMENTS the MPC actually constrained this step (the
+            # k_occ nearest within OCC_QUERY_R) so the plot shows what is pushing the ego,
+            # keyed on rounded endpoints so a corner re-detected every scan doesn't stack
+            # duplicates. _nearest_segments pads unused slots to 1e6 — drop those.
             if k_occ and occ_segs is not None and len(occ_segs):
-                near_seg = mpc._nearest_segments(s_mpc, occ_segs, k_occ, OCC_QUERY_R)
-                for row in near_seg:
-                    if row[0] < 1e5:
-                        seg_track[(round(float(row[0]), 1), round(float(row[1]), 1),
-                                   round(float(row[2]), 1), round(float(row[3]), 1))] = None
-
-            if k_occ and occ_pts is not None and len(occ_pts):
-                near_occ = mpc._nearest_points(s_mpc, occ_pts, k_occ, OCC_QUERY_R)
-                for row in near_occ:
-                    if row[0] < 1e5:
-                        occ_track[(round(float(row[0]), 1),
-                                   round(float(row[1]), 1))] = None
+                # Record every tracked boundary within query range, keyed on TRACK ID so a
+                # corner re-seen across scans occupies ONE entry instead of a smear of
+                # near-duplicates. Value keeps the ego pose + episode time of the FIRST
+                # sighting, tying each keep-out to where on the path it began applying.
+                tids = corner_tracker.ids()
+                ego_xy = np.array([s_mpc[0], s_mpc[1]])
+                for ti, seg_i in enumerate(occ_segs):
+                    if ti >= len(tids):
+                        break
+                    d = point_segment_distance_np(ego_xy[None, :], seg_i[0], seg_i[1])[0]
+                    if d <= OCC_QUERY_R:
+                        seg_track.setdefault(tids[ti],
+                                             (seg_i[0][0], seg_i[0][1], seg_i[1][0],
+                                              seg_i[1][1], s[0], s[1], ep_steps * DT))
 
             action = ActionTuple(
                 continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32))
@@ -1009,15 +1037,19 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
             # (not the decaying end-of-run snapshot) so the plot shows every wall the
             # ego actually reacted to, including ones it has since driven past.
             occ_pts = np.array(list(occ_seen.keys())) if occ_seen else None
-            occ_boundary = (np.array(list(occ_track.keys())) if occ_track else None)
-            occ_segments = (np.array(list(seg_track.keys())).reshape(-1, 2, 2)
-                            if seg_track else None)
+            if seg_track:
+                _vals = np.array(list(seg_track.values()), dtype=float)
+                occ_segments = _vals[:, :4].reshape(-1, 2, 2)
+                occ_ego = _vals[:, 4:]
+            else:
+                occ_segments = occ_ego = None
             _save_trajectory(save_traj, ep, ep_log, goal_xy, np.asarray(traj),
                              np.asarray(obs_track) if obs_track else None, occ_pts,
-                             occ_boundary=occ_boundary,
-                             occ_segments=occ_segments,
+                             occ_segments=occ_segments, occ_ego=occ_ego,
+                             # OCC_HORIZON (shared with MPPI), not the planning horizon,
+                             # so the drawn radius always equals the enforced one.
                              capsule_horizon=(OCC_D_TARGET_HORIZON if OCC_SINGLE_CIRCLE
-                                              else horizon * DT),
+                                              else OCC_HORIZON),
                              single_radius=OCC_SINGLE_CIRCLE)
 
         verdict   = "COLLISION" if ep_log["collided"] else "safe"
