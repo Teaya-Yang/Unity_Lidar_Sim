@@ -130,18 +130,21 @@ C_PROGRESS                  = 10.0
 
 # ── Occlusion-aware safety: forward-reachable-set keep-out + RSS sightline speed cap ──
 # SHARED with taxi_controller_mpc.py (the MPC imports these), so both controllers use the SAME
-# occlusion model and constants. A worst-case hidden agent sits on the FREE↔UNKNOWN frontier (a
-# blind corner; LidarCostmap.distance_to_unknown gives the distance to it) and could be anywhere
-# within V_TARGET·t_k of it after t_k = (k+1)·DT. Two coupled terms, gated on --occlusion-aware:
+# occlusion model and constants. A worst-case hidden agent sits on a discrete blind-corner
+# boundary point (LidarCostmap.occlusion_points, the visible occlusion MOUTHS — same set the MPC
+# constrains, filtered to within OCC_QUERY_R of the ego), NOT the whole FREE↔UNKNOWN frontier, and
+# could be anywhere within V_TARGET·t_k of it after t_k = (k+1)·DT. Two coupled terms, gated on
+# --occlusion-aware:
 #   * expanding keep-out circle:  r_keep = D_SAFE_OCC + V_TARGET·t_k  (soft ring at D_INFL_OCC,
 #     steep exact penalty inside r_keep) — the ego swings wide around the blind corner;
 #   * RSS sightline speed cap:     v_safe = sqrt(2·A_BRAKE_SIGHT·d_vis), floored at V_SIGHT_FLOOR —
 #     the ego slows so it can always stop before the nearest occlusion.
 # Keep V_TARGET realistic — too high and the bubble swallows the horizon and the ego freezes.
-V_TARGET       = 5.0    # assumed max speed of a hidden agent emerging from occlusion [m/s]
+V_TARGET       = 3.0    # assumed max speed of a hidden agent emerging from occlusion [m/s]
 D_SAFE_OCC     = 16.0   # base (t=0) hard keep-out radius around an occlusion boundary [m]
 D_INFL_OCC     = 24.0   # base (t=0) soft-influence radius (early deflection). Must stay >= D_SAFE_OCC.
 W_OCC          = 20.0   # soft-influence ring penalty weight for occlusion boundaries
+OCC_QUERY_R    = 60.0   # only track occlusion boundaries within this radius of the ego (plot only) [m]
 W_SIGHT        = 15.0    # sightline over-speed² penalty weight
 A_BRAKE_SIGHT  = 0.4    # assumed braking decel for the RSS stopping distance [m/s²] (gentle ⇒ slows early)
 V_SIGHT_FLOOR  = 2.5    # never cap the sightline speed below this [m/s]
@@ -353,12 +356,32 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
 
     s0_theta = float(s0[2])              # initial heading — the straight-line lock reference
 
-    # ── TEMP sightline diagnostic: is the cap even active at the ego's current pose? ──
+    # Occlusion set for this solve: the DISCRETE blind-corner boundary points (like the MPC's
+    # P_occ), NOT the continuous FREE↔UNKNOWN frontier field. distance_to_unknown() measures the
+    # distance to the whole wall's shadow, so the entire wall repelled the ego; occlusion_points()
+    # returns only the visible blind-corner MOUTHS. Filter to within OCC_QUERY_R of the ego (== the
+    # MPC) and hold them fixed over the horizon; d_occ per rollout pose = distance to the nearest.
+    occ_x = occ_y = None
     if OCCLUSION_AWARE and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-        _dv = float(LIDAR_COSTMAP.distance_to_unknown(
-            np.array([s0_fwd]), np.array([s0_lat]))[0])
+        _op = LIDAR_COSTMAP.occlusion_points()
+        if _op is not None and len(_op):
+            _d = np.hypot(_op[:, 0] - s0_fwd, _op[:, 1] - s0_lat)
+            _near = _op[_d < OCC_QUERY_R]
+            if len(_near):
+                occ_x, occ_y = _near[:, 0], _near[:, 1]
+
+    def _dist_to_occ(px, py):
+        """(K,) distance from each rollout pose to the nearest occlusion boundary point [m]."""
+        dx = px[:, None] - occ_x[None, :]
+        dy = py[:, None] - occ_y[None, :]
+        return np.sqrt(np.min(dx * dx + dy * dy, axis=1))
+
+    # ── TEMP sightline diagnostic: is the cap even active at the ego's current pose? ──
+    if occ_x is not None:
+        _dv = float(_dist_to_occ(np.array([s0_fwd]), np.array([s0_lat]))[0])
         _vs = max((2.0 * A_BRAKE_SIGHT * _dv) ** 0.5, V_SIGHT_FLOOR)
-        print(f"[sightline] ready d_vis(ego)={_dv:8.2f}  v_safe={_vs:5.2f}  v={s0[3]:5.2f}")
+        print(f"[sightline] ready d_vis(ego)={_dv:8.2f}  v_safe={_vs:5.2f}  "
+              f"v={s0[3]:5.2f}  nOcc={0 if occ_x is None else len(occ_x)}")
     else:
         print(f"[sightline] INACTIVE  ready="
               f"{None if LIDAR_COSTMAP is None else LIDAR_COSTMAP.ready}")
@@ -390,13 +413,14 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         cost += np.exp(-C_VEL * d_k**2) * vv**2
 
         # ── Occlusion-aware safety (mirrors the MPC): FRS keep-out + RSS sightline cap ──
-        # d_occ = distance to the nearest occlusion frontier (FREE↔UNKNOWN edge) at this rollout
-        # pose. A worst-case hidden agent could be anywhere within V_TARGET·t_k of that edge by
-        # t_k, so an EXPANDING keep-out circle r_keep = D_SAFE_OCC + V_TARGET·t_k (soft ring at
+        # d_occ = distance to the nearest discrete occlusion BOUNDARY point at this rollout pose
+        # (the same P_occ set the MPC constrains). A worst-case hidden agent could be anywhere
+        # within V_TARGET·t_k of that point by t_k, so an EXPANDING keep-out circle
+        # r_keep = D_SAFE_OCC + V_TARGET·t_k (soft ring at
         # D_INFL_OCC) pushes the ego wide, and the sightline cap v_safe = sqrt(2·A_BRAKE_SIGHT·d_occ)
         # slows it so it can stop before the corner. Both use the shared constants (== the MPC).
-        if OCCLUSION_AWARE and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            d_occ  = LIDAR_COSTMAP.distance_to_unknown(fwd, lat)   # (K,) dist to nearest occlusion [m]
+        if occ_x is not None:
+            d_occ  = _dist_to_occ(fwd, lat)   # (K,) dist to nearest occlusion BOUNDARY point [m]
             t_k    = (k + 1) * DT
             r_grow = V_TARGET * t_k
             r_infl = D_INFL_OCC + r_grow
@@ -629,7 +653,8 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 # ── Main control loop ─────────────────────────────────────────────────────────
 
 def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts=None,
-                     occ_boundary=None):
+                     occ_boundary=None, occ_segments=None, capsule_horizon=None,
+                     max_capsules=12):
     """Persist one episode's ego trajectory as CSV + a top-down PNG plot.
 
     traj columns: t, x, y, theta, v, a_cmd, delta_cmd  (x=Unity Z, y=Unity X).
@@ -640,6 +665,15 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
     occ_boundary (optional): (K, 2) array of occlusion-boundary (blind-spot)
     points the occlusion-aware MPC actually constrained (x, y), same frame —
     each seeds an expanding forward-reachable-set keep-out.
+    occ_segments (optional): (S, 2, 2) occlusion BOUNDARY segments from the
+    range-jump detector, [[near, far], ...] in the same frame. Each is drawn as
+    the nested forward-reachable-set CAPSULES the MPC constrained against, at
+    radius D_SAFE_OCC + V_TARGET·t for t across the horizon.
+    capsule_horizon (optional): horizon length [s] the capsules expanded over
+    (N·DT). Defaults to 3 s if not given.
+    max_capsules: cap on how many segments get capsules drawn — an episode
+    accumulates far more boundaries than are legible at once, so the ones
+    nearest the ego path are kept.
     """
     import os
     os.makedirs(out_dir, exist_ok=True)
@@ -662,6 +696,40 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
     if occ_pts is not None and len(occ_pts):
         ax.scatter(occ_pts[:, 0], occ_pts[:, 1], c="0.35", s=8, marker="s",
                    alpha=0.5, label="static occluders", zorder=1)
+    # Expanding forward-reachable-set capsules around each occlusion boundary segment.
+    # Drawn first (lowest zorder) so the ego path stays readable on top of them.
+    if occ_segments is not None and len(occ_segments):
+        from occlusion_capsules import capsule_polygon, point_segment_distance_np
+        segs = np.asarray(occ_segments, float).reshape(-1, 2, 2)
+
+        # An episode accumulates far more boundaries than are legible; keep those
+        # nearest the ego path, which are the ones that actually shaped the trajectory.
+        if len(segs) > max_capsules:
+            path = np.column_stack((x, y))
+            dmin = np.array([point_segment_distance_np(path, s[0], s[1]).min()
+                             for s in segs])
+            segs = segs[np.argsort(dmin)[:max_capsules]]
+
+        T = float(capsule_horizon) if capsule_horizon else 3.0
+        # One outline per horizon slice: t=0 is the base keep-out, t=T the fully
+        # expanded set. Nesting is what shows the growth the MPC plans against.
+        t_slices = np.linspace(0.0, T, 4)
+        for si, seg in enumerate(segs):
+            for ti, t in enumerate(t_slices):
+                r = D_SAFE_OCC + V_TARGET * t
+                poly = capsule_polygon(seg[0], seg[1], r)
+                first = (si == 0 and ti == 0)
+                ax.plot(poly[:, 0], poly[:, 1], "-", color="tab:red",
+                        lw=1.0 if ti == 0 else 0.6,
+                        alpha=0.55 if ti == 0 else 0.28,
+                        zorder=0,
+                        label=(f"FRS capsules (t=0…{T:.1f}s, "
+                               f"v_target={V_TARGET:.1f})" if first else None))
+            # The boundary line itself — the locus the phantom agent is assumed to be on.
+            ax.plot(seg[:, 0], seg[:, 1], "-", color="tab:red", lw=1.8, alpha=0.9,
+                    zorder=1,
+                    label="occlusion boundary segments" if si == 0 else None)
+
     if occ_boundary is not None and len(occ_boundary):
         ax.scatter(occ_boundary[:, 0], occ_boundary[:, 1], c="tab:purple", s=14,
                    marker="D", alpha=0.5, label="occlusion boundaries", zorder=2)
@@ -881,10 +949,18 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                     oi, oj = np.where(g.state == 2)
                     for wx, wy in zip(g._o0 + (oi + 0.5) * g.res, g._o1 + (oj + 0.5) * g.res):
                         occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
-                    op = LIDAR_COSTMAP.occlusion_points()
-                    if op is not None:
-                        for wx, wy in op:
-                            occ_track[(round(float(wx), 1), round(float(wy), 1))] = None
+                    # Only track occlusion boundaries when occlusion-awareness is actually
+                    # active — otherwise the planner ignores them and plotting them is
+                    # misleading (the purple diamonds imply a constraint that isn't there).
+                    if OCCLUSION_AWARE:
+                        op = LIDAR_COSTMAP.occlusion_points()
+                        if op is not None and len(op):
+                            # Only track boundaries within OCC_QUERY_R of the ego (like the
+                            # MPC) so the plot shows the locally-relevant occlusion set, not
+                            # the whole episode-wide union of every wall's shadow.
+                            d = np.hypot(op[:, 0] - s[0], op[:, 1] - s[1])
+                            for wx, wy in op[d < OCC_QUERY_R]:
+                                occ_track[(round(float(wx), 1), round(float(wy), 1))] = None
             u_nom, mean = mppi(s, mean, obstacles, goal_xy, u_prev)
 
             u_cmd      = u_nom

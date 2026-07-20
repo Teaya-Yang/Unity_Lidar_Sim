@@ -46,6 +46,8 @@ from typing import Optional
 
 import numpy as np
 
+import occlusion_capsules as occ_caps
+
 try:
     import rclpy
     from rclpy.node import Node
@@ -248,6 +250,15 @@ class LidarCostmap:
         self._pts = None            # (N,3) ROS xyz, finite
         self._pose = None           # (a0, a1) sensor world position
         self._stamp = 0.0
+
+        # Ordered-cloud path for range-jump occlusion SEGMENTS (occlusion_capsules).
+        # Kept separate from self._pts because that one drops non-returns, which
+        # destroys the beam adjacency the jump test needs. Shape must match the
+        # PointCloudPublisher Inspector fields; set via configure_scan().
+        self._scan_shape = None     # (n_h, n_v) or None ⇒ segment path disabled
+        self._scan_res_h = 1.0
+        self._scan_max_range = 1000.0
+        self._pts_ordered = None    # (n_h, n_v, 3) with NaN preserved
         self._dist = None           # (n,n) static distance field [m]
         self._dist_unknown = None   # (n,n) distance-to-nearest-UNKNOWN (frontier) field [m]
         self._shadow = None         # (n,n) bool: occlusion-shadow cells (blind spots behind occluders)
@@ -293,9 +304,11 @@ class LidarCostmap:
 
             def _cloud(self, msg):
                 pts = outer._parse_cloud(msg)
+                ordered = outer._parse_ordered(msg)
                 if pts is not None:
                     with outer._lock:
                         outer._pts = pts
+                        outer._pts_ordered = ordered
                         outer._stamp = time.monotonic()
                     if not self._got_cloud:
                         self._got_cloud = True
@@ -318,6 +331,51 @@ class LidarCostmap:
               f"persistent {self.grid.n}×{self.grid.n} @ {self.res} m  "
               f"free_ttl={self.grid.free_ttl}s  EDT={'scipy' if _HAS_SCIPY else 'chamfer'}")
         return True
+
+    def configure_scan(self, fov_h: float, fov_v: float, res_h: float, res_v: float,
+                       max_range: float) -> None:
+        """Enable the range-jump segment path by declaring the scan geometry.
+
+        Must match the PointCloudPublisher Inspector fields — the flat cloud is
+        reshaped back into its (azimuth x elevation) beam grid, so a mismatch makes
+        adjacency meaningless. Mismatched scans are ignored rather than misread.
+        """
+        self._scan_shape = occ_caps.scan_shape(fov_h, fov_v, res_h, res_v)
+        self._scan_res_h = float(res_h)
+        self._scan_max_range = float(max_range)
+
+    def _parse_ordered(self, msg) -> Optional[np.ndarray]:
+        if self._scan_shape is None:
+            return None
+        n_h, n_v = self._scan_shape
+        return occ_caps.parse_ordered_cloud(msg, n_h, n_v)
+
+    def occlusion_segments(self, grazing_deg: float = 12.0, min_jump: float = 0.5,
+                           merge_radius: float = 1.5, max_seg_len: float = 30.0,
+                           ego_fwd=None, fwd_half_angle_deg: float = 100.0,
+                           min_corner_range: Optional[float] = None) -> Optional[np.ndarray]:
+        """(M,2,2) world occlusion BOUNDARY segments from LiDAR range jumps, or None.
+
+        These seed the MPC's expanding capsules. Detection is INSTANTANEOUS (this scan
+        only), unlike occlusion_points() which reports accumulated line-of-sight shadow
+        cells from the persistent grid — the two are complementary, not interchangeable.
+
+        ego_fwd: (a0,a1) forward unit vector; when given, boundaries outside the
+        +/-fwd_half_angle_deg wedge are discarded so corners the ego has already passed
+        stop constraining it.
+        Returns None when configure_scan() was never called or the scan is unusable.
+        """
+        with self._lock:
+            xyz, pose = self._pts_ordered, self._pose
+        if xyz is None or pose is None:
+            return None
+        return occ_caps.segments_from_ordered_cloud(
+            xyz, self._scan_res_h, self._scan_max_range, pose,
+            grazing_deg=grazing_deg, min_jump=min_jump,
+            merge_radius=merge_radius, max_seg_len=max_seg_len,
+            ego_fwd=ego_fwd, fwd_half_angle_deg=fwd_half_angle_deg,
+            min_corner_range=(self.min_range if min_corner_range is None
+                              else min_corner_range))
 
     @staticmethod
     def _parse_cloud(msg) -> Optional[np.ndarray]:

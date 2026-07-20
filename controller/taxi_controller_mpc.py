@@ -66,6 +66,7 @@ from taxi_controller import (
     obs_to_state, inject_sensor_noise, make_scenarios,
     identify_bicycle_model, _save_trajectory,
 )
+from occlusion_capsules import point_segment_distance_sym, point_segment_distance_np
 
 # ── MPC-specific tuning ───────────────────────────────────────────────────────
 # Horizon: MPPI uses H=60 (6 s) because sampling is cheap. IPOPT solves a real NLP
@@ -139,6 +140,21 @@ SYM_BIAS_FRAC   = 0.5    # fraction of the horizon over which the bias is applie
 # sightline cap W_SIGHT / A_BRAKE_SIGHT / V_SIGHT_FLOOR) are imported from
 # taxi_controller so the MPC and MPPI controllers stay in lock-step. Only the two
 # NLP-specific knobs below are local: K_OCC (number of solver slots) and OCC_QUERY_R.
+# Scan geometry for the range-jump boundary detector. MUST match the Unity
+# PointCloudPublisher Inspector fields — the flat cloud is reshaped back into its beam
+# grid, and a mismatch is detected and the scan ignored (no silent misreading).
+SCAN_FOV_H     = 360.0
+SCAN_FOV_V     = 45.0
+SCAN_RES_H     = 1.0
+SCAN_RES_V     = 1.0
+SCAN_MAX_RANGE = 1000.0
+
+# Only boundaries within this half-angle of the ego's heading seed capsules. A phantom
+# emerging from a corner already driven past cannot be run into, so constraining it just
+# brakes the ego for nothing. 180 ⇒ no filter; 90 ⇒ strictly ahead; 100 keeps a little
+# past abeam so a corner isn't dropped the instant it draws level.
+OCC_FWD_HALF_ANGLE = 90.0   # [deg]
+
 K_OCC       = 10        # nearest occlusion-boundary points constrained per step (0 ⇒ off)
 OCC_QUERY_R = 60.0     # only consider occlusion boundaries within this radius of the ego [m]
 
@@ -202,7 +218,11 @@ class TaxiMPC:
         P_opos  = [ca.MX.sym(f"op_{i}", 2) for i in range(self.k_obs)]  # abs obstacle pos now
         P_ovel  = [ca.MX.sym(f"ov_{i}", 2) for i in range(self.k_obs)]  # obstacle velocity
         P_spos  = [ca.MX.sym(f"sp_{i}", 2) for i in range(self.k_static)]  # static OCC points
-        P_occ   = [ca.MX.sym(f"occ_{i}", 2) for i in range(self.k_occ)]    # occlusion boundary points
+        # Occlusion boundary SEGMENTS (ax, ay, bx, by) — the boundary LINES found by the
+        # range-jump detector, expanded into capsules below. A degenerate segment
+        # (a == b) collapses the capsule to a circle, so a point-based occlusion source
+        # flows through this same path unchanged.
+        P_occ   = [ca.MX.sym(f"occ_{i}", 4) for i in range(self.k_occ)]
 
         R_act_dm  = ca.DM(R_ACT)
         R_dact_dm = ca.DM(R_DACT)
@@ -274,11 +294,13 @@ class TaxiMPC:
             r_grow = self.v_target * t_k
             d_vis  = ca.MX(1e6)          # distance to the NEAREST occlusion boundary this stage
             for i in range(self.k_occ):
-                oc   = P_occ[i]
-                dx_c = px - oc[0]
-                dy_c = py - oc[1]
-                d2c  = dx_c * dx_c + dy_c * dy_c
-                dc   = ca.sqrt(d2c + 1e-6)
+                oc = P_occ[i]
+                # Distance to the boundary SEGMENT, so the r_grow level set is a capsule
+                # (rectangle + two end circles) rather than a circle: the hidden agent is
+                # assumed to lurk anywhere along the boundary line, not just at its corner.
+                d2c, dc = point_segment_distance_sym(
+                    px, py, oc[0], oc[1], oc[2], oc[3],
+                    ca.fmin, ca.fmax, ca.sqrt)
                 d_vis = ca.fmin(d_vis, dc)
                 r_infl_occ = self.d_infl_occ + r_grow
                 r_keep_occ = self.d_safe_occ + r_grow
@@ -392,7 +414,7 @@ class TaxiMPC:
 
     # ── Build the numeric parameter vector for one solve ──────────────────────
     def _pack_params(self, s0, goal_xy, v_des, u_prev, obstacles,
-                     static_pts=None, occ_pts=None):
+                     static_pts=None, occ_pts=None, occ_segs=None):
         nx = self.NX
         p = list(s0[:nx]) + [goal_xy[0], goal_xy[1], v_des, u_prev[0], u_prev[1]]
 
@@ -424,16 +446,47 @@ class TaxiMPC:
         # hide on it; otherwise the widened, expanding occlusion circle would cover the
         # goal and repel the ego from its own destination (the orbit failure mode).
         if self.k_occ:
-            occ_src = occ_pts
-            if occ_src is not None and len(occ_src) and goal_xy is not None:
+            segs = self._as_segments(occ_segs, occ_pts)
+            if segs is not None and len(segs) and goal_xy is not None:
+                # Test the NEAR endpoint (the corner) against the goal: that is the point
+                # the phantom is anchored to.
+                gd = np.hypot(segs[:, 0, 0] - goal_xy[0], segs[:, 0, 1] - goal_xy[1])
                 r_goal_clear = self.d_safe_occ + self.v_target * self.N * DT
-                gd = np.hypot(np.asarray(occ_src)[:, 0] - goal_xy[0],
-                              np.asarray(occ_src)[:, 1] - goal_xy[1])
-                occ_src = np.asarray(occ_src)[gd > r_goal_clear]
-            op = self._nearest_points(s0, occ_src, self.k_occ, OCC_QUERY_R)
-            for row in op:
-                p += [float(row[0]), float(row[1])]
+                segs = segs[gd > r_goal_clear]
+            os_ = self._nearest_segments(s0, segs, self.k_occ, OCC_QUERY_R)
+            for row in os_:
+                p += [float(row[0]), float(row[1]), float(row[2]), float(row[3])]
         return np.array(p, dtype=float)
+
+    @staticmethod
+    def _as_segments(occ_segs, occ_pts):
+        """Normalize either source to (M, 2, 2) segments. Points become DEGENERATE
+        segments (a == b), whose capsule is exactly the old circle — so the legacy
+        point-based costmap path keeps its previous behaviour bit for bit."""
+        if occ_segs is not None and len(occ_segs):
+            return np.asarray(occ_segs, float).reshape(-1, 2, 2)
+        if occ_pts is not None and len(occ_pts):
+            pts = np.asarray(occ_pts, float).reshape(-1, 2)
+            return np.stack([pts, pts], axis=1)
+        return None
+
+    @staticmethod
+    def _nearest_segments(s0, segs, k, query_r):
+        """The k segments nearest the ego (by true point-to-segment distance), padded
+        with far-parked degenerate segments so the parameter vector is fixed-size."""
+        out = np.full((k, 4), 1e6)
+        if segs is not None and len(segs):
+            segs = np.asarray(segs, float).reshape(-1, 2, 2)
+            ego = np.array([s0[0], s0[1]], float)
+            d = np.array([point_segment_distance_np(ego[None, :], s[0], s[1])[0]
+                          for s in segs])
+            near = segs[d <= query_r]
+            dn = d[d <= query_r]
+            if len(near):
+                order = np.argsort(dn)[:k]
+                sel = near[order]
+                out[:len(sel)] = sel.reshape(len(sel), 4)
+        return out
 
     @staticmethod
     def _nearest_points(s0, pts, k, query_r):
@@ -504,7 +557,8 @@ class TaxiMPC:
         return np.concatenate(parts)
 
     # ── Solve the receding-horizon problem, return the first control ──────────
-    def solve(self, s0, goal_xy, obstacles, u_prev, static_pts=None, occ_pts=None):
+    def solve(self, s0, goal_xy, obstacles, u_prev, static_pts=None, occ_pts=None,
+              occ_segs=None):
         """Return (u0, info). u0 = [a_cmd, delta_cmd] to apply this step.
 
         static_pts: optional (M, 2) array of static OCC world points (from the LiDAR
@@ -523,7 +577,8 @@ class TaxiMPC:
         # the factor is 1 beyond GOAL_STOP_DIST, so the outer taper is unaffected.
         v_des_eff *= float(np.clip(d0 / GOAL_STOP_DIST, 0.0, 1.0))
 
-        p = self._pack_params(s0, goal_xy, v_des_eff, u_prev, obstacles, static_pts, occ_pts)
+        p = self._pack_params(s0, goal_xy, v_des_eff, u_prev, obstacles, static_pts,
+                              occ_pts, occ_segs)
 
         # ── Warm start: shift previous solution, else roll out from s0 ─────────
         if self._Xopt is None:
@@ -662,9 +717,16 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                   f"K_STATIC={K_STATIC}, D_SAFE_STATIC={D_SAFE_STATIC:.1f} m")
             if occlusion_aware:
                 k_occ = K_OCC
+                # Declare the scan geometry so range-jump boundary SEGMENTS (capsules)
+                # are available; without this the costmap falls back to accumulated
+                # blind-spot points, whose capsules degenerate to circles.
+                cm.configure_scan(SCAN_FOV_H, SCAN_FOV_V, SCAN_RES_H, SCAN_RES_V,
+                                  SCAN_MAX_RANGE)
                 print(f"[MPC] Occlusion-aware: ON  — forward reachable sets K_OCC={K_OCC}, "
                       f"v_target={V_TARGET:.1f} m/s, D_SAFE_OCC={D_SAFE_OCC:.1f} m "
-                      f"(expands +{V_TARGET*horizon*DT:.1f} m over the horizon)")
+                      f"(expands +{V_TARGET*horizon*DT:.1f} m over the horizon); "
+                      f"capsules from range-jump segments "
+                      f"({SCAN_FOV_H:g}°x{SCAN_FOV_V:g}° @ {SCAN_RES_H:g}°)")
         else:
             print("[MPC] LiDAR map     : requested but unavailable (no rclpy) — "
                   "running WITHOUT static keep-out")
@@ -731,6 +793,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
         # world cell (a mouth that sweeps as the ego moves would otherwise paint a whole
         # line across many steps even when each step is corner-only).
         occ_track = {}
+        seg_track = {}   # deduped occlusion boundary SEGMENTS seen this episode (for the plot)
         # Union of every OCC cell seen across the episode. The costmap is a rolling,
         # DECAYING, ego-centered grid (occ_ttl≈12s), so a single end-of-run snapshot
         # only shows walls still in view at the goal — walls the ego passed earlier
@@ -784,6 +847,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
             # ── Refresh the LiDAR static-obstacle costmap and extract OCC points ──
             static_pts = None
             occ_pts    = None
+            occ_segs   = None
             n_static   = 0
             n_occ      = 0
             if costmap is not None:
@@ -802,14 +866,23 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                             for wx, wy in static_pts:
                                 occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
                     if k_occ:
-                        occ_pts = costmap.occlusion_points()     # blind-spot boundary cells
-                        n_occ   = 0 if occ_pts is None else len(occ_pts)
+                        # Range-jump boundary SEGMENTS (this scan) seed the expanding
+                        # capsules. They need configure_scan(); when that wasn't called
+                        # this returns None and the accumulated blind-spot POINTS are
+                        # used instead, whose capsules degenerate to the previous circles.
+                        occ_segs = costmap.occlusion_segments(
+                            ego_fwd=ego_fwd,
+                            fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
+                        occ_pts  = costmap.occlusion_points()    # blind-spot boundary cells
+                        n_occ    = (len(occ_segs) if occ_segs is not None
+                                    else (0 if occ_pts is None else len(occ_pts)))
 
             # ── MPC solve ─────────────────────────────────────────────────────
             # MPC state is [x, y, theta, v, accel]; delta_actual is not a state
             # (the steering-rate limit is a constraint), so it isn't passed.
             s_mpc = np.array([s[0], s[1], s[2], s[3], accel_actual])
-            u_cmd, info = mpc.solve(s_mpc, goal_xy, obstacles, u_prev, static_pts, occ_pts)
+            u_cmd, info = mpc.solve(s_mpc, goal_xy, obstacles, u_prev, static_pts,
+                                    occ_pts, occ_segs)
             solve_ms_acc += info["solve_ms"]
             solve_fail   += (0 if info["success"] else 1)
 
@@ -861,6 +934,15 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
             # Record the occlusion-boundary points the MPC actually constrained this
             # step (the k_occ nearest within OCC_QUERY_R) so the plot shows what is
             # pushing the ego. _nearest_points pads unused slots to 1e6 — drop those.
+            # Same for the boundary SEGMENTS actually constrained, keyed on rounded
+            # endpoints so a corner re-detected every scan doesn't stack duplicates.
+            if k_occ and occ_segs is not None and len(occ_segs):
+                near_seg = mpc._nearest_segments(s_mpc, occ_segs, k_occ, OCC_QUERY_R)
+                for row in near_seg:
+                    if row[0] < 1e5:
+                        seg_track[(round(float(row[0]), 1), round(float(row[1]), 1),
+                                   round(float(row[2]), 1), round(float(row[3]), 1))] = None
+
             if k_occ and occ_pts is not None and len(occ_pts):
                 near_occ = mpc._nearest_points(s_mpc, occ_pts, k_occ, OCC_QUERY_R)
                 for row in near_occ:
@@ -888,9 +970,13 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
             # ego actually reacted to, including ones it has since driven past.
             occ_pts = np.array(list(occ_seen.keys())) if occ_seen else None
             occ_boundary = (np.array(list(occ_track.keys())) if occ_track else None)
+            occ_segments = (np.array(list(seg_track.keys())).reshape(-1, 2, 2)
+                            if seg_track else None)
             _save_trajectory(save_traj, ep, ep_log, goal_xy, np.asarray(traj),
                              np.asarray(obs_track) if obs_track else None, occ_pts,
-                             occ_boundary=occ_boundary)
+                             occ_boundary=occ_boundary,
+                             occ_segments=occ_segments,
+                             capsule_horizon=horizon * DT)
 
         verdict   = "COLLISION" if ep_log["collided"] else "safe"
         mean_ms   = solve_ms_acc / max(ep_log["steps"], 1)
