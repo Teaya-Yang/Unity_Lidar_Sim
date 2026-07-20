@@ -155,6 +155,30 @@ SCAN_MAX_RANGE = 1000.0
 # past abeam so a corner isn't dropped the instant it draws level.
 OCC_FWD_HALF_ANGLE = 90.0   # [deg]
 
+# Keep-out SHAPE around each detected occlusion boundary.
+#   False (default) ⇒ expanding CIRCLE about the boundary's CORNER point — the paper's
+#                     "direct circle-sampling" formulation, and the tighter set.
+#   True            ⇒ expanding CAPSULE about the whole boundary LINE (corner→far),
+#                     i.e. the hidden agent may lurk anywhere along the sightline, not
+#                     only at the corner. Strictly more conservative: the capsule always
+#                     contains the circle, so the ego gives every corner a wider berth.
+# The constraint code is identical either way — a zero-length segment IS a circle — so
+# this only changes the geometry fed in, never the solver.
+OCC_USE_CAPSULES = False
+
+# Algorithm 1 (single-circle) mode. True ⇒ each detected boundary gets exactly ONE
+# keep-out circle of radius D_SAFE_OCC + d_target, regenerated from scratch at every
+# LiDAR scan — no nested set growing along the horizon.
+#
+# d_target = V_TARGET · OCC_D_TARGET_HORIZON. Because a SINGLE circle must stay valid
+# for the whole prediction window, the horizon used is the full N·DT: a hidden agent
+# moving at V_TARGET can cover that much ground by the end of the horizon, so a smaller
+# radius would be weaker than the nested formulation at its late stages. (The paper's
+# literal d_target = v_target/Δt is dimensionally acceleration — 30 m per step here —
+# so distance = speed · time is used instead.)
+OCC_SINGLE_CIRCLE     = True
+OCC_D_TARGET_HORIZON  = N_MPC * DT     # [s] → d_target = 3.0 · 3.0 s = 9.0 m
+
 K_OCC       = 10        # nearest occlusion-boundary points constrained per step (0 ⇒ off)
 OCC_QUERY_R = 60.0     # only consider occlusion boundaries within this radius of the ego [m]
 
@@ -178,7 +202,7 @@ class TaxiMPC:
     def __init__(self, N=N_MPC, k_obs=K_OBS, d_infl=D_INFL, d_safe=D_SAFE,
                  k_static=0, d_infl_static=D_INFL_STATIC, d_safe_static=D_SAFE_STATIC,
                  k_occ=0, d_infl_occ=D_INFL_OCC, d_safe_occ=D_SAFE_OCC, v_target=V_TARGET,
-                 verbose=False):
+                 occ_d_target=None, verbose=False):
         self.N     = int(N)
         self.k_obs = int(k_obs)
         self.d_infl = float(d_infl)
@@ -187,6 +211,9 @@ class TaxiMPC:
         self.d_infl_static = float(d_infl_static)
         self.d_safe_static = float(d_safe_static)
         self.k_occ = int(k_occ)                # 0 ⇒ no occlusion-aware keep-out
+        # None ⇒ radius grows per stage (v_target·t_k, nested set). A float ⇒ Algorithm 1:
+        # ONE circle of that fixed radius per boundary, rebuilt each scan.
+        self.occ_d_target = None if occ_d_target is None else float(occ_d_target)
         self.d_infl_occ = float(d_infl_occ)
         self.d_safe_occ = float(d_safe_occ)
         self.v_target   = float(v_target)
@@ -291,7 +318,11 @@ class TaxiMPC:
             # v_target, so the keep-out circle EXPANDS along the horizon by
             # v_target · t_k. The influence ring expands identically. (The paper's
             # d_target = v_target/Δt is a typo; distance = speed · time is used.)
-            r_grow = self.v_target * t_k
+            # Single-circle mode (Algorithm 1): ONE circle of radius d_target per detected
+            # boundary, rebuilt from scratch at every LiDAR scan, rather than a nested set
+            # growing along the horizon. The radius is therefore stage-INDEPENDENT.
+            r_grow = (self.occ_d_target if self.occ_d_target is not None
+                      else self.v_target * t_k)
             d_vis  = ca.MX(1e6)          # distance to the NEAREST occlusion boundary this stage
             for i in range(self.k_occ):
                 oc = P_occ[i]
@@ -725,7 +756,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                 print(f"[MPC] Occlusion-aware: ON  — forward reachable sets K_OCC={K_OCC}, "
                       f"v_target={V_TARGET:.1f} m/s, D_SAFE_OCC={D_SAFE_OCC:.1f} m "
                       f"(expands +{V_TARGET*horizon*DT:.1f} m over the horizon); "
-                      f"capsules from range-jump segments "
+                      f"{'capsules' if OCC_USE_CAPSULES else 'circles'} from range-jump corners "
                       f"({SCAN_FOV_H:g}°x{SCAN_FOV_V:g}° @ {SCAN_RES_H:g}°)")
         else:
             print("[MPC] LiDAR map     : requested but unavailable (no rclpy) — "
@@ -734,7 +765,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
         print("[MPC] Occlusion-aware: requested but needs --lidar-costmap — DISABLED")
 
     mpc = TaxiMPC(N=horizon, k_obs=K_OBS, d_infl=d_infl, d_safe=d_safe,
-                  k_static=k_static, k_occ=k_occ)
+                  k_static=k_static, k_occ=k_occ,
+                  occ_d_target=(V_TARGET * OCC_D_TARGET_HORIZON
+                                if OCC_SINGLE_CIRCLE else None))
 
     env_params = EnvironmentParametersChannel()
     env = UnityEnvironment(
@@ -867,12 +900,19 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                                 occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
                     if k_occ:
                         # Range-jump boundary SEGMENTS (this scan) seed the expanding
-                        # capsules. They need configure_scan(); when that wasn't called
+                        # keep-outs. They need configure_scan(); when that wasn't called
                         # this returns None and the accumulated blind-spot POINTS are
-                        # used instead, whose capsules degenerate to the previous circles.
+                        # used instead.
                         occ_segs = costmap.occlusion_segments(
                             ego_fwd=ego_fwd,
                             fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
+                        if occ_segs is not None and not OCC_USE_CAPSULES:
+                            # Collapse each boundary line onto its CORNER, so the keep-out
+                            # is an expanding CIRCLE about that point. Done here, at the
+                            # source, so the constraints, the recorded seg_track and the
+                            # episode plot all show the same geometry.
+                            occ_segs = occ_segs.copy()
+                            occ_segs[:, 1, :] = occ_segs[:, 0, :]
                         occ_pts  = costmap.occlusion_points()    # blind-spot boundary cells
                         n_occ    = (len(occ_segs) if occ_segs is not None
                                     else (0 if occ_pts is None else len(occ_pts)))
@@ -976,7 +1016,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                              np.asarray(obs_track) if obs_track else None, occ_pts,
                              occ_boundary=occ_boundary,
                              occ_segments=occ_segments,
-                             capsule_horizon=horizon * DT)
+                             capsule_horizon=(OCC_D_TARGET_HORIZON if OCC_SINGLE_CIRCLE
+                                              else horizon * DT),
+                             single_radius=OCC_SINGLE_CIRCLE)
 
         verdict   = "COLLISION" if ep_log["collided"] else "safe"
         mean_ms   = solve_ms_acc / max(ep_log["steps"], 1)

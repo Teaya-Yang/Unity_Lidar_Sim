@@ -654,7 +654,7 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 
 def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts=None,
                      occ_boundary=None, occ_segments=None, capsule_horizon=None,
-                     max_capsules=12):
+                     max_capsules=12, single_radius=False):
     """Persist one episode's ego trajectory as CSV + a top-down PNG plot.
 
     traj columns: t, x, y, theta, v, a_cmd, delta_cmd  (x=Unity Z, y=Unity X).
@@ -669,8 +669,10 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
     range-jump detector, [[near, far], ...] in the same frame. Each is drawn as
     the nested forward-reachable-set CAPSULES the MPC constrained against, at
     radius D_SAFE_OCC + V_TARGET·t for t across the horizon.
-    capsule_horizon (optional): horizon length [s] the capsules expanded over
+    capsule_horizon (optional): horizon length [s] the keep-out expanded over
     (N·DT). Defaults to 3 s if not given.
+    single_radius: True ⇒ Algorithm 1 mode, draw ONE circle at the fixed radius
+    D_SAFE_OCC + V_TARGET·capsule_horizon instead of a nested set.
     max_capsules: cap on how many segments get capsules drawn — an episode
     accumulates far more boundaries than are legible at once, so the ones
     nearest the ego path are kept.
@@ -711,9 +713,10 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
             segs = segs[np.argsort(dmin)[:max_capsules]]
 
         T = float(capsule_horizon) if capsule_horizon else 3.0
-        # One outline per horizon slice: t=0 is the base keep-out, t=T the fully
-        # expanded set. Nesting is what shows the growth the MPC plans against.
-        t_slices = np.linspace(0.0, T, 4)
+        # Single-circle (Algorithm 1) mode draws ONE outline at the fixed radius the
+        # MPC actually constrained; otherwise one outline per horizon slice, whose
+        # nesting shows the growth being planned against.
+        t_slices = ([T] if single_radius else np.linspace(0.0, T, 4))
         for si, seg in enumerate(segs):
             for ti, t in enumerate(t_slices):
                 r = D_SAFE_OCC + V_TARGET * t
@@ -723,8 +726,10 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
                         lw=1.0 if ti == 0 else 0.6,
                         alpha=0.55 if ti == 0 else 0.28,
                         zorder=0,
-                        label=(f"FRS capsules (t=0…{T:.1f}s, "
-                               f"v_target={V_TARGET:.1f})" if first else None))
+                        label=((f"FRS keep-out r={D_SAFE_OCC + V_TARGET * T:.1f} m "
+                                f"(d_target={V_TARGET * T:.1f} m)") if single_radius
+                               else f"FRS capsules (t=0…{T:.1f}s, v_target={V_TARGET:.1f})")
+                        if first else None)
             # The boundary line itself — the locus the phantom agent is assumed to be on.
             ax.plot(seg[:, 0], seg[:, 1], "-", color="tab:red", lw=1.8, alpha=0.9,
                     zorder=1,
