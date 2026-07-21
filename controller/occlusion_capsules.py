@@ -75,7 +75,7 @@ def segments_from_ordered_cloud(
     max_seg_len: float = 30.0,
     elev_row: Optional[int] = None,
     ego_fwd: Optional[Tuple[float, float]] = None,
-    fwd_half_angle_deg: float = 180.0,
+    fwd_half_angle_deg: float = 100.0,
     min_corner_range: float = 1.0,
     trend_window: int = 4,
     min_far_run: int = 10,

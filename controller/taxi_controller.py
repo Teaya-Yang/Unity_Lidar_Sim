@@ -678,7 +678,7 @@ def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_diff
 def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts=None,
                      occ_segments=None, capsule_horizon=None,
                      max_capsules=12, single_radius=False, show_expansion=True,
-                     occ_ego=None):
+                     occ_ego=None, show_occlusion=True):
     """Persist one episode's ego trajectory as CSV + a top-down PNG plot.
 
     traj columns: t, x, y, theta, v, a_cmd, delta_cmd  (x=Unity Z, y=Unity X).
@@ -694,6 +694,10 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
     (N·DT). Defaults to 3 s if not given.
     single_radius: True ⇒ Algorithm 1 mode, the ENFORCED radius is the fixed
     D_SAFE_OCC + V_TARGET·capsule_horizon (no per-stage growth).
+    show_occlusion: False ⇒ draw none of the occlusion artifacts (keep-out circles,
+    expansion rings, corner centres, ego-at-detection markers and their connectors),
+    leaving just the trajectory, static occluders, obstacles and goal. The second
+    (horizon-time) colorbar is suppressed too.
     occ_ego (optional): (S, 3) array of (ego_x, ego_y, t_episode) recorded when each
     occlusion segment was FIRST constrained — used to tie each keep-out back to the
     point on the trajectory where it applied.
@@ -728,7 +732,7 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
                    alpha=0.5, label="static occluders", zorder=1)
     # Expanding forward-reachable-set capsules around each occlusion boundary segment.
     # Drawn first (lowest zorder) so the ego path stays readable on top of them.
-    if occ_segments is not None and len(occ_segments):
+    if show_occlusion and occ_segments is not None and len(occ_segments):
         from occlusion_capsules import capsule_polygon, point_segment_distance_np
         segs = np.asarray(occ_segments, float).reshape(-1, 2, 2)
         occ_ego = None if occ_ego is None else np.asarray(occ_ego, float).reshape(-1, 3)
@@ -793,7 +797,7 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
                 markeredgecolor="k", label="goal", zorder=5)
     fig.colorbar(sc, ax=ax, label="speed [m/s]")
     # Second colorbar for the keep-out rings: which future instant each one constrains.
-    if occ_segments is not None and len(occ_segments):
+    if show_occlusion and occ_segments is not None and len(occ_segments):
         import matplotlib as _mpl
         T_cb = float(capsule_horizon) if capsule_horizon else 3.0
         sm = _mpl.cm.ScalarMappable(cmap=horizon_cmap,
@@ -825,7 +829,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         value_net_path=None, w_term=W_TERM, pin_episode=None,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
-        occlusion_aware=False, save_traj=None):
+        occlusion_aware=False, save_traj=None, show_occlusion_plot=True):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW
@@ -1138,7 +1142,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                              # OCC_HORIZON, not the PLANNING horizon: the keep-out is
                              # capped at OCC_HORIZON in the cost, so drawing H_MPPI*DT
                              # would overstate the constraint by V_TARGET*(6.0-3.0)=9 m.
-                             capsule_horizon=OCC_HORIZON)
+                             capsule_horizon=OCC_HORIZON,
+                             show_occlusion=show_occlusion_plot)
 
         verdict = "COLLISION" if ep_log["collided"] else "safe"
         print(f"[Ep {ep+1:3d}] Δt={ep_log['incursion_dt']:+.2f}s  "
@@ -1267,6 +1272,9 @@ if __name__ == "__main__":
                         "rollout endpoints from which occluded path-relevant space stays hidden, "
                         "so the ego arcs wider to see into blind corners (self-terminating via "
                         "memory + decay). Enables the LiDAR map; needs ROS 2 sourced.")
+    p.add_argument("--no-occlusion-plot", action="store_true",
+                   help="omit the occlusion keep-out circles, corner centres and "
+                        "ego-at-detection markers from the saved trajectory plots")
     p.add_argument("--occlusion-aware", action="store_true",
                    help="Add occlusion-aware forward-reachable-set keep-outs + an RSS sightline "
                         "speed cap (same model/constants as the MPC controller): a worst-case "
@@ -1303,4 +1311,5 @@ if __name__ == "__main__":
         lidar_topic=args.lidar_topic,
         visibility_cost=args.visibility_cost,
         occlusion_aware=args.occlusion_aware,
+        show_occlusion_plot=not args.no_occlusion_plot,
         save_traj=args.save_traj)

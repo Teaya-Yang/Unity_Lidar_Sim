@@ -734,7 +734,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
         scenario_type=SCENARIO_STANDARD, detect_range=float("inf"),
         d_infl=D_INFL, d_safe=D_SAFE, horizon=N_MPC, pin_episode=None,
         lidar_costmap=False, lidar_topic="/point_cloud", save_traj=None,
-        occlusion_aware=False):
+        occlusion_aware=False, show_occlusion_plot=True):
     # Detection range lives as a module global inside taxi_controller (obs_to_state
     # reads it), so set it there rather than shadowing a local copy.
     tc.DETECTION_RANGE = detect_range
@@ -1044,6 +1044,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                              # so the drawn radius always equals the enforced one.
                              capsule_horizon=(OCC_D_TARGET_HORIZON if OCC_SINGLE_CIRCLE
                                               else OCC_HORIZON),
+                             show_occlusion=show_occlusion_plot,
                              single_radius=OCC_SINGLE_CIRCLE)
 
         verdict   = "COLLISION" if ep_log["collided"] else "safe"
@@ -1132,6 +1133,9 @@ if __name__ == "__main__":
                         "dynamic obstacles in the observation vector.")
     p.add_argument("--lidar-topic",    default="/point_cloud",
                    help="PointCloud2 topic for the LiDAR map. Default: /point_cloud.")
+    p.add_argument("--no-occlusion-plot", action="store_true",
+                   help="omit the occlusion keep-out circles, corner centres and "
+                        "ego-at-detection markers from the saved trajectory plots")
     p.add_argument("--occlusion-aware", action="store_true",
                    help="Add occlusion-aware forward-reachable-set keep-outs (Firoozi et al.): "
                         "the K_OCC nearest blind-spot cells behind occluders each seed an "
@@ -1161,4 +1165,5 @@ if __name__ == "__main__":
         lidar_costmap=args.lidar_costmap,
         lidar_topic=args.lidar_topic,
         save_traj=args.save_traj,
-        occlusion_aware=args.occlusion_aware)
+        occlusion_aware=args.occlusion_aware,
+        show_occlusion_plot=not args.no_occlusion_plot)
