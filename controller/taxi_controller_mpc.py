@@ -53,8 +53,8 @@ from mlagents_envs.side_channel.environment_parameters_channel import (
 # ── Reuse the shared machinery + parameters from the MPPI controller ──────────
 # Importing keeps the dynamics constants, observation unpacking, scenario sweep,
 # sys-id probe and trajectory logging identical across both controllers.
-import taxi_controller as tc
-from taxi_controller import (
+import taxi_controller_mppi as tc
+from taxi_controller_mppi import (
     DT, L, V_DES, GOAL_SLOWDOWN_DIST, GOAL_MIN_SPEED,
     A_MIN, A_MAX, DELTA_LIM,
     DRAG_COEFF, ACCEL_TAU, MAX_STEER_RATE, STEER_ROLLOFF_SPD, STEER_ROLLOFF_MIN,
