@@ -25,7 +25,7 @@ intended quantity is distance = speed · time, so the radius used here (and alre
 used by the circle formulation in both controllers) is v_target · t_k.
 
 Detection needs the ORDERED cloud — beam adjacency IS the method — so non-returns are
-kept as max-range rather than dropped the way LidarCostmap._parse_cloud drops them.
+kept as max-range rather than dropped the way ObstacleCircles._parse_cloud drops them.
 """
 
 import math
@@ -47,7 +47,7 @@ def scan_shape(fov_h: float, fov_v: float, res_h: float, res_v: float) -> Tuple[
 def parse_ordered_cloud(msg, n_h: int, n_v: int) -> Optional[np.ndarray]:
     """PointCloud2 -> (n_h, n_v, 3) sensor-frame xyz with non-returns left as NaN.
 
-    Unlike LidarCostmap._parse_cloud this preserves beam order and keeps invalid
+    Unlike ObstacleCircles._parse_cloud this preserves beam order and keeps invalid
     points, because a dropped beam destroys the adjacency the jump test relies on.
     Returns None if the point count contradicts (n_h, n_v).
     """
@@ -62,12 +62,50 @@ def parse_ordered_cloud(msg, n_h: int, n_v: int) -> Optional[np.ndarray]:
     return xyz.reshape(n_h, n_v, 3)
 
 
+def _wall_line_deviation(win: np.ndarray, far: np.ndarray):
+    """Total-least-squares line through the wall points `win`, tested against `far`.
+
+    win : (w, 2) near-side (wall) beam hit-points in the horizontal plane.
+    far : (2,)   the candidate's FAR endpoint.
+
+    Returns (dev, wall_rms):
+      dev      — perpendicular distance of `far` from the fitted wall line, or None if
+                 the wall points are too coincident to define a direction.
+      wall_rms — RMS perpendicular spread of `win` about that line (how clean a line the
+                 near side actually is).
+
+    A grazing flat wall has a small wall_rms (the points ARE a line) and a small dev (the
+    far endpoint continues that line); a genuine occlusion corner has a large dev because
+    the escaped beam has left the wall. The line is fit by the principal eigenvector of
+    the 2x2 point covariance (closed form), which — unlike a range extrapolation — is
+    exact for a straight surface at any angle of incidence.
+    """
+    c = win.mean(axis=0)
+    d = win - c
+    cov = d.T @ d
+    a_, b_, dd = cov[0, 0], cov[0, 1], cov[1, 1]
+    tr = a_ + dd
+    disc = max(tr * tr / 4.0 - (a_ * dd - b_ * b_), 0.0)
+    l1 = tr / 2.0 + math.sqrt(disc)                       # larger eigenvalue
+    if abs(b_) > 1e-12:
+        ex, ey = b_, l1 - a_                              # eigenvector for l1
+    else:
+        ex, ey = (1.0, 0.0) if a_ >= dd else (0.0, 1.0)   # diagonal cov: axis-aligned
+    nrm = math.hypot(ex, ey)
+    if nrm < 1e-9:
+        return None, None
+    ex, ey = ex / nrm, ey / nrm
+    wall_rms = float(np.sqrt(np.mean((d[:, 0] * ey - d[:, 1] * ex) ** 2)))
+    dev = abs((far[0] - c[0]) * ey - (far[1] - c[1]) * ex)
+    return dev, wall_rms
+
+
 def segments_from_ordered_cloud(
     xyz: np.ndarray,
     res_h: float,
     max_range: float,
     ego_xy: Tuple[float, float],
-    grazing_deg: float = 10.0,
+    grazing_deg: float = 1.0,
     min_jump: float = 2.0,
     sigma: float = 0.0,
     wraps: bool = True,
@@ -75,7 +113,7 @@ def segments_from_ordered_cloud(
     max_seg_len: float = 30.0,
     elev_row: Optional[int] = None,
     ego_fwd: Optional[Tuple[float, float]] = None,
-    fwd_half_angle_deg: float = 100.0,
+    fwd_half_angle_deg: float = 180.0,
     min_corner_range: float = 1.0,
     trend_window: int = 4,
     min_far_run: int = 10,
@@ -84,7 +122,7 @@ def segments_from_ordered_cloud(
 
     xyz:      (n_h, n_v, 3) ordered sensor-frame cloud, ROS axes, NaN for non-returns.
     ego_xy:   sensor world position as (a0, a1) — the cloud is sensor-relative, so this
-              is a pure translation (matching LidarCostmap._ingest's convention).
+              is a pure translation (matching ObstacleCircles._build_circles's convention).
     elev_row: which elevation row to extract from; None picks the middle row, which is
               the one nearest the horizontal plane the vehicle drives in.
     ego_fwd:  (a0,a1) ego forward unit vector. When given, only boundaries whose CORNER
@@ -94,20 +132,24 @@ def segments_from_ordered_cloud(
     min_corner_range: corners nearer than this are dropped. Beams clipping the airframe
               or the ground under the sensor jump hugely at ~0 m, and the resulting corner
               sits ON the sensor where its bearing is meaningless — so it passes the
-              forward wedge at ANY half-angle. Mirrors LidarCostmap's min_range.
+              forward wedge at ANY half-angle. Mirrors ObstacleCircles's min_range.
     min_far_run: consecutive beams that must STAY on the far side for a jump to count as
               a corner. A fragmented wall (dropouts, or returns that slip between OCC
               fragments) produces isolated beams that fly past and then the surface
               resumes immediately — a real corner instead has the far range PERSIST.
               This is what removes the column of spurious corners along a wall face.
               0 or 1 disables the check.
-    trend_window: beams used to estimate the LOCAL RANGE TREND before each candidate.
-              A surface seen at grazing incidence produces a large but *steady* range step
-              per beam, indistinguishable from a corner by |Δr| alone — which is why a wall
-              viewed nearly edge-on lights up along its whole length. Comparing each step
-              against the trend extrapolated from the preceding beams removes that: a flat
-              wall (any incidence) has ~zero residual, a true depth break has a large one.
-              0 disables, falling back to the raw |Δr| test.
+    trend_window: beams fitted to the LOCAL WALL LINE on the near side of each candidate.
+              A surface seen at grazing incidence produces a large per-beam range step, so
+              |Δr| alone flags a wall viewed nearly edge-on along its whole length. But a
+              flat wall's beam hit-points are COLLINEAR in Cartesian space at *any*
+              incidence, while its range profile is convex — so a line fit, not a range
+              extrapolation, is the incidence-invariant test. This fits a line to the
+              trend_window near-side (wall) points and keeps the candidate only if the FAR
+              endpoint sits well OFF that line: a true depth break flies off the wall, a
+              grazing surface lands right on it and is rejected. Only rejects when the
+              near-side points are themselves a clean line, so a thin real occluder whose
+              window straddles background is never suppressed. 0 disables the test.
     fwd_half_angle_deg: half-width of that wedge. 180 is equivalent to no filter; 90
               keeps everything strictly ahead; the 100 default keeps a little past
               abeam so a corner is not dropped the instant it draws level.
@@ -119,7 +161,7 @@ def segments_from_ordered_cloud(
     n_h, n_v, _ = xyz.shape
     j = n_v // 2 if elev_row is None else int(np.clip(elev_row, 0, n_v - 1))
 
-    # ROS (x, y) -> world-aligned (a0, a1), the same mapping LidarCostmap._ingest uses.
+    # ROS (x, y) -> world-aligned (a0, a1), the same mapping ObstacleCircles._build_circles uses.
     a0 = xyz[:, j, 0].astype(np.float64)
     a1 = -xyz[:, j, 1].astype(np.float64)
     rng = np.hypot(a0, a1)
@@ -149,18 +191,10 @@ def segments_from_ordered_cloud(
     thresh = np.maximum(near * math.radians(res_h) / math.tan(math.radians(grazing_deg))
                         + 3.0 * sigma, min_jump)
 
-    if trend_window and trend_window >= 2:
-        # Predict each beam's range by extrapolating the mean per-beam slope of the
-        # preceding trend_window beams; the residual is what a grazing surface cannot
-        # explain. Wrap-around indexing keeps the 360-degree seam continuous.
-        prev = np.stack([rng[(cur - k) % n_h] for k in range(trend_window + 1)])
-        slope = np.mean(np.diff(prev[::-1], axis=0), axis=0)      # per-beam range change
-        predicted = rng[cur] + slope
-        residual = np.abs(rng[nxt] - predicted)
-        # A real break must exceed the trend AND still be a large absolute step.
-        detect = (residual > thresh) & (delta > thresh)
-    else:
-        detect = delta > thresh
+    # The absolute-step test flags every large Δr, INCLUDING a wall seen edge-on; the
+    # Cartesian line-fit test below (in the per-candidate loop) then rejects the grazing
+    # surfaces, which need the beam geometry that only survives to that loop.
+    detect = delta > thresh
 
     if min_far_run and min_far_run > 1:
         # Past a genuine corner the escaping beams keep flying; past a dropout the surface
@@ -187,16 +221,36 @@ def segments_from_ordered_cloud(
             fwd = f / n
             cos_lim = math.cos(math.radians(float(np.clip(fwd_half_angle_deg, 0.0, 180.0))))
 
+    use_line = bool(trend_window) and trend_window >= 2
+    w = int(trend_window)
     segs = []
     for h in hit:
         i, k = cur[h], nxt[h]
         # Near endpoint = the corner; far endpoint = where the escaping beam landed.
+        # `near_idx` is the corner beam; the wall extends AWAY from the gap from there,
+        # so we walk indices backward when the near side is the earlier beam and forward
+        # when it is the later one.
         if rng[i] <= rng[k]:
             p_near = np.array([a0[i], a1[i]])
             p_far = np.array([a0[k], a1[k]])
+            near_idx, step = i, -1
         else:
             p_near = np.array([a0[k], a1[k]])
             p_far = np.array([a0[i], a1[i]])
+            near_idx, step = k, +1
+
+        # Grazing-surface rejection. Fit a line to the near-side wall points and drop the
+        # candidate if the far endpoint continues that line (a wall seen edge-on) rather
+        # than flying off it (a real depth break). Only trust the rejection when the wall
+        # points are themselves a clean line — a window straddling background gives a
+        # large wall_rms, so a thin genuine occluder is never suppressed.
+        if use_line:
+            offs = near_idx + step * np.arange(w)
+            widx = offs % n_h if wraps else np.clip(offs, 0, n_h - 1)
+            win = np.column_stack([a0[widx], a1[widx]])
+            dev, wall_rms = _wall_line_deviation(win, p_far)
+            if dev is not None and wall_rms <= thresh[h] and dev <= thresh[h]:
+                continue
 
         # Drop boundaries behind the ego. Tested on the CORNER (the phantom's anchor)
         # in sensor-relative coords, which are already ego-centred.

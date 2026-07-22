@@ -32,7 +32,6 @@ import time
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.base_env import ActionTuple
 from mlagents_envs.exception import UnityCommunicatorStoppedException
-from value_net import ValueFunction, terminal_features
 from mlagents_envs.side_channel.environment_parameters_channel import (
     EnvironmentParametersChannel,
 )
@@ -136,8 +135,8 @@ C_PROGRESS                  = 10.0
 # ── Occlusion-aware safety: forward-reachable-set keep-out + RSS sightline speed cap ──
 # SHARED with taxi_controller_mpc.py (the MPC imports these), so both controllers use the SAME
 # occlusion model and constants. A worst-case hidden agent sits on a discrete blind-corner
-# boundary point (LidarCostmap.occlusion_points, the visible occlusion MOUTHS — same set the MPC
-# constrains, filtered to within OCC_QUERY_R of the ego), NOT the whole FREE↔UNKNOWN frontier, and
+# boundary point (the range-jump corner from ObstacleCircles.occlusion_segments — same set the MPC
+# constrains, filtered to within OCC_QUERY_R of the ego), and
 # could be anywhere within V_TARGET·t_k of it after t_k = (k+1)·DT. Two coupled terms, gated on
 # --occlusion-aware:
 #   * expanding keep-out circle:  r_keep = D_SAFE_OCC + V_TARGET·t_k  (soft ring at D_INFL_OCC,
@@ -165,14 +164,12 @@ GOAL_OCC_CLEAR = 31.0   # within this distance of the goal, fade the (repelling)
 N_SCEN = 10
 W_INFO = 10
 INFO_RANGE = 10
-W_TERM = 10
 
 # Lister obstacles cost
-LIDAR_COSTMAP  = None    # LidarCostmap instance when --lidar-costmap / --visibility-cost is set
+LIDAR_COSTMAP  = None    # ObstacleCircles instance when --lidar-costmap is set (name kept for
+                         # brevity across the many call sites; it is the circle-cover model now)
 STATIC_AVOID   = False   # set True by --lidar-costmap: adds the static keep-out/soft-ring cost
-                         # below to MPPI. Independent of VISIBILITY_COST (--visibility-cost),
-                         # which only adds the "peek around blind corners" incentive and does
-                         # NOT by itself avoid a collision with a static surface.
+                         # to MPPI, using clearance to the nearest obstacle-circle surface.
 W_STATIC       = 20.0     # weight of the static-surface soft influence ring (graded, gives a gradient)
 D_SAFE_STATIC  = 10.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
 D_INFL_STATIC  = 14.0      # soft influence ring around static surfaces [m]
@@ -385,18 +382,14 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     s0_theta = float(s0[2])              # initial heading — the straight-line lock reference
 
     # Occlusion set for this solve: the DISCRETE blind-corner boundary points (like the MPC's
-    # P_occ), NOT the continuous FREE↔UNKNOWN frontier field. distance_to_unknown() measures the
-    # distance to the whole wall's shadow, so the entire wall repelled the ego; occlusion_points()
-    # returns only the visible blind-corner MOUTHS. Filter to within OCC_QUERY_R of the ego (== the
-    # MPC) and hold them fixed over the horizon; d_occ per rollout pose = distance to the nearest.
+    # P_occ), taken as the NEAR endpoints (corners) of the range-jump boundary segments. Filter
+    # to within OCC_QUERY_R of the ego (== the MPC) and hold them fixed over the horizon; d_occ
+    # per rollout pose = distance to the nearest.
     occ_x = occ_y = None
     if OCCLUSION_AWARE and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
         # Range-jump boundary corners, tracked across scans (same source as the MPC).
-        # Falls back to the accumulated grid blind-spot points when the segment path is
-        # unavailable (configure_scan() not set up, or an unusable scan).
         _seg = OCC_SEGS_NOW
-        _op = (_seg[:, 0, :] if _seg is not None and len(_seg)
-               else LIDAR_COSTMAP.occlusion_points())
+        _op = _seg[:, 0, :] if _seg is not None and len(_seg) else None
         if _op is not None and len(_op):
             # Same selection the MPC's _pack_params does: drop boundaries sitting within
             # the fully-expanded keep-out of the GOAL (the goal is known-safe, so a phantom
@@ -450,7 +443,11 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
                       for rel, ov in obstacles]
         _d_static = None
         if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            _d_static = LIDAR_COSTMAP.distance(fwd - s0_fwd, lat - s0_lat)
+            # ABSOLUTE world (a0,a1): the circles live in world coords and distance()
+            # expects absolute queries (see the [CHK] debug and stage_cost's obstacles/
+            # goal, which are all absolute too). Passing ego-relative deltas here made the
+            # clearance huge, so the static keep-out never fired (ego drove through walls).
+            _d_static = LIDAR_COSTMAP.distance(fwd, lat)
         cost += tcost.stage_cost(
             fwd, lat, th, vv, u_k, u_km1,
             goal_xy=(goal_fwd, goal_lat), v_des=v_des_eff, t_k=(k + 1) * DT,
@@ -471,9 +468,6 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
                 v_sight_floor=V_SIGHT_FLOOR, goal_occ_clear=GOAL_OCC_CLEAR,
                 occ_horizon=OCC_HORIZON)
 
-        if VISIBILITY_COST and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-            rel_pts = np.stack([fwd - s0_fwd, lat - s0_lat], axis=1)   # (K, 2)
-            cost += W_VIS * LIDAR_COSTMAP.hidden_fraction(rel_pts)
         # (The forward-reachable-set keep-out now lives in the unified occlusion-aware block
         # above, gated on OCCLUSION_AWARE with the shared constants — see the MPC for parity.)
 
@@ -827,11 +821,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         noise_std=0.0, scenario_type=SCENARIO_STANDARD, detect_range=float("inf"), dataset_path=None,
         uncertainty=False, n_scenarios=N_SCEN, w_info=W_INFO,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
-        value_net_path=None, w_term=W_TERM, pin_episode=None,
+        pin_episode=None,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
         occlusion_aware=False, save_traj=None, show_occlusion_plot=True):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
-    global D_INFL, D_SAFE, INFO_RANGE, VALUE_NET, W_TERM, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
+    global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
@@ -846,17 +840,22 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
     print(f"[Controller] Connecting to Unity on port {port} ...")
     if detect_range < float("inf"):
         print(f"[Controller] Detection range : {detect_range:.1f} m  (obstacles beyond masked)")
-    if lidar_costmap or visibility_cost:
-        VISIBILITY_COST = visibility_cost
+    if visibility_cost:
+        # The active-perception visibility term was a product of the removed persistent
+        # occupancy grid; the circle model has no accumulated UNKNOWN volume to score.
+        print("[Controller] --visibility-cost is no longer supported (needs the removed "
+              "persistent grid) — IGNORED.")
+    VISIBILITY_COST = False
+    if lidar_costmap:
         STATIC_AVOID    = lidar_costmap
         OCCLUSION_AWARE = occlusion_aware and lidar_costmap   # occlusion terms need the map
-        from lidar_costmap import LidarCostmap
+        from obstacle_circles import ObstacleCircles
         from occlusion_capsules import OcclusionCornerTracker, point_segment_distance_np
         # max_age raised from the 0.5s default: Unity's PointCloudPublisher is configured well
         # below 10Hz (measured ~1Hz cloud_age via [DEBUG lidar]), so 0.5s made `ready` permanently
         # False and the static-avoidance/collision cost never activated. 1.5s covers ~1Hz publish
         # with margin; lower it again if the Unity publish rate is raised instead.
-        cm = LidarCostmap(max_age=1.5, enable_visibility=visibility_cost)
+        cm = ObstacleCircles(max_age=1.5)
         if cm.start(topic=lidar_topic):
             LIDAR_COSTMAP = cm
             if OCCLUSION_AWARE:
@@ -866,15 +865,12 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                 OCC_TRACKER = OcclusionCornerTracker(
                     assoc_radius=OCC_TRACK_ASSOC, alpha=OCC_TRACK_ALPHA,
                     ttl=OCC_TRACK_TTL, min_hits=OCC_TRACK_HITS)
-            feats = []
-            if lidar_costmap:    feats.append(f"static(D_SAFE={D_SAFE_STATIC:.1f}m)")
+            feats = [f"static(D_SAFE={D_SAFE_STATIC:.1f}m, circle-cover)"]
             if OCCLUSION_AWARE:  feats.append(f"occlusion(D_SAFE_OCC={D_SAFE_OCC:.1f}m, "
                                              f"v_target={V_TARGET:.1f}m/s, sightline)")
-            if visibility_cost:  feats.append(f"visibility(W_VIS={W_VIS:.1f})")
             print(f"[Controller] LiDAR map     : ON  (topic={lidar_topic}) — {' + '.join(feats)} "
-                  f"in the MPPI cost; persistent 3-state map")
+                  f"in the MPPI cost; per-scan obstacle circles")
         else:
-            VISIBILITY_COST = False
             STATIC_AVOID    = False
             OCCLUSION_AWARE = False
             print("[Controller] LiDAR map     : requested but unavailable (no rclpy) — "
@@ -1025,14 +1021,13 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                     OCC_SEGS_NOW = _s
                 else:
                     OCC_SEGS_NOW = None
-                # Accumulate the persistent-grid perception into the episode-wide union
-                # (deduped by rounded world cell) for the trajectory plot: OCC cells as
-                # static occluders, occlusion_points() as blind-corner boundaries.
+                # Accumulate the per-scan obstacle-circle centres into the episode-wide
+                # union (deduped by rounded world position) for the trajectory plot.
                 if save_traj is not None and LIDAR_COSTMAP.ready:
-                    g = LIDAR_COSTMAP.grid
-                    oi, oj = np.where(g.state == 2)
-                    for wx, wy in zip(g._o0 + (oi + 0.5) * g.res, g._o1 + (oj + 0.5) * g.res):
-                        occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
+                    _circ = LIDAR_COSTMAP.circles()
+                    if _circ is not None:
+                        for wx, wy, _r in _circ:
+                            occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
                     # Only track occlusion boundaries when occlusion-awareness is actually
                     # active — otherwise the planner ignores them and plotting them is
                     # misleading (the purple diamonds imply a constraint that isn't there).
@@ -1063,18 +1058,15 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
             u_prev    = np.array([a_cmd, delta_cmd])   # feed the Δu smoothness cost next step
 
             if LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready and ep_steps % 20 == 0:
-                g = LIDAR_COSTMAP.grid
-                oi, oj = np.where(g.state == 2)                     # OCC cells
-                op = LIDAR_COSTMAP.occlusion_points()
-                n_occ = 0 if op is None else len(op)
-                if len(oi):
-                    w0 = g._o0 + (oi + 0.5) * g.res
-                    w1 = g._o1 + (oj + 0.5) * g.res
-                    d_true  = np.min(np.hypot(w0 - s[0], w1 - s[1]))
+                _circ = LIDAR_COSTMAP.circles()
+                if _circ is not None and len(_circ):
+                    w0, w1, wr = _circ[:, 0], _circ[:, 1], _circ[:, 2]
+                    surf = np.hypot(w0 - s[0], w1 - s[1]) - wr          # clearance to surface
+                    k = int(np.argmin(surf))
                     d_field = LIDAR_COSTMAP.distance(np.array([s[0]]), np.array([s[1]]))[0]
-                    k = np.argmin(np.hypot(w0 - s[0], w1 - s[1]))
-                    print(f"[CHK] ego=({s[0]:.1f},{s[1]:.1f})  nearest OCC=({w0[k]:.1f},{w1[k]:.1f})  "
-                        f"d_true={d_true:.1f}  d_field={d_field:.1f}  nOCC={len(oi)}  nOcc_bnd={n_occ}")
+                    print(f"[CHK] ego=({s[0]:.1f},{s[1]:.1f})  nearest circle=({w0[k]:.1f},{w1[k]:.1f}"
+                          f",r={wr[k]:.1f})  d_surf={surf[k]:.1f}  d_field={d_field:.1f}  "
+                          f"nCircles={len(_circ)}")
 
 
             # Advance Python-side kinematic state to match what Unity will compute
@@ -1249,29 +1241,21 @@ if __name__ == "__main__":
                    help="Radius [m] of the uncertainty (belief-entropy) caution term. Raise it to "
                         "match --d-infl so the ego slows for ambiguous distant threats. Only used "
                         "with --uncertainty.")
-    p.add_argument("--value-net",      default=None,
-                   help="Path to a value_net checkpoint (.npz from train_value.py). Enables the "
-                        "learned terminal cost-to-go V(s,b) at MPPI rollout endpoints.")
-    p.add_argument("--w-term",         default=W_TERM, type=float,
-                   help="Weight of the learned terminal value term. 0 disables it even with "
-                        "--value-net loaded; sweep upward from 0.5. Only used with --value-net.")
     p.add_argument("--pin-episode",    default=None, type=int, metavar="SEED",
                    help="Replay one fixed scenario every episode (same ego spawn/path, same "
                         "obstacles, same timings). Use to hand-place occluders/buildings at a "
                         "known map location in the Unity editor and test against it repeatedly. "
                         "Try different SEED values to pick a location you like.")
     p.add_argument("--lidar-costmap",  action="store_true",
-                   help="Build a static-obstacle distance field from the published PointCloud2 "
-                        "each control step and add it to the MPPI cost — walls/parked aircraft/"
-                        "buildings get a uniform margin (D_SAFE_STATIC). Needs ROS 2 sourced "
-                        "(rclpy) and the ros_tcp_endpoint running.")
+                   help="Down-sample the published PointCloud2 each control step and cover the "
+                        "static obstacles (walls/parked aircraft/buildings) with circles, added "
+                        "to the MPPI cost as clearance ≥ D_SAFE_STATIC to each circle surface. "
+                        "Needs ROS 2 sourced (rclpy) and the ros_tcp_endpoint running.")
     p.add_argument("--lidar-topic",    default="/point_cloud",
                    help="PointCloud2 topic for the LiDAR map. Default: /point_cloud.")
     p.add_argument("--visibility-cost", action="store_true",
-                   help="Active-perception term: from the persistent 3-state map, penalise "
-                        "rollout endpoints from which occluded path-relevant space stays hidden, "
-                        "so the ego arcs wider to see into blind corners (self-terminating via "
-                        "memory + decay). Enables the LiDAR map; needs ROS 2 sourced.")
+                   help="DEPRECATED / no-op: the active-perception visibility term relied on the "
+                        "removed persistent occupancy grid and is ignored.")
     p.add_argument("--no-occlusion-plot", action="store_true",
                    help="omit the occlusion keep-out circles, corner centres and "
                         "ego-at-detection markers from the saved trajectory plots")
@@ -1304,8 +1288,6 @@ if __name__ == "__main__":
         d_infl=args.d_infl,
         d_safe=args.d_safe,
         info_range=args.info_range,
-        value_net_path=args.value_net,
-        w_term=args.w_term,
         pin_episode=args.pin_episode,
         lidar_costmap=args.lidar_costmap,
         lidar_topic=args.lidar_topic,

@@ -124,8 +124,8 @@ SYM_BIAS_FRAC   = 0.5    # fraction of the horizon over which the bias is applie
 # Undetected agents may emerge from occluded regions. Following the paper's
 # alternative "direct circle-sampling" formulation (the drop-in fit for a
 # monolithic IPOPT NLP, versus the bilevel capsule-projection method), each
-# occlusion BOUNDARY point (a blind-spot cell from the LiDAR costmap, see
-# LidarCostmap.occlusion_points) seeds an EXPANDING keep-out circle: a worst-case
+# occlusion BOUNDARY point (a range-jump blind-corner from ObstacleCircles.
+# occlusion_segments) seeds an EXPANDING keep-out circle: a worst-case
 # hidden agent starts on the boundary and advances at up to V_TARGET, so the
 # forbidden radius grows along the prediction horizon as V_TARGET · t_k. The
 # ego therefore gives occluded corners a wider berth the further ahead it plans.
@@ -255,7 +255,10 @@ class TaxiMPC:
         P_uprev = ca.MX.sym("uprev", nu)          # last applied control (Δu_0 + rate limit)
         P_opos  = [ca.MX.sym(f"op_{i}", 2) for i in range(self.k_obs)]  # abs obstacle pos now
         P_ovel  = [ca.MX.sym(f"ov_{i}", 2) for i in range(self.k_obs)]  # obstacle velocity
-        P_spos  = [ca.MX.sym(f"sp_{i}", 2) for i in range(self.k_static)]  # static OCC points
+        # Static keep-out CIRCLES (x, y, radius) — the obstacle-covering circles from
+        # ObstacleCircles. The per-circle radius is added to the robot margin below, so
+        # the constraint is ‖p_ego − c‖ ≥ d_safe_static + r (robot-circle vs obstacle-circle).
+        P_spos  = [ca.MX.sym(f"sp_{i}", 3) for i in range(self.k_static)]
         # Occlusion boundary SEGMENTS (ax, ay, bx, by) — the boundary LINES found by the
         # range-jump detector, expanded into capsules below. A degenerate segment
         # (a == b) collapses the capsule to a circle, so a point-based occlusion source
@@ -265,7 +268,6 @@ class TaxiMPC:
         R_act_dm  = ca.DM(R_ACT)
         R_dact_dm = ca.DM(R_DACT)
         d_safe2      = self.d_safe ** 2
-        d_safe_stat2 = self.d_safe_static ** 2
         max_dstep = MAX_STEER_RATE * DT           # per-step steering-rate cap [rad]
 
         g_eq   = [X[0] - P_s0]   # equalities: initial state + multiple-shooting defects
@@ -313,15 +315,20 @@ class TaxiMPC:
                 viol = ca.fmax(0.0, d_safe2 - d2)
                 cost += RHO_SLACK * viol + RHO_SLACK2 * viol * viol
 
-            # Static-obstacle terms (LiDAR OCC points) — fixed, no velocity.
+            # Static-obstacle terms (obstacle-covering circles) — fixed, no velocity.
+            # Keep-out and influence radii are widened by the circle's own radius r_s,
+            # so a bigger covering circle pushes the ego out proportionally.
             for i in range(self.k_static):
                 sp   = P_spos[i]
+                r_s  = sp[2]
                 dx_s = px - sp[0]
                 dy_s = py - sp[1]
                 d2s  = dx_s * dx_s + dy_s * dy_s
                 ds   = ca.sqrt(d2s + 1e-6)
-                cost += W_STATIC_RING * ca.fmax(0.0, self.d_infl_static - ds) ** 2
-                viols = ca.fmax(0.0, d_safe_stat2 - d2s)
+                r_keep_s = self.d_safe_static + r_s
+                r_infl_s = self.d_infl_static + r_s
+                cost += W_STATIC_RING * ca.fmax(0.0, r_infl_s - ds) ** 2
+                viols = ca.fmax(0.0, r_keep_s * r_keep_s - d2s)
                 cost += RHO_SLACK * viols + RHO_SLACK2 * viols * viols
 
             # Occlusion forward-reachable-set terms (Firoozi et al.). A worst-case
@@ -479,13 +486,14 @@ class TaxiMPC:
         for v2 in opos: p += v2
         for v2 in ovel: p += v2
 
-        # Static (LiDAR) keep-out points: the k_static nearest OCC cells to the ego.
+        # Static keep-out CIRCLES: the k_static nearest covering circles to the ego,
+        # each (x, y, radius).
         self._spos_used = None
         if self.k_static:
-            sp = self._nearest_points(s0, static_pts, self.k_static, STATIC_QUERY_R)
+            sp = self._nearest_circles(s0, static_pts, self.k_static, STATIC_QUERY_R)
             self._spos_used = sp                 # kept for per-step diagnostics
             for row in sp:
-                p += [float(row[0]), float(row[1])]
+                p += [float(row[0]), float(row[1]), float(row[2])]
 
         # Occlusion boundary points: the k_occ nearest blind-spot cells to the ego.
         # Drop any that sit within the (fully expanded) keep-out radius of the GOAL —
@@ -536,14 +544,17 @@ class TaxiMPC:
         return out
 
     @staticmethod
-    def _nearest_points(s0, pts, k, query_r):
-        """Pick the k nearest points (within query_r of the ego); pad far-parked if fewer."""
-        out = np.full((k, 2), 1e6)
-        if pts is not None and len(pts):
-            pts = np.asarray(pts, float)
-            d   = np.hypot(pts[:, 0] - s0[0], pts[:, 1] - s0[1])
-            near = pts[d <= query_r]
-            dn   = d[d <= query_r]
+    def _nearest_circles(s0, circles, k, query_r):
+        """Pick the k circles nearest the ego by SURFACE distance (‖p−c‖ − r), within
+        query_r; pad with far-parked zero-radius circles ([1e6, 1e6, 0]) if fewer, so
+        the parameter vector is fixed-size and pads are never active."""
+        out = np.full((k, 3), 1e6)
+        out[:, 2] = 0.0
+        if circles is not None and len(circles):
+            circles = np.asarray(circles, float).reshape(-1, 3)
+            surf = np.hypot(circles[:, 0] - s0[0], circles[:, 1] - s0[1]) - circles[:, 2]
+            near = circles[surf <= query_r]
+            dn   = surf[surf <= query_r]
             if len(near):
                 order = np.argsort(dn)[:k]
                 out[:len(order)] = near[order]
@@ -713,11 +724,12 @@ class TaxiMPC:
         if self._spos_used is not None:
             sp = self._spos_used[self._spos_used[:, 0] < 1e5]     # drop far-parked pads
             if len(sp):
-                dxy = (Xopt[1:, None, :2] - sp[None, :, :])        # (Nh, K, 2)
+                dxy = (Xopt[1:, None, :2] - sp[None, :, :2])       # (Nh, K, 2)
                 d   = np.hypot(dxy[..., 0], dxy[..., 1])
-                min_pred_stat = float(d.min())
-                max_sst = float(np.max(np.maximum(0.0,
-                                                  self.d_safe_static ** 2 - d ** 2)))
+                # Clearance/violation are to the circle SURFACE: keep-out = d_safe_static + r.
+                r_keep = self.d_safe_static + sp[None, :, 2]       # (1, K)
+                min_pred_stat = float((d - sp[None, :, 2]).min())  # nearest surface clearance
+                max_sst = float(np.max(np.maximum(0.0, r_keep ** 2 - d ** 2)))
 
         info = {"solve_ms": dt_solve * 1e3, "success": bool(ok and finite),
                 "fallback": used_fallback,
@@ -747,16 +759,16 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
 
     # ── Optional LiDAR static-obstacle keep-out (buildings / parked aircraft) ──
     # These surfaces never appear in the observation vector; they come only from
-    # the published PointCloud2 via the persistent LidarCostmap grid. Enabling this
-    # adds the K_STATIC nearest OCC-cell keep-out points to the MPC each step; with
-    # --occlusion-aware, the grid's occlusion_points() (blind-corner cells) seed the
-    # K_OCC expanding forward-reachable-set keep-outs.
+    # the published PointCloud2. Each scan is down-sampled and covered with circles
+    # (ObstacleCircles); the K_STATIC nearest are fed as keep-out circles to the MPC.
+    # With --occlusion-aware, the range-jump blind-corner SEGMENTS seed the K_OCC
+    # expanding forward-reachable-set keep-outs.
     costmap  = None
     k_static = 0
     k_occ    = 0
     if lidar_costmap:
-        from lidar_costmap import LidarCostmap
-        cm = LidarCostmap(max_age=1.5, enable_visibility=False)
+        from obstacle_circles import ObstacleCircles
+        cm = ObstacleCircles(max_age=1.5)
         if cm.start(topic=lidar_topic):
             costmap  = cm
             k_static = K_STATIC
@@ -765,8 +777,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
             if occlusion_aware:
                 k_occ = K_OCC
                 # Declare the scan geometry so range-jump boundary SEGMENTS (capsules)
-                # are available; without this the costmap falls back to accumulated
-                # blind-spot points, whose capsules degenerate to circles.
+                # are available.
                 cm.configure_scan(SCAN_FOV_H, SCAN_FOV_V, SCAN_RES_H, SCAN_RES_V,
                                   SCAN_MAX_RANGE)
                 print(f"[MPC] Occlusion-aware: ON  — forward reachable sets K_OCC={K_OCC}, "
@@ -905,22 +916,16 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                 ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
                 costmap.update(ego_fwd)
                 if costmap.ready:
-                    g = costmap.grid
-                    oi, oj = np.where(g.state == 2)              # OCC cells
-                    if len(oi):
-                        static_pts = np.column_stack((
-                            g._o0 + (oi + 0.5) * g.res,          # world a0 (Unity Z)
-                            g._o1 + (oj + 0.5) * g.res))         # world a1 (Unity X)
+                    static_pts = costmap.circles()               # (M,3) world [a0, a1, r]
+                    if static_pts is not None and len(static_pts):
                         n_static = len(static_pts)
                         if save_traj is not None:
-                            # Dedup by rounded world cell so the union stays bounded.
-                            for wx, wy in static_pts:
+                            # Dedup by rounded world centre so the union stays bounded.
+                            for wx, wy, _r in static_pts:
                                 occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
                     if k_occ:
                         # Range-jump boundary SEGMENTS (this scan) seed the expanding
-                        # keep-outs. They need configure_scan(); when that wasn't called
-                        # this returns None and the accumulated blind-spot POINTS are
-                        # used instead.
+                        # keep-outs. They need configure_scan().
                         occ_segs = costmap.occlusion_segments(
                             ego_fwd=ego_fwd,
                             fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
@@ -934,9 +939,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                             # episode plot all show the same geometry.
                             occ_segs = occ_segs.copy()
                             occ_segs[:, 1, :] = occ_segs[:, 0, :]
-                        occ_pts  = costmap.occlusion_points()    # blind-spot boundary cells
-                        n_occ    = (len(occ_segs) if occ_segs is not None
-                                    else (0 if occ_pts is None else len(occ_pts)))
+                        n_occ    = (len(occ_segs) if occ_segs is not None else 0)
 
             # ── MPC solve ─────────────────────────────────────────────────────
             # MPC state is [x, y, theta, v, accel]; delta_actual is not a state
@@ -1126,11 +1129,11 @@ if __name__ == "__main__":
     p.add_argument("--pin-episode",    default=None, type=int, metavar="SEED",
                    help="Replay one fixed scenario every episode.")
     p.add_argument("--lidar-costmap",  action="store_true",
-                   help="Build a static-obstacle keep-out from the published PointCloud2 each "
-                        "step and add the K_STATIC nearest OCC points to the MPC — walls/parked "
-                        "aircraft/buildings get a D_SAFE_STATIC margin. Needs ROS 2 sourced (rclpy) "
-                        "and the ros_tcp_endpoint running. WITHOUT this the MPC only avoids the "
-                        "dynamic obstacles in the observation vector.")
+                   help="Down-sample the published PointCloud2 each step and cover the static "
+                        "obstacles with circles; the K_STATIC nearest are added to the MPC as "
+                        "keep-out constraints ‖p_ego−c‖ ≥ D_SAFE_STATIC + r. Needs ROS 2 sourced "
+                        "(rclpy) and the ros_tcp_endpoint running. WITHOUT this the MPC only avoids "
+                        "the dynamic obstacles in the observation vector.")
     p.add_argument("--lidar-topic",    default="/point_cloud",
                    help="PointCloud2 topic for the LiDAR map. Default: /point_cloud.")
     p.add_argument("--no-occlusion-plot", action="store_true",
