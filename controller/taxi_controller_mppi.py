@@ -32,9 +32,6 @@ import time
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.base_env import ActionTuple
 from mlagents_envs.exception import UnityCommunicatorStoppedException
-from mlagents_envs.side_channel.environment_parameters_channel import (
-    EnvironmentParametersChannel,
-)
 import quadprog
 
 from occlusion_capsules import occlusion_stage_cost
@@ -210,21 +207,6 @@ DETECTION_RANGE = float("inf")   # default: oracle (off). Set via --detect-range
 # Number of obstacles packed in the observation vector (must match TaxiAgent K_OBS)
 K_OBS    = 3
 OBS_SIZE = 4 + K_OBS * 4 + 2 + 2   # 20: ego(4) + K_OBS*4 + goal(1) + cbf_h(1) + tangent(2)
-
-# Scenario types — int value pushed as 'scenario_type' side channel. Also used as the
-# RL task_id in the recorded dataset. IDs 0-4 are the original scenarios (shared with
-# Unity's ScenarioType enum); 5-7 are appended tasks whose Unity behaviours are added
-# in a follow-up (the Python plumbing here is forward-compatible with the append plan).
-SCENARIO_STANDARD         = 0   # difficulty-based perpendicular crossing conflict
-SCENARIO_HEADON           = 1   # oncoming traffic on the ego's own taxiway
-SCENARIO_FOLLOW           = 2   # follow a lead vehicle to the same goal; lead randomly stops/accelerates
-SCENARIO_INTERSECTION     = 3   # ego on one taxiway branch, crosser on the other — meet at node
-SCENARIO_RUNWAY_INCURSION = 4   # ego drives on a runway; a vehicle holds short and may incur onto it
-SCENARIO_CONVERGING       = 5   # agents spawn FAR on a ring and home toward the ego from multiple
-                                # bearings — a long-range converging threat (tests early/long-range
-                                # planning via D_INFL, not close-in avoidance)
-SCENARIO_NAMES = ['standard', 'headon', 'follow_vehicle', 'intersection',
-                  'runway_incursion', 'converging']
 
 rng = np.random.default_rng(42)
 
@@ -547,134 +529,16 @@ def identify_bicycle_model(env, behavior_name, n_steps=200):
         print("[SysID] Not enough data — is the Unity environment running?")
 
 
-# ── Scenario sweep ────────────────────────────────────────────────────────────
-
-DT_SPAN        = 0.8    # was 3.0 — episodes with |Δt|>~1.3s are self-clearing (the
-                        # crosser vacates the conflict point before the ego arrives) and
-                        # can never collide regardless of controller. Narrowing to ±0.8s
-                        # concentrates the sweep on the timing window where genuine
-                        # conflicts live, shrinking the "dud" tail that dilutes the rate.
-JITTER_DT      = 0.15
-SPEED_JIT      = 0.10
-BASE_SEED      = 1234
-CONFLICT_Z_MAX = 20.0   # max Z shift of conflict point along taxiway [m]
-
-# An episode is a "dud" (no genuine conflict) if no obstacle ever came within this
-# distance of the ego — the paths never intersected in space/time, so a collision
-# was physically impossible and the episode only dilutes the reported rate. The
-# conditional rate (collisions / genuine-conflict episodes) is the meaningful metric.
-DUD_DIST = 30.0   # [m] — min_dist above this ⇒ episode excluded from conditional rate
-
-# Lever 1 — speed scales with difficulty ONLY for head-on (longitudinal) conflicts,
-# where higher closing speed genuinely compresses the reaction window. For
-# PERPENDICULAR crossers (standard) a faster mover spends LESS time in
-# the conflict zone (t_window ~ vehicle_size / speed), so speed scaling makes
-# crossings EASIER, not harder — confirmed empirically. Crossers stay slow so they
-# linger in the conflict zone; difficulty is raised via Lever 2 (compound conflicts)
-# instead.
-SPEED_CROSS_BASE   = 5.0    # perpendicular crosser speed [m/s] — kept low on purpose
-SPEED_HEADON_MIN   = 5.0    # head-on closing speed at difficulty 0 [m/s]
-SPEED_HEADON_MAX   = 12.0   # head-on closing speed at difficulty 1 [m/s]
-# Distance ahead of the ego where the head-on meet point sits (the oncoming agent spawns further
-# ahead still and drives back to it). Larger = agents appear further away, giving the ego more
-# reaction room before the pass. Pushed to Unity as 'head_on_gap'; only the head-on scenario reads it.
-HEADON_APPROACH_GAP = 90.0
-
-# Converging scenario — homing agents that spawn on a ring around the ego and drive at it.
-# Spawn distance is deliberately large so the ego reacts at long range (raise D_INFL to match);
-# closing speed ramps modestly with difficulty (faster convergence = tighter reaction window).
-CONVERGE_SPAWN_DIST = 70.0  # ring radius [m] agents spawn on around the ego (pushed to Unity)
-SPEED_CONVERGE_MIN  = 4.0   # homing speed at difficulty 0 [m/s]
-SPEED_CONVERGE_MAX  = 8.0   # homing speed at difficulty 1 [m/s]
-
-# Lever 3 — concentrate Δt near the conflict (was a uniform linspace).
-# A power-warped grid keeps the full [-DT_SPAN, DT_SPAN] coverage at the
-# extremes but packs most episodes near Δt=0 where genuine conflicts live,
-# raising difficulty density and shrinking the no-conflict "dud" tail.
-DT_CONCENTRATION = 1.0  # with the narrowed ±0.8s span the whole grid is already in
-                        # the conflict window, so no extra warping is needed (1.0=uniform)
-
-# Fix A — episode reach: agents are placed so they arrive at the conflict point
-# within egoTtc + dtOffset seconds. Reducing reach shrinks how far ahead
-# Unity searches for intersections, so agents spawn CLOSE to the conflict
-# (short upstream arc) and actually arrive during the episode.
-# At V_DES=8 m/s, 20 s caps intersections to ~160 m ahead — agents at most
-# 100-120 m upstream at spd=5 m/s, arriving in ~20-24 s well within timeout.
-EPISODE_REACH_SECONDS = 20.0   # pushed to Unity as "episode_reach_seconds" each episode
-MAX_GOAL_DIST         = 180.0  # cap the ego goal [m] so long (runway-length) paths don't taxi to
-                               # timeout after the encounter. Pushed to Unity as "max_goal_dist".
-
-
-def make_scenarios(n_episodes, base_seed=BASE_SEED, min_difficulty=0.0, max_difficulty=1.0,
-                   scenario_type=SCENARIO_STANDARD):
-    """
-    Build a reproducible list of per-episode scenario parameter dicts.
-
-    Each dict is pushed to Unity via EnvironmentParametersChannel before env.reset().
-    Keys:
-      incursion_dt    — Δt offset for the primary (agent[0]) incursion [s]
-      ambulance_speed — crossing speed for agent[0] [m/s]
-      difficulty      — [0, 1] curriculum difficulty sent to ScenarioManager
-
-    min_difficulty / max_difficulty clamp the ramp so you can test a specific
-    difficulty band. E.g. min_difficulty=0.85 forces 3-agent Erratic scenarios.
-    """
-    # Lever 3: power-warp a uniform [-1, 1] grid so density concentrates near 0
-    # while the extremes still reach ±DT_SPAN (full timing coverage preserved).
-    u    = np.linspace(-1.0, 1.0, n_episodes)
-    grid = DT_SPAN * np.sign(u) * np.abs(u) ** DT_CONCENTRATION
-    scenarios = []
-    for i, dt in enumerate(grid):
-        r = np.random.default_rng(base_seed + i)
-        # Difficulty is drawn INDEPENDENTLY of Δt so the (Δt × difficulty) plane is
-        # actually sampled, not walked along its diagonal. (Previously difficulty
-        # ramped with the episode index, perfectly correlating it with Δt and making
-        # it impossible to attribute a failure to timing vs. scenario complexity.)
-        # The Δt grid still spans [-DT_SPAN, DT_SPAN] for full timing coverage.
-        difficulty = float(r.uniform(min_difficulty, max_difficulty))
-        # Scenario type: forced when scenario_type >= 0, else drawn per-episode from the
-        # active list ("mixed" mode, scenario_type = -1). Runway incursion is excluded from
-        # mixed mode — it needs runway geometry that only some episodes can place — so run it
-        # explicitly via --scenario runway_incursion. Converging is likewise explicit-only: it is
-        # a distinct long-range regime best run with an enlarged D_INFL (--d-infl).
-        _active_types = [SCENARIO_STANDARD, SCENARIO_HEADON,
-                         SCENARIO_FOLLOW, SCENARIO_INTERSECTION]
-        stype = float(scenario_type) if scenario_type >= 0 else float(r.choice(_active_types))
-        desired_spd = -1.0
-        # Lever 1: only head-on closing speed ramps with difficulty; perpendicular
-        # crossers stay slow (so they linger in the conflict zone).
-        if stype == SCENARIO_HEADON:
-            spd_base = SPEED_HEADON_MIN + (SPEED_HEADON_MAX - SPEED_HEADON_MIN) * difficulty
-        elif stype == SCENARIO_CONVERGING:
-            spd_base = SPEED_CONVERGE_MIN + (SPEED_CONVERGE_MAX - SPEED_CONVERGE_MIN) * difficulty
-        else:
-            spd_base = SPEED_CROSS_BASE
-        scenarios.append({
-            "episode_seed":      float(base_seed + i),   # deterministic Unity path/obstacle selection
-            "incursion_dt":      float(dt + r.uniform(-JITTER_DT, JITTER_DT)),
-            "ambulance_speed":   float(spd_base * (1.0 + r.uniform(-SPEED_JIT, SPEED_JIT))),
-            "difficulty":        difficulty,
-            "conflict_z_offset": float(r.uniform(-CONFLICT_Z_MAX, CONFLICT_Z_MAX)),
-            "cross_dir_sign":    float(r.choice([-1.0, 1.0])),
-            "scenario_type":     stype,
-            "desired_speed":     desired_spd,
-            "head_on_prob":           0.3 if stype == SCENARIO_HEADON else 0.0,
-            "episode_reach_seconds":  EPISODE_REACH_SECONDS,
-            "max_goal_dist":          MAX_GOAL_DIST,         # cap ego goal so long paths don't run to timeout
-            "converge_spawn_dist":    CONVERGE_SPAWN_DIST,   # ring radius; only used by SCENARIO_CONVERGING
-            "head_on_gap":            HEADON_APPROACH_GAP,   # meet/spawn distance; only used by SCENARIO_HEADON
-        })
-    return scenarios
-
-
 # ── Main control loop ─────────────────────────────────────────────────────────
 
-def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts=None,
+def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=None,
                      occ_segments=None, capsule_horizon=None,
                      max_capsules=12, single_radius=False, show_expansion=True,
                      occ_ego=None, show_occlusion=True):
-    """Persist one episode's ego trajectory as CSV + a top-down PNG plot.
+    """Persist the run's ego trajectory as CSV + a top-down PNG plot.
 
+    verdict: short outcome tag ("reached" / "collision" / "timeout") used in the
+    output filename and plot title.
     traj columns: t, x, y, theta, v, a_cmd, delta_cmd  (x=Unity Z, y=Unity X).
     obs_track (optional): (N, 3) array of per-step dynamic-obstacle world
     positions (t, x, y), same frame as traj — overlaid on the plot.
@@ -705,8 +569,7 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
     """
     import os
     os.makedirs(out_dir, exist_ok=True)
-    verdict = "collision" if ep_log["collided"] else ("reached" if ep_log["reached"] else "timeout")
-    stem = os.path.join(out_dir, f"ep{ep+1:03d}_{ep_log['scenario']}_{verdict}")
+    stem = os.path.join(out_dir, f"traj_{verdict}")
 
     header = "t,x,y,theta,v,a_cmd,delta_cmd"
     np.savetxt(f"{stem}.csv", traj, delimiter=",", header=header, comments="")
@@ -808,7 +671,7 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
     ax.set_ylim(cy - half, cy + half)
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
-    ax.set_title(f"Ep {ep+1} — {ep_log['scenario']} — {verdict}")
+    ax.set_title(f"trajectory — {verdict}")
     ax.legend(loc="best"); ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(f"{stem}.png", dpi=120)
@@ -816,12 +679,10 @@ def _save_trajectory(out_dir, ep, ep_log, goal_xy, traj, obs_track=None, occ_pts
     print(f"[traj] saved {stem}.csv and {stem}.png")
 
 
-def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
-        min_difficulty=0.0, max_difficulty=1.0,
-        noise_std=0.0, scenario_type=SCENARIO_STANDARD, detect_range=float("inf"), dataset_path=None,
+def run(unity_exec_path=None, port=5004, run_sysid=True,
+        noise_std=0.0, detect_range=float("inf"),
         uncertainty=False, n_scenarios=N_SCEN, w_info=W_INFO,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
-        pin_episode=None,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
         occlusion_aware=False, save_traj=None, show_occlusion_plot=True):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
@@ -877,13 +738,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
                   "running WITHOUT LiDAR-based costs")
     elif occlusion_aware:
         print("[Controller] Occlusion-aware : requested but needs --lidar-costmap — DISABLED")
-    env_params = EnvironmentParametersChannel()
     env = UnityEnvironment(
         file_name=unity_exec_path,
         base_port=port,
         seed=42,
         no_graphics=unity_exec_path is not None,  # headless when running a build
-        side_channels=[env_params],
     )
     env.reset()
 
@@ -908,301 +767,196 @@ def run(unity_exec_path=None, port=5004, run_sysid=True, n_episodes=20,
         identify_bicycle_model(env, behavior_name)
         env.reset()
 
-    scenarios     = make_scenarios(n_episodes, min_difficulty=min_difficulty,
-                                              max_difficulty=max_difficulty,
-                                              scenario_type=scenario_type)
-    # --pin-episode: replay ONE fixed scenario every episode. The pinned episode_seed makes
-    # Unity's per-episode RNG (ego path pick, obstacle assignment, timings) fully deterministic,
-    # so the ego spawns at the SAME map location each episode — for hand-placing occluders /
-    # buildings in the editor and iterating on one repeatable situation.
-    if pin_episode is not None:
-        pinned = make_scenarios(1, base_seed=pin_episode,
-                                min_difficulty=min_difficulty,
-                                max_difficulty=max_difficulty,
-                                scenario_type=scenario_type)[0]
-        scenarios = [dict(pinned) for _ in range(n_episodes)]
-        print(f"[Controller] Pinned episode  : seed={pin_episode} — identical scenario every "
-              f"episode (ego path, obstacles, timings all repeat)")
-    episode_stats = []
-    # Unity (Editor or build) can exit mid-run — most often the Editor drops Play mode because a
-    # script recompiled, or the window was closed. That surfaces as UnityCommunicatorStoppedException
-    # from env.step(); catch it so we still print the summary for the episodes that DID complete
-    # instead of dying with a traceback and losing the recorded dataset.
+    # Unity (Editor or build) can exit mid-run — most often the Editor drops Play mode because
+    # a script recompiled, or the window was closed. That surfaces as
+    # UnityCommunicatorStoppedException from env.step(); catch it so the run ends cleanly (and
+    # still writes its trajectory) instead of dying with a traceback.
     unity_stopped = False
-    for ep in range(n_episodes):
-        mean   = np.zeros((H_MPPI, 2))
-        sc     = scenarios[ep]
-        task_id = int(sc["scenario_type"])
-        ep_log = {"min_h": np.inf, "min_dist": np.inf,
-                  "collided": False, "reached": False, "steps": 0,
-                  "incursion_dt": sc["incursion_dt"],
-                  "difficulty": sc["difficulty"],
-                  "scenario": SCENARIO_NAMES[task_id]}
-        traj = []   # per-step ego pose log for this episode: (t, x, y, theta, v, a_cmd, delta_cmd)
-        obs_track = []   # per-step obstacle world positions: list of (t, x, y) rows
-        # Union across the episode (deduped by rounded world cell) of the static
-        # occluders and occlusion boundaries the perception produced. The OA-MPC
-        # perception is frame-based (no memory), so a single end-of-run snapshot only
-        # shows what is visible at the goal — accumulate to show the full extent the
-        # ego actually reacted to, matching the MPC controller's trajectory plot.
-        occ_seen = {}    # static occluder points  → plotted as "static occluders"
-        occ_track = {}   # tracked occlusion boundaries, keyed on stable track id
-        prev_obs = None
-        prev_act = None
+    mean      = np.zeros((H_MPPI, 2))
+    min_h     = np.inf
+    min_dist  = np.inf
+    collided  = False
+    reached   = False
+    traj      = []   # per-step ego pose: (t, x, y, theta, v, a_cmd, delta_cmd)
+    obs_track = []   # per-step obstacle world positions: list of (t, x, y) rows
+    # Union across the run (deduped by rounded world cell) of the static occluders and
+    # occlusion boundaries the perception produced. Perception is frame-based (no memory),
+    # so a single end-of-run snapshot only shows what is visible at the goal — accumulate to
+    # show the full extent the ego actually reacted to.
+    occ_seen  = {}   # static occluder points  → plotted as "static occluders"
+    occ_track = {}   # tracked occlusion boundaries, keyed on stable track id
 
-        for key, val in sc.items():
-            env_params.set_float_parameter(key, val)
+    env.reset()
+    decision_steps, terminal_steps = env.get_steps(behavior_name)
 
-        sname = SCENARIO_NAMES[int(sc["scenario_type"])]
-        print(f"\n[Ep {ep+1:3d}] [{sname}] Δt={sc['incursion_dt']:+.2f}s  "
-              f"v_amb={sc['ambulance_speed']:.2f} m/s  "
-              f"diff={sc['difficulty']:.2f}  "
-              f"noise={noise_std:.3f}  "
-              f"dir={'L' if sc['cross_dir_sign'] < 0 else 'R'}")
+    ep_steps     = 0
+    delta_actual = 0.0   # tracked Python-side to feed into MPPI state
+    accel_actual = 0.0
+    u_prev       = np.zeros(2)   # last applied [a, delta], for the MPPI Δu smoothness cost
+    episode_done = False
 
+    while not episode_done:
+        # ── Terminal step (episode just ended) ──────────────────────────────
+        if len(terminal_steps) > 0:
+            collided = min_h < 0.
+            reached  = not terminal_steps.interrupted[0] and not collided
+            episode_done = True
+            break
+
+        if len(decision_steps) == 0:
+            env.step()
+            decision_steps, terminal_steps = env.get_steps(behavior_name)
+            continue
+
+        obs   = decision_steps.obs[0][0]          # shape (OBS_SIZE,)
+        ep_steps += 1
+
+        obs_n = inject_sensor_noise(obs, noise_std, rng)
+        s, obstacles, goal_xy = obs_to_state(obs_n, delta_actual, accel_actual)
+
+        # Rebuild the LiDAR map from the latest cloud+pose, scrubbing returns near
+        # the known dynamic agents (the oracle handles those). ego_fwd (world a0,a1)
+        # orients the visibility ROI wedge — same axes as the mppi rollout frame.
+        if LIDAR_COSTMAP is not None:
+            ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
+            LIDAR_COSTMAP.update(ego_fwd)
+            # Detect + track occlusion boundaries ONCE per control step, exactly as the
+            # MPC's run loop does, then hand the result to both the planner and the
+            # plot recorder. Previously mppi() re-queried and the recorder called the
+            # tracker again with None, so the tracker advanced twice per step and the
+            # plot lagged the planner by one step.
+            if OCCLUSION_AWARE and OCC_TRACKER is not None and LIDAR_COSTMAP.ready:
+                _s = LIDAR_COSTMAP.occlusion_segments(
+                    ego_fwd=ego_fwd, fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
+                _s = OCC_TRACKER.update(_s, time.monotonic())
+                if _s is not None and len(_s):
+                    # Circle keep-out ⇒ collapse each boundary onto its corner (as the
+                    # MPC does), so cost and plot use identical geometry.
+                    _s = _s.copy()
+                    _s[:, 1, :] = _s[:, 0, :]
+                OCC_SEGS_NOW = _s
+            else:
+                OCC_SEGS_NOW = None
+            # Accumulate the per-scan obstacle-circle centres into the episode-wide
+            # union (deduped by rounded world position) for the trajectory plot.
+            if save_traj is not None and LIDAR_COSTMAP.ready:
+                _circ = LIDAR_COSTMAP.circles()
+                if _circ is not None:
+                    for wx, wy, _r in _circ:
+                        occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
+                # Only track occlusion boundaries when occlusion-awareness is actually
+                # active — otherwise the planner ignores them and plotting them is
+                # misleading (the purple diamonds imply a constraint that isn't there).
+                if OCCLUSION_AWARE and OCC_TRACKER is not None:
+                    # Record the TRACKED range-jump boundaries within OCC_QUERY_R,
+                    # keyed on stable track id so a corner re-seen across scans is ONE
+                    # entry, not a smear of jittered near-duplicates. Value keeps the
+                    # ego pose + episode time of the first sighting.
+                    _segs = OCC_SEGS_NOW
+                    if _segs is not None and len(_segs):
+                        _tids = OCC_TRACKER.ids()
+                        _ego = np.array([s[0], s[1]])
+                        for _i, _sg in enumerate(_segs):
+                            if _i >= len(_tids):
+                                break
+                            if point_segment_distance_np(_ego[None, :], _sg[0],
+                                                         _sg[1])[0] <= OCC_QUERY_R:
+                                occ_track.setdefault(
+                                    _tids[_i], (_sg[0][0], _sg[0][1], _sg[1][0],
+                                                _sg[1][1], s[0], s[1], ep_steps * DT))
+        u_nom, mean = mppi(s, mean, obstacles, goal_xy, u_prev)
+
+        u_cmd      = u_nom
+        cbf_engaged = False
+
+        a_cmd     = float(np.clip(u_cmd[0], A_MIN, A_MAX))
+        delta_cmd = float(np.clip(u_cmd[1], -DELTA_LIM, DELTA_LIM))
+        u_prev    = np.array([a_cmd, delta_cmd])   # feed the Δu smoothness cost next step
+
+        if LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready and ep_steps % 20 == 0:
+            _circ = LIDAR_COSTMAP.circles()
+            if _circ is not None and len(_circ):
+                w0, w1, wr = _circ[:, 0], _circ[:, 1], _circ[:, 2]
+                surf = np.hypot(w0 - s[0], w1 - s[1]) - wr          # clearance to surface
+                k = int(np.argmin(surf))
+                d_field = LIDAR_COSTMAP.distance(np.array([s[0]]), np.array([s[1]]))[0]
+                print(f"[CHK] ego=({s[0]:.1f},{s[1]:.1f})  nearest circle=({w0[k]:.1f},{w1[k]:.1f}"
+                      f",r={wr[k]:.1f})  d_surf={surf[k]:.1f}  d_field={d_field:.1f}  "
+                      f"nCircles={len(_circ)}")
+
+
+        # Advance Python-side kinematic state to match what Unity will compute
+        v = s[3]
+        speed_frac   = min(v / max(STEER_ROLLOFF_SPD, 1e-3), 1.0)
+        eff_limit    = DELTA_LIM * (1.0 - speed_frac * (1.0 - STEER_ROLLOFF_MIN))
+        delta_target = float(np.clip(delta_cmd, -eff_limit, eff_limit))
+        delta_actual = delta_actual + float(np.clip(
+            delta_target - delta_actual, -MAX_STEER_RATE * DT, MAX_STEER_RATE * DT))
+        if ACCEL_TAU > 1e-3:
+            accel_actual += (float(np.clip(a_cmd, A_MIN, A_MAX)) - accel_actual) * (DT / ACCEL_TAU)
+        else:
+            accel_actual = float(np.clip(a_cmd, A_MIN, A_MAX))
+
+        # Log nearest obstacle distance — measured directly from geometry (min |rel_xy|) so it's
+        # correct regardless of the Unity-side dSafe baked into obs[17]. (Back-computing it from
+        # obs[17] + D_SAFE² read 0.00 whenever the retuned Python D_SAFE < Unity's dSafe.)
+        h_val = float(obs[17])
+        dist  = float(min((np.hypot(rel[0], rel[1]) for rel, _ in obstacles), default=np.inf))
+        min_h    = min(min_h, h_val)
+        min_dist = min(min_dist, dist)
+
+
+        # Record ego pose this step (world frame: x=Unity Z, y=Unity X).
+        traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd))
+        # Record obstacle world positions this step (rel_xy is ego-relative world coords).
+        for rel, _ov in obstacles:
+            obs_track.append((ep_steps * DT, s[0] + rel[0], s[1] + rel[1]))
+
+        action = ActionTuple(
+            continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)
+        )
+        env.set_actions(behavior_name, action)
         try:
-            env.reset()
+            env.step()
         except UnityCommunicatorStoppedException:
             unity_stopped = True
             break
         decision_steps, terminal_steps = env.get_steps(behavior_name)
 
-        ep_steps     = 0
-        delta_actual = 0.0   # tracked Python-side to feed into MPPI state
-        accel_actual = 0.0
-        u_prev       = np.zeros(2)   # last applied [a, delta], for the MPPI Δu smoothness cost
-        episode_done = False
-        # Re-seed MPPI per episode so CBF vs no-CBF runs are directly comparable.
-        rng = np.random.default_rng(BASE_SEED + ep)
-
-        while not episode_done:
-            # ── Terminal step (episode just ended) ──────────────────────────────
-            if len(terminal_steps) > 0:
-                ep_log["collided"] = ep_log["min_h"] < 0.
-                ep_log["reached"]  = not terminal_steps.interrupted[0] and not ep_log["collided"]
-                # Close out the final transition with the terminal obs + terminal reward.
-                if prev_obs is not None:
-                    term_reward = -20.0 if ep_log["collided"] else 10.0
-                    final_obs   = terminal_steps.obs[0][0]
-                episode_done = True
-                break
-
-            if len(decision_steps) == 0:
-                env.step()
-                decision_steps, terminal_steps = env.get_steps(behavior_name)
-                continue
-
-            obs   = decision_steps.obs[0][0]          # shape (OBS_SIZE,)
-            ep_steps += 1
-
-            obs_n = inject_sensor_noise(obs, noise_std, rng)
-            s, obstacles, goal_xy = obs_to_state(obs_n, delta_actual, accel_actual)
-
-            # Rebuild the LiDAR map from the latest cloud+pose, scrubbing returns near
-            # the known dynamic agents (the oracle handles those). ego_fwd (world a0,a1)
-            # orients the visibility ROI wedge — same axes as the mppi rollout frame.
-            if LIDAR_COSTMAP is not None:
-                ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
-                LIDAR_COSTMAP.update(ego_fwd)
-                # Detect + track occlusion boundaries ONCE per control step, exactly as the
-                # MPC's run loop does, then hand the result to both the planner and the
-                # plot recorder. Previously mppi() re-queried and the recorder called the
-                # tracker again with None, so the tracker advanced twice per step and the
-                # plot lagged the planner by one step.
-                if OCCLUSION_AWARE and OCC_TRACKER is not None and LIDAR_COSTMAP.ready:
-                    _s = LIDAR_COSTMAP.occlusion_segments(
-                        ego_fwd=ego_fwd, fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
-                    _s = OCC_TRACKER.update(_s, time.monotonic())
-                    if _s is not None and len(_s):
-                        # Circle keep-out ⇒ collapse each boundary onto its corner (as the
-                        # MPC does), so cost and plot use identical geometry.
-                        _s = _s.copy()
-                        _s[:, 1, :] = _s[:, 0, :]
-                    OCC_SEGS_NOW = _s
-                else:
-                    OCC_SEGS_NOW = None
-                # Accumulate the per-scan obstacle-circle centres into the episode-wide
-                # union (deduped by rounded world position) for the trajectory plot.
-                if save_traj is not None and LIDAR_COSTMAP.ready:
-                    _circ = LIDAR_COSTMAP.circles()
-                    if _circ is not None:
-                        for wx, wy, _r in _circ:
-                            occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
-                    # Only track occlusion boundaries when occlusion-awareness is actually
-                    # active — otherwise the planner ignores them and plotting them is
-                    # misleading (the purple diamonds imply a constraint that isn't there).
-                    if OCCLUSION_AWARE and OCC_TRACKER is not None:
-                        # Record the TRACKED range-jump boundaries within OCC_QUERY_R,
-                        # keyed on stable track id so a corner re-seen across scans is ONE
-                        # entry, not a smear of jittered near-duplicates. Value keeps the
-                        # ego pose + episode time of the first sighting.
-                        _segs = OCC_SEGS_NOW
-                        if _segs is not None and len(_segs):
-                            _tids = OCC_TRACKER.ids()
-                            _ego = np.array([s[0], s[1]])
-                            for _i, _sg in enumerate(_segs):
-                                if _i >= len(_tids):
-                                    break
-                                if point_segment_distance_np(_ego[None, :], _sg[0],
-                                                             _sg[1])[0] <= OCC_QUERY_R:
-                                    occ_track.setdefault(
-                                        _tids[_i], (_sg[0][0], _sg[0][1], _sg[1][0],
-                                                    _sg[1][1], s[0], s[1], ep_steps * DT))
-            u_nom, mean = mppi(s, mean, obstacles, goal_xy, u_prev)
-
-            u_cmd      = u_nom
-            cbf_engaged = False
-
-            a_cmd     = float(np.clip(u_cmd[0], A_MIN, A_MAX))
-            delta_cmd = float(np.clip(u_cmd[1], -DELTA_LIM, DELTA_LIM))
-            u_prev    = np.array([a_cmd, delta_cmd])   # feed the Δu smoothness cost next step
-
-            if LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready and ep_steps % 20 == 0:
-                _circ = LIDAR_COSTMAP.circles()
-                if _circ is not None and len(_circ):
-                    w0, w1, wr = _circ[:, 0], _circ[:, 1], _circ[:, 2]
-                    surf = np.hypot(w0 - s[0], w1 - s[1]) - wr          # clearance to surface
-                    k = int(np.argmin(surf))
-                    d_field = LIDAR_COSTMAP.distance(np.array([s[0]]), np.array([s[1]]))[0]
-                    print(f"[CHK] ego=({s[0]:.1f},{s[1]:.1f})  nearest circle=({w0[k]:.1f},{w1[k]:.1f}"
-                          f",r={wr[k]:.1f})  d_surf={surf[k]:.1f}  d_field={d_field:.1f}  "
-                          f"nCircles={len(_circ)}")
-
-
-            # Advance Python-side kinematic state to match what Unity will compute
-            v = s[3]
-            speed_frac   = min(v / max(STEER_ROLLOFF_SPD, 1e-3), 1.0)
-            eff_limit    = DELTA_LIM * (1.0 - speed_frac * (1.0 - STEER_ROLLOFF_MIN))
-            delta_target = float(np.clip(delta_cmd, -eff_limit, eff_limit))
-            delta_actual = delta_actual + float(np.clip(
-                delta_target - delta_actual, -MAX_STEER_RATE * DT, MAX_STEER_RATE * DT))
-            if ACCEL_TAU > 1e-3:
-                accel_actual += (float(np.clip(a_cmd, A_MIN, A_MAX)) - accel_actual) * (DT / ACCEL_TAU)
-            else:
-                accel_actual = float(np.clip(a_cmd, A_MIN, A_MAX))
-
-            # Log nearest obstacle distance — measured directly from geometry (min |rel_xy|) so it's
-            # correct regardless of the Unity-side dSafe baked into obs[17]. (Back-computing it from
-            # obs[17] + D_SAFE² read 0.00 whenever the retuned Python D_SAFE < Unity's dSafe.)
-            h_val = float(obs[17])
-            dist  = float(min((np.hypot(rel[0], rel[1]) for rel, _ in obstacles), default=np.inf))
-            ep_log["min_h"]    = min(ep_log["min_h"], h_val)
-            ep_log["min_dist"] = min(ep_log["min_dist"], dist)
-            ep_log["steps"]    = ep_steps
-
-
-            # Record ego pose this step (world frame: x=Unity Z, y=Unity X).
-            traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd))
-            # Record obstacle world positions this step (rel_xy is ego-relative world coords).
-            for rel, _ov in obstacles:
-                obs_track.append((ep_steps * DT, s[0] + rel[0], s[1] + rel[1]))
-
-            action = ActionTuple(
-                continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)
-            )
-            prev_obs = obs_n.copy()
-            prev_act = np.array([a_cmd, delta_cmd], dtype=np.float32)
-
-
-            env.set_actions(behavior_name, action)
-            try:
-                env.step()
-            except UnityCommunicatorStoppedException:
-                unity_stopped = True
-                break
-            decision_steps, terminal_steps = env.get_steps(behavior_name)
-
-        if unity_stopped:      # Unity exited mid-episode — don't log a partial episode
-            break
-        episode_stats.append(ep_log)
-
-        if save_traj is not None and traj:
-            # Overlay the episode-wide UNION of static occluders and occlusion
-            # boundaries the perception produced (not a single decaying end-of-run
-            # frame), so the plot shows every wall/blind corner the ego reacted to —
-            # matching the MPC controller's trajectory plot. obs_track dynamic slots
-            # are often empty when the crosser never enters range.
-            occ_pts      = np.array(list(occ_seen.keys()))  if occ_seen  else None
-            if occ_track:
-                _vals = np.array(list(occ_track.values()), dtype=float)
-                occ_segments, occ_ego = _vals[:, :4].reshape(-1, 2, 2), _vals[:, 4:]
-            else:
-                occ_segments = occ_ego = None
-            _save_trajectory(save_traj, ep, ep_log, goal_xy, np.asarray(traj),
-                             np.asarray(obs_track) if obs_track else None,
-                             occ_pts, occ_segments=occ_segments, occ_ego=occ_ego,
-                             # OCC_HORIZON, not the PLANNING horizon: the keep-out is
-                             # capped at OCC_HORIZON in the cost, so drawing H_MPPI*DT
-                             # would overstate the constraint by V_TARGET*(6.0-3.0)=9 m.
-                             capsule_horizon=OCC_HORIZON,
-                             show_occlusion=show_occlusion_plot)
-
-        verdict = "COLLISION" if ep_log["collided"] else "safe"
-        print(f"[Ep {ep+1:3d}] Δt={ep_log['incursion_dt']:+.2f}s  "
-              f"diff={ep_log['difficulty']:.2f}  "
-              f"steps={ep_log['steps']:4d}  "
-              f"min_dist={ep_log['min_dist']:5.2f}m  "
-              f"min_h={ep_log['min_h']:8.2f}  → {verdict}")
-
     if unity_stopped:
-        print(f"\n[Controller] Unity stopped early (Editor left Play mode, or the app closed). "
-              f"Completed {len(episode_stats)}/{n_episodes} episodes — reporting those.\n"
-              f"             If this was unexpected: check the Unity Console for an exception, and "
-              f"avoid editing C# scripts while the Editor is in Play mode (that triggers a recompile "
-              f"and drops the connection).")
+        print("\n[Controller] Unity stopped early (Editor left Play mode, or the app closed).\n"
+              "             If this was unexpected: check the Unity Console for an exception, "
+              "and avoid editing C# scripts while the Editor is in Play mode (that triggers a "
+              "recompile and drops the connection).")
     try:
         env.close()
     except Exception:
         pass
 
-    print("\n=== Summary ===")
-    n   = len(episode_stats)
-    if n == 0:
-        print("No episodes completed — nothing to summarise.")
-        return
-    col = sum(1 for e in episode_stats if e["collided"])
-    dists = [e["min_dist"] for e in episode_stats]
-    print(f"Collision rate : {col}/{n} = {col/n:.1%}")
+    verdict = "collision" if collided else ("reached" if reached else "timeout")
 
-    # ── Conditional rate: exclude duds (paths never intersected) ───────────────
-    genuine = [e for e in episode_stats if e["min_dist"] <= DUD_DIST]
-    n_gen   = len(genuine)
-    col_gen = sum(1 for e in genuine if e["collided"])
-    n_dud   = n - n_gen
-    if n_gen:
-        print(f"Conditional    : {col_gen}/{n_gen} = {col_gen/n_gen:.1%}  "
-              f"(genuine conflicts only; {n_dud} duds with min_dist>{DUD_DIST:.0f}m excluded)")
-    else:
-        print(f"Conditional    : n/a (all {n} episodes were duds, min_dist>{DUD_DIST:.0f}m)")
+    if save_traj is not None and traj:
+        # Overlay the run-wide UNION of static occluders and occlusion boundaries the
+        # perception produced (not a single decaying end-of-run frame), so the plot shows
+        # every wall/blind corner the ego reacted to. obs_track dynamic slots are often
+        # empty when no agent ever enters range.
+        occ_pts = np.array(list(occ_seen.keys())) if occ_seen else None
+        if occ_track:
+            _vals = np.array(list(occ_track.values()), dtype=float)
+            occ_segments, occ_ego = _vals[:, :4].reshape(-1, 2, 2), _vals[:, 4:]
+        else:
+            occ_segments = occ_ego = None
+        _save_trajectory(save_traj, verdict, goal_xy, np.asarray(traj),
+                         np.asarray(obs_track) if obs_track else None,
+                         occ_pts, occ_segments=occ_segments, occ_ego=occ_ego,
+                         # OCC_HORIZON, not the PLANNING horizon: the keep-out is
+                         # capped at OCC_HORIZON in the cost, so drawing H_MPPI*DT
+                         # would overstate the constraint by V_TARGET*(6.0-3.0)=9 m.
+                         capsule_horizon=OCC_HORIZON,
+                         show_occlusion=show_occlusion_plot)
 
-    print(f"Mean min_dist  : {np.mean(dists):.2f} m  "
-          f"(median {np.median(dists):.2f} m — use median; no-conflict duds skew the mean)")
-    print(f"Worst min_dist : {np.min(dists):.2f} m "
-          f"(target >= {D_SAFE:.1f} m)")
-    print(f"Worst min_h    : {np.min([e['min_h'] for e in episode_stats]):.2f} "
-          "(target >= 0)")
-
-    # ── Per-scenario-type breakdown ───────────────────────────────────────────
-    print("\n  scenario      episodes  collisions   rate    genuine  cond.rate   median min_dist[m]")
-    for name in SCENARIO_NAMES:
-        grp = [e for e in episode_stats if e["scenario"] == name]
-        if not grp:
-            continue
-        g_col   = sum(1 for e in grp if e["collided"])
-        g_med   = np.median([e["min_dist"] for e in grp])
-        grp_gen = [e for e in grp if e["min_dist"] <= DUD_DIST]
-        gc_col  = sum(1 for e in grp_gen if e["collided"])
-        cond    = f"{gc_col/len(grp_gen):5.1%}" if grp_gen else "  n/a"
-        print(f"  {name:<12s}  {len(grp):8d}  {g_col:10d}   {g_col/len(grp):5.1%}   "
-              f"{len(grp_gen):7d}    {cond}   {g_med:14.2f}")
-
-    print("\n  Δt[s]  scenario      diff  min_dist[m]   min_h     result")
-    for e in sorted(episode_stats, key=lambda d: d["incursion_dt"]):
-        print(f"  {e['incursion_dt']:+5.2f}  {e['scenario']:<12s}  {e['difficulty']:.2f}  "
-              f"{e['min_dist']:8.2f}   {e['min_h']:8.2f}   "
-              f"{'COLLISION' if e['collided'] else 'safe'}")
-
-    return episode_stats
+    print(f"\n[Controller] steps={ep_steps:4d}  min_dist={min_dist:5.2f} m "
+          f"(target >= {D_SAFE:.1f} m)  min_h={min_h:8.2f} (target >= 0)  → {verdict.upper()}")
 
 
 if __name__ == "__main__":
@@ -1210,16 +964,8 @@ if __name__ == "__main__":
     p.add_argument("--exec",           default=None)
     p.add_argument("--port",           default=5004,  type=int)
     p.add_argument("--sysid",          default=False,  type=lambda x: x.lower() == "true")
-    p.add_argument("--episodes",       default=20,    type=int)
-    p.add_argument("--min-difficulty", default=0.0,   type=float)
-    p.add_argument("--max-difficulty", default=1.0,   type=float)
     p.add_argument("--noise-std",      default=0.0,   type=float,
                    help="Std-dev of Gaussian noise injected into obstacle obs [m]. 0=off.")
-    p.add_argument("--scenario",       default="standard",
-                   choices=SCENARIO_NAMES + ["mixed"],
-                   help="Force a specific scenario type for all episodes, or "
-                        "'mixed' to randomise across the active crossing-conflict types "
-                        "(standard, headon, follow_vehicle, intersection) per episode.")
     p.add_argument("--detect-range",   default=float("inf"), type=float,
                    help="Euclidean detection range [m]. Obstacles beyond this distance "
                         "are masked from MPPI and CBF, simulating finite sensor range. "
@@ -1232,7 +978,7 @@ if __name__ == "__main__":
     p.add_argument("--d-infl",         default=D_INFL, type=float,
                    help="MPPI obstacle influence radius [m] — the distance at which the planner "
                         "STARTS bending around an obstacle. Raise it (e.g. 40-60) for long-range "
-                        "planning, e.g. the 'converging' scenario. Must stay >= --d-safe.")
+                        "planning against long-range threats. Must stay >= --d-safe.")
     p.add_argument("--d-safe",         default=D_SAFE, type=float,
                    help="Hard keep-out radius [m] for the CBF barrier and the BIG close-in penalty. "
                         "Governs close-in avoidance; leave at default unless you want a larger "
@@ -1241,11 +987,6 @@ if __name__ == "__main__":
                    help="Radius [m] of the uncertainty (belief-entropy) caution term. Raise it to "
                         "match --d-infl so the ego slows for ambiguous distant threats. Only used "
                         "with --uncertainty.")
-    p.add_argument("--pin-episode",    default=None, type=int, metavar="SEED",
-                   help="Replay one fixed scenario every episode (same ego spawn/path, same "
-                        "obstacles, same timings). Use to hand-place occluders/buildings at a "
-                        "known map location in the Unity editor and test against it repeatedly. "
-                        "Try different SEED values to pick a location you like.")
     p.add_argument("--lidar-costmap",  action="store_true",
                    help="Down-sample the published PointCloud2 each control step and cover the "
                         "static obstacles (walls/parked aircraft/buildings) with circles, added "
@@ -1266,29 +1007,23 @@ if __name__ == "__main__":
                         "(radius grows as v_target·t) and the ego is speed-capped so it can stop "
                         "before the nearest occlusion. Requires --lidar-costmap.")
     p.add_argument("--save-traj", default=None, metavar="DIR",
-                   help="Save each episode's ego trajectory as CSV + a top-down PNG plot into DIR.")
+                   help="Save the run's ego trajectory as CSV + a top-down PNG plot into DIR.")
     args = p.parse_args()
 
     if args.d_infl < args.d_safe:
         p.error(f"--d-infl ({args.d_infl}) must be >= --d-safe ({args.d_safe}): "
                 "the soft influence ring cannot be inside the hard keep-out radius.")
 
-    sc_int = -1 if args.scenario == "mixed" else SCENARIO_NAMES.index(args.scenario)
     run(unity_exec_path=args.exec if args.exec != "None" else None,
         port=args.port,
         run_sysid=args.sysid,
-        n_episodes=args.episodes,
-        min_difficulty=args.min_difficulty,
-        max_difficulty=args.max_difficulty,
         noise_std=args.noise_std,
-        scenario_type=sc_int,
         detect_range=args.detect_range,
         n_scenarios=args.n_scenarios,
         w_info=args.w_info,
         d_infl=args.d_infl,
         d_safe=args.d_safe,
         info_range=args.info_range,
-        pin_episode=args.pin_episode,
         lidar_costmap=args.lidar_costmap,
         lidar_topic=args.lidar_topic,
         visibility_cost=args.visibility_cost,

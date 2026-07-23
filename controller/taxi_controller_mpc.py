@@ -25,15 +25,15 @@ Closed-loop re-solves every DT correct any small mismatch against Unity's exact
 of the MPPI rollout is not a model state here.
 
 Everything else — observation contract (OBS_SIZE=20), action contract ([a, delta]),
-the scenario sweep, sys-id probe, and per-episode trajectory logging — is shared with
-`taxi_controller.py` via direct import, so the two controllers stay in lock-step.
+the sys-id probe, and trajectory logging — is shared with `taxi_controller_mppi.py`
+via direct import, so the two controllers stay in lock-step.
 
 Observation / action contract: see taxi_controller.py (unchanged).
 
 Requirements (beyond taxi_controller's): `pip install casadi`.
 
 Run (same as the MPPI controller, e.g.):
-    python3 taxi_controller_mpc.py --scenario headon --episodes 20 --save-traj out_mpc
+    python3 taxi_controller_mpc.py --save-traj out_mpc
 """
 
 import argparse
@@ -46,24 +46,20 @@ import casadi as ca
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.base_env import ActionTuple
 from mlagents_envs.exception import UnityCommunicatorStoppedException
-from mlagents_envs.side_channel.environment_parameters_channel import (
-    EnvironmentParametersChannel,
-)
 
 # ── Reuse the shared machinery + parameters from the MPPI controller ──────────
-# Importing keeps the dynamics constants, observation unpacking, scenario sweep,
-# sys-id probe and trajectory logging identical across both controllers.
+# Importing keeps the dynamics constants, observation unpacking, sys-id probe and
+# trajectory logging identical across both controllers.
 import taxi_controller_mppi as tc
 from taxi_controller_mppi import (
     DT, L, V_DES, GOAL_SLOWDOWN_DIST, GOAL_MIN_SPEED,
     A_MIN, A_MAX, DELTA_LIM,
     DRAG_COEFF, ACCEL_TAU, MAX_STEER_RATE, STEER_ROLLOFF_SPD, STEER_ROLLOFF_MIN,
-    D_SAFE, D_INFL, K_OBS, OBS_SIZE, DUD_DIST,
+    D_SAFE, D_INFL, K_OBS, OBS_SIZE,
     D_SAFE_STATIC, D_INFL_STATIC,
     V_TARGET, D_SAFE_OCC, D_INFL_OCC, W_OCC,
     W_SIGHT, A_BRAKE_SIGHT, V_SIGHT_FLOOR, GOAL_OCC_CLEAR, OCC_HORIZON,
-    SCENARIO_STANDARD, SCENARIO_NAMES,
-    obs_to_state, inject_sensor_noise, make_scenarios,
+    obs_to_state, inject_sensor_noise,
     identify_bicycle_model, _save_trajectory,
 )
 from occlusion_capsules import (point_segment_distance_sym, point_segment_distance_np,
@@ -741,10 +737,9 @@ class TaxiMPC:
 
 # ── Main control loop (MPC) ───────────────────────────────────────────────────
 
-def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
-        min_difficulty=0.0, max_difficulty=1.0, noise_std=0.0,
-        scenario_type=SCENARIO_STANDARD, detect_range=float("inf"),
-        d_infl=D_INFL, d_safe=D_SAFE, horizon=N_MPC, pin_episode=None,
+def run(unity_exec_path=None, port=5004, run_sysid=False, noise_std=0.0,
+        detect_range=float("inf"),
+        d_infl=D_INFL, d_safe=D_SAFE, horizon=N_MPC,
         lidar_costmap=False, lidar_topic="/point_cloud", save_traj=None,
         occlusion_aware=False, show_occlusion_plot=True):
     # Detection range lives as a module global inside taxi_controller (obs_to_state
@@ -796,13 +791,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
                   occ_d_target=(V_TARGET * OCC_D_TARGET_HORIZON
                                 if OCC_SINGLE_CIRCLE else None))
 
-    env_params = EnvironmentParametersChannel()
     env = UnityEnvironment(
         file_name=unity_exec_path,
         base_port=port,
         seed=42,
         no_graphics=unity_exec_path is not None,
-        side_channels=[env_params],
     )
     env.reset()
 
@@ -825,284 +818,207 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, n_episodes=20,
         identify_bicycle_model(env, behavior_name)
         env.reset()
 
-    scenarios = make_scenarios(n_episodes, min_difficulty=min_difficulty,
-                               max_difficulty=max_difficulty,
-                               scenario_type=scenario_type)
-    if pin_episode is not None:
-        pinned = make_scenarios(1, base_seed=pin_episode,
-                                min_difficulty=min_difficulty,
-                                max_difficulty=max_difficulty,
-                                scenario_type=scenario_type)[0]
-        scenarios = [dict(pinned) for _ in range(n_episodes)]
-        print(f"[MPC] Pinned episode  : seed={pin_episode} — identical scenario every episode")
-
-    episode_stats = []
     unity_stopped = False
+    min_h     = np.inf
+    min_dist  = np.inf
+    collided  = False
+    reached   = False
+    traj      = []
+    obs_track = []
+    # Occlusion-boundary segments actually constrained by the MPC, keyed on TRACK ID (a
+    # mouth that sweeps as the ego moves would otherwise paint a whole line across many
+    # steps even when each step is corner-only).
+    seg_track = {}
+    corner_tracker = OcclusionCornerTracker(
+        assoc_radius=OCC_TRACK_ASSOC, alpha=OCC_TRACK_ALPHA,
+        ttl=OCC_TRACK_TTL, min_hits=OCC_TRACK_HITS)
+    # Union of every OCC cell seen across the run. The costmap is a rolling, DECAYING,
+    # ego-centered grid (occ_ttl≈12s), so a single end-of-run snapshot only shows walls
+    # still in view at the goal — walls the ego passed earlier have decayed/rolled out.
+    # Accumulate (dedup by cell) to show the real extent.
+    occ_seen = {}
 
-    for ep in range(n_episodes):
-        sc      = scenarios[ep]
-        task_id = int(sc["scenario_type"])
-        ep_log  = {"min_h": np.inf, "min_dist": np.inf,
-                   "collided": False, "reached": False, "steps": 0,
-                   "incursion_dt": sc["incursion_dt"],
-                   "difficulty": sc["difficulty"],
-                   "scenario": SCENARIO_NAMES[task_id]}
-        traj      = []
-        obs_track = []
-        # Occlusion-boundary points actually constrained by the MPC, deduped by rounded
-        # world cell (a mouth that sweeps as the ego moves would otherwise paint a whole
-        # line across many steps even when each step is corner-only).
-        seg_track = {}   # occlusion boundary SEGMENTS seen this episode, keyed on TRACK ID
-        corner_tracker = OcclusionCornerTracker(
-            assoc_radius=OCC_TRACK_ASSOC, alpha=OCC_TRACK_ALPHA,
-            ttl=OCC_TRACK_TTL, min_hits=OCC_TRACK_HITS)
-        # Union of every OCC cell seen across the episode. The costmap is a rolling,
-        # DECAYING, ego-centered grid (occ_ttl≈12s), so a single end-of-run snapshot
-        # only shows walls still in view at the goal — walls the ego passed earlier
-        # have decayed/rolled out. Accumulate (dedup by cell) to show the real extent.
-        occ_seen = {}
+    env.reset()
+    decision_steps, terminal_steps = env.get_steps(behavior_name)
 
-        for key, val in sc.items():
-            env_params.set_float_parameter(key, val)
+    ep_steps     = 0
+    delta_actual = 0.0
+    accel_actual = 0.0
+    u_prev       = np.zeros(2)
+    episode_done = False
+    solve_ms_acc = 0.0
+    solve_fail   = 0
 
-        sname = SCENARIO_NAMES[int(sc["scenario_type"])]
-        print(f"\n[Ep {ep+1:3d}] [{sname}] Δt={sc['incursion_dt']:+.2f}s  "
-              f"v_amb={sc['ambulance_speed']:.2f} m/s  diff={sc['difficulty']:.2f}  "
-              f"noise={noise_std:.3f}  dir={'L' if sc['cross_dir_sign'] < 0 else 'R'}")
+    while not episode_done:
+        if len(terminal_steps) > 0:
+            collided = min_h < 0.0
+            reached  = not terminal_steps.interrupted[0] and not collided
+            episode_done = True
+            break
 
+        if len(decision_steps) == 0:
+            env.step()
+            decision_steps, terminal_steps = env.get_steps(behavior_name)
+            continue
+
+        obs = decision_steps.obs[0][0]
+        ep_steps += 1
+
+        obs_n = inject_sensor_noise(obs, noise_std, tc.rng)
+        s, obstacles, goal_xy = obs_to_state(obs_n, delta_actual, accel_actual)
+
+        # ── Refresh the LiDAR static-obstacle costmap and extract OCC points ──
+        static_pts = None
+        occ_pts    = None
+        occ_segs   = None
+        n_static   = 0
+        n_occ      = 0
+        if costmap is not None:
+            ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
+            costmap.update(ego_fwd)
+            if costmap.ready:
+                static_pts = costmap.circles()               # (M,3) world [a0, a1, r]
+                if static_pts is not None and len(static_pts):
+                    n_static = len(static_pts)
+                    if save_traj is not None:
+                        # Dedup by rounded world centre so the union stays bounded.
+                        for wx, wy, _r in static_pts:
+                            occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
+                if k_occ:
+                    # Range-jump boundary SEGMENTS (this scan) seed the expanding
+                    # keep-outs. They need configure_scan().
+                    occ_segs = costmap.occlusion_segments(
+                        ego_fwd=ego_fwd,
+                        fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
+                    # Associate + smooth against previous scans so the same physical
+                    # corner keeps one stable centre instead of a fresh jittered one.
+                    occ_segs = corner_tracker.update(occ_segs, time.monotonic())
+                    if occ_segs is not None and not OCC_USE_CAPSULES:
+                        # Collapse each boundary line onto its CORNER, so the keep-out
+                        # is an expanding CIRCLE about that point. Done here, at the
+                        # source, so the constraints, the recorded seg_track and the
+                        # episode plot all show the same geometry.
+                        occ_segs = occ_segs.copy()
+                        occ_segs[:, 1, :] = occ_segs[:, 0, :]
+                    n_occ    = (len(occ_segs) if occ_segs is not None else 0)
+
+        # ── MPC solve ─────────────────────────────────────────────────────
+        # MPC state is [x, y, theta, v, accel]; delta_actual is not a state
+        # (the steering-rate limit is a constraint), so it isn't passed.
+        s_mpc = np.array([s[0], s[1], s[2], s[3], accel_actual])
+        u_cmd, info = mpc.solve(s_mpc, goal_xy, obstacles, u_prev, static_pts,
+                                occ_pts, occ_segs)
+        solve_ms_acc += info["solve_ms"]
+        solve_fail   += (0 if info["success"] else 1)
+
+        a_cmd     = float(np.clip(u_cmd[0], A_MIN, A_MAX))
+        delta_cmd = float(np.clip(u_cmd[1], -DELTA_LIM, DELTA_LIM))
+        u_prev    = np.array([a_cmd, delta_cmd])
+
+        # Per-step diagnostic: how many obstacles the MPC sees, the nearest one,
+        # and the solve status. Prints on step 1, every 10 steps, and on any
+        # solver fallback — so it's obvious whether obstacles are reaching the
+        # planner and whether IPOPT is converging.
+        n_obs   = len(obstacles)
+        near    = min((np.hypot(r[0], r[1]) for r, _ in obstacles), default=np.inf)
+        near_st = np.inf
+        if static_pts is not None and len(static_pts):
+            near_st = float(np.min(np.hypot(static_pts[:, 0] - s[0],
+                                            static_pts[:, 1] - s[1])))
+        if ep_steps == 1 or ep_steps % 10 == 0 or info["fallback"]:
+            tag = " FALLBACK" if info["fallback"] else ""
+            mps = info.get("min_pred_stat", np.inf)
+            print(f"  [step {ep_steps:4d}] n_obs={n_obs} near={near:6.1f}m  "
+                  f"nStatic={n_static} nearStatic={near_st:6.1f}m  "
+                  f"minPredStat={mps:6.1f}m maxSlack={info.get('max_sst', 0.0):7.1f}  "
+                  f"nOcc={n_occ}  "
+                  f"v={s[3]:5.2f}  a={a_cmd:+.2f} δ={delta_cmd:+.3f}  "
+                  f"solve={info['solve_ms']:5.1f}ms iter={info['iter']:3d} "
+                  f"{info['status']}{tag}")
+
+        # Advance Python-side kinematic state to match what Unity computes,
+        # so the next MPC solve starts from the right delta/accel actuals.
+        v            = s[3]
+        speed_frac   = min(v / max(STEER_ROLLOFF_SPD, 1e-3), 1.0)
+        eff_limit    = DELTA_LIM * (1.0 - speed_frac * (1.0 - STEER_ROLLOFF_MIN))
+        delta_target = float(np.clip(delta_cmd, -eff_limit, eff_limit))
+        delta_actual = delta_actual + float(np.clip(
+            delta_target - delta_actual, -MAX_STEER_RATE * DT, MAX_STEER_RATE * DT))
+        accel_actual += (float(np.clip(a_cmd, A_MIN, A_MAX)) - accel_actual) * (DT / ACCEL_TAU)
+
+        h_val = float(obs[17])
+        dist  = float(min((np.hypot(rel[0], rel[1]) for rel, _ in obstacles),
+                          default=np.inf))
+        min_h    = min(min_h, h_val)
+        min_dist = min(min_dist, dist)
+
+        traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd))
+        for rel, _ov in obstacles:
+            obs_track.append((ep_steps * DT, s[0] + rel[0], s[1] + rel[1]))
+        # Record the boundary SEGMENTS the MPC actually constrained this step (the
+        # k_occ nearest within OCC_QUERY_R) so the plot shows what is pushing the ego,
+        # keyed on rounded endpoints so a corner re-detected every scan doesn't stack
+        # duplicates. _nearest_segments pads unused slots to 1e6 — drop those.
+        if k_occ and occ_segs is not None and len(occ_segs):
+            # Record every tracked boundary within query range, keyed on TRACK ID so a
+            # corner re-seen across scans occupies ONE entry instead of a smear of
+            # near-duplicates. Value keeps the ego pose + episode time of the FIRST
+            # sighting, tying each keep-out to where on the path it began applying.
+            tids = corner_tracker.ids()
+            ego_xy = np.array([s_mpc[0], s_mpc[1]])
+            for ti, seg_i in enumerate(occ_segs):
+                if ti >= len(tids):
+                    break
+                d = point_segment_distance_np(ego_xy[None, :], seg_i[0], seg_i[1])[0]
+                if d <= OCC_QUERY_R:
+                    seg_track.setdefault(tids[ti],
+                                         (seg_i[0][0], seg_i[0][1], seg_i[1][0],
+                                          seg_i[1][1], s[0], s[1], ep_steps * DT))
+
+        action = ActionTuple(
+            continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32))
+        env.set_actions(behavior_name, action)
         try:
-            env.reset()
+            env.step()
         except UnityCommunicatorStoppedException:
             unity_stopped = True
             break
         decision_steps, terminal_steps = env.get_steps(behavior_name)
 
-        ep_steps     = 0
-        delta_actual = 0.0
-        accel_actual = 0.0
-        u_prev       = np.zeros(2)
-        # Fresh MPC warm-start each episode so runs are comparable.
-        mpc._Xopt = mpc._Uopt = mpc._lam_x0 = mpc._lam_g0 = None
-        episode_done = False
-        solve_ms_acc = 0.0
-        solve_fail   = 0
-
-        while not episode_done:
-            if len(terminal_steps) > 0:
-                ep_log["collided"] = ep_log["min_h"] < 0.0
-                ep_log["reached"]  = (not terminal_steps.interrupted[0]
-                                      and not ep_log["collided"])
-                episode_done = True
-                break
-
-            if len(decision_steps) == 0:
-                env.step()
-                decision_steps, terminal_steps = env.get_steps(behavior_name)
-                continue
-
-            obs = decision_steps.obs[0][0]
-            ep_steps += 1
-
-            obs_n = inject_sensor_noise(obs, noise_std, tc.rng)
-            s, obstacles, goal_xy = obs_to_state(obs_n, delta_actual, accel_actual)
-
-            # ── Refresh the LiDAR static-obstacle costmap and extract OCC points ──
-            static_pts = None
-            occ_pts    = None
-            occ_segs   = None
-            n_static   = 0
-            n_occ      = 0
-            if costmap is not None:
-                ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
-                costmap.update(ego_fwd)
-                if costmap.ready:
-                    static_pts = costmap.circles()               # (M,3) world [a0, a1, r]
-                    if static_pts is not None and len(static_pts):
-                        n_static = len(static_pts)
-                        if save_traj is not None:
-                            # Dedup by rounded world centre so the union stays bounded.
-                            for wx, wy, _r in static_pts:
-                                occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
-                    if k_occ:
-                        # Range-jump boundary SEGMENTS (this scan) seed the expanding
-                        # keep-outs. They need configure_scan().
-                        occ_segs = costmap.occlusion_segments(
-                            ego_fwd=ego_fwd,
-                            fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
-                        # Associate + smooth against previous scans so the same physical
-                        # corner keeps one stable centre instead of a fresh jittered one.
-                        occ_segs = corner_tracker.update(occ_segs, time.monotonic())
-                        if occ_segs is not None and not OCC_USE_CAPSULES:
-                            # Collapse each boundary line onto its CORNER, so the keep-out
-                            # is an expanding CIRCLE about that point. Done here, at the
-                            # source, so the constraints, the recorded seg_track and the
-                            # episode plot all show the same geometry.
-                            occ_segs = occ_segs.copy()
-                            occ_segs[:, 1, :] = occ_segs[:, 0, :]
-                        n_occ    = (len(occ_segs) if occ_segs is not None else 0)
-
-            # ── MPC solve ─────────────────────────────────────────────────────
-            # MPC state is [x, y, theta, v, accel]; delta_actual is not a state
-            # (the steering-rate limit is a constraint), so it isn't passed.
-            s_mpc = np.array([s[0], s[1], s[2], s[3], accel_actual])
-            u_cmd, info = mpc.solve(s_mpc, goal_xy, obstacles, u_prev, static_pts,
-                                    occ_pts, occ_segs)
-            solve_ms_acc += info["solve_ms"]
-            solve_fail   += (0 if info["success"] else 1)
-
-            a_cmd     = float(np.clip(u_cmd[0], A_MIN, A_MAX))
-            delta_cmd = float(np.clip(u_cmd[1], -DELTA_LIM, DELTA_LIM))
-            u_prev    = np.array([a_cmd, delta_cmd])
-
-            # Per-step diagnostic: how many obstacles the MPC sees, the nearest one,
-            # and the solve status. Prints on step 1, every 10 steps, and on any
-            # solver fallback — so it's obvious whether obstacles are reaching the
-            # planner and whether IPOPT is converging.
-            n_obs   = len(obstacles)
-            near    = min((np.hypot(r[0], r[1]) for r, _ in obstacles), default=np.inf)
-            near_st = np.inf
-            if static_pts is not None and len(static_pts):
-                near_st = float(np.min(np.hypot(static_pts[:, 0] - s[0],
-                                                static_pts[:, 1] - s[1])))
-            if ep_steps == 1 or ep_steps % 10 == 0 or info["fallback"]:
-                tag = " FALLBACK" if info["fallback"] else ""
-                mps = info.get("min_pred_stat", np.inf)
-                print(f"  [step {ep_steps:4d}] n_obs={n_obs} near={near:6.1f}m  "
-                      f"nStatic={n_static} nearStatic={near_st:6.1f}m  "
-                      f"minPredStat={mps:6.1f}m maxSlack={info.get('max_sst', 0.0):7.1f}  "
-                      f"nOcc={n_occ}  "
-                      f"v={s[3]:5.2f}  a={a_cmd:+.2f} δ={delta_cmd:+.3f}  "
-                      f"solve={info['solve_ms']:5.1f}ms iter={info['iter']:3d} "
-                      f"{info['status']}{tag}")
-
-            # Advance Python-side kinematic state to match what Unity computes,
-            # so the next MPC solve starts from the right delta/accel actuals.
-            v            = s[3]
-            speed_frac   = min(v / max(STEER_ROLLOFF_SPD, 1e-3), 1.0)
-            eff_limit    = DELTA_LIM * (1.0 - speed_frac * (1.0 - STEER_ROLLOFF_MIN))
-            delta_target = float(np.clip(delta_cmd, -eff_limit, eff_limit))
-            delta_actual = delta_actual + float(np.clip(
-                delta_target - delta_actual, -MAX_STEER_RATE * DT, MAX_STEER_RATE * DT))
-            accel_actual += (float(np.clip(a_cmd, A_MIN, A_MAX)) - accel_actual) * (DT / ACCEL_TAU)
-
-            h_val = float(obs[17])
-            dist  = float(min((np.hypot(rel[0], rel[1]) for rel, _ in obstacles),
-                              default=np.inf))
-            ep_log["min_h"]    = min(ep_log["min_h"], h_val)
-            ep_log["min_dist"] = min(ep_log["min_dist"], dist)
-            ep_log["steps"]    = ep_steps
-
-            traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd))
-            for rel, _ov in obstacles:
-                obs_track.append((ep_steps * DT, s[0] + rel[0], s[1] + rel[1]))
-            # Record the boundary SEGMENTS the MPC actually constrained this step (the
-            # k_occ nearest within OCC_QUERY_R) so the plot shows what is pushing the ego,
-            # keyed on rounded endpoints so a corner re-detected every scan doesn't stack
-            # duplicates. _nearest_segments pads unused slots to 1e6 — drop those.
-            if k_occ and occ_segs is not None and len(occ_segs):
-                # Record every tracked boundary within query range, keyed on TRACK ID so a
-                # corner re-seen across scans occupies ONE entry instead of a smear of
-                # near-duplicates. Value keeps the ego pose + episode time of the FIRST
-                # sighting, tying each keep-out to where on the path it began applying.
-                tids = corner_tracker.ids()
-                ego_xy = np.array([s_mpc[0], s_mpc[1]])
-                for ti, seg_i in enumerate(occ_segs):
-                    if ti >= len(tids):
-                        break
-                    d = point_segment_distance_np(ego_xy[None, :], seg_i[0], seg_i[1])[0]
-                    if d <= OCC_QUERY_R:
-                        seg_track.setdefault(tids[ti],
-                                             (seg_i[0][0], seg_i[0][1], seg_i[1][0],
-                                              seg_i[1][1], s[0], s[1], ep_steps * DT))
-
-            action = ActionTuple(
-                continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32))
-            env.set_actions(behavior_name, action)
-            try:
-                env.step()
-            except UnityCommunicatorStoppedException:
-                unity_stopped = True
-                break
-            decision_steps, terminal_steps = env.get_steps(behavior_name)
-
-        if unity_stopped:
-            break
-        episode_stats.append(ep_log)
-
-        if save_traj is not None and traj:
-            # Overlay the UNION of static occluders seen across the whole episode
-            # (not the decaying end-of-run snapshot) so the plot shows every wall the
-            # ego actually reacted to, including ones it has since driven past.
-            occ_pts = np.array(list(occ_seen.keys())) if occ_seen else None
-            if seg_track:
-                _vals = np.array(list(seg_track.values()), dtype=float)
-                occ_segments = _vals[:, :4].reshape(-1, 2, 2)
-                occ_ego = _vals[:, 4:]
-            else:
-                occ_segments = occ_ego = None
-            _save_trajectory(save_traj, ep, ep_log, goal_xy, np.asarray(traj),
-                             np.asarray(obs_track) if obs_track else None, occ_pts,
-                             occ_segments=occ_segments, occ_ego=occ_ego,
-                             # OCC_HORIZON (shared with MPPI), not the planning horizon,
-                             # so the drawn radius always equals the enforced one.
-                             capsule_horizon=(OCC_D_TARGET_HORIZON if OCC_SINGLE_CIRCLE
-                                              else OCC_HORIZON),
-                             show_occlusion=show_occlusion_plot,
-                             single_radius=OCC_SINGLE_CIRCLE)
-
-        verdict   = "COLLISION" if ep_log["collided"] else "safe"
-        mean_ms   = solve_ms_acc / max(ep_log["steps"], 1)
-        print(f"[Ep {ep+1:3d}] Δt={ep_log['incursion_dt']:+.2f}s  "
-              f"diff={ep_log['difficulty']:.2f}  steps={ep_log['steps']:4d}  "
-              f"min_dist={ep_log['min_dist']:5.2f}m  min_h={ep_log['min_h']:8.2f}  "
-              f"solve≈{mean_ms:4.1f}ms  fails={solve_fail}  → {verdict}")
-
     if unity_stopped:
-        print(f"\n[MPC] Unity stopped early. Completed {len(episode_stats)}/{n_episodes} "
-              f"episodes — reporting those.")
+        print("\n[MPC] Unity stopped early (Editor left Play mode, or the app closed).")
     try:
         env.close()
     except Exception:
         pass
 
-    # ── Summary (same layout as the MPPI controller) ──────────────────────────
-    print("\n=== Summary (MPC) ===")
-    n = len(episode_stats)
-    if n == 0:
-        print("No episodes completed — nothing to summarise.")
-        return
-    col   = sum(1 for e in episode_stats if e["collided"])
-    dists = [e["min_dist"] for e in episode_stats]
-    print(f"Collision rate : {col}/{n} = {col/n:.1%}")
+    verdict = "collision" if collided else ("reached" if reached else "timeout")
 
-    genuine = [e for e in episode_stats if e["min_dist"] <= DUD_DIST]
-    n_gen   = len(genuine)
-    col_gen = sum(1 for e in genuine if e["collided"])
-    n_dud   = n - n_gen
-    if n_gen:
-        print(f"Conditional    : {col_gen}/{n_gen} = {col_gen/n_gen:.1%}  "
-              f"(genuine conflicts only; {n_dud} duds excluded)")
-    else:
-        print(f"Conditional    : n/a (all {n} episodes were duds)")
+    if save_traj is not None and traj:
+        # Overlay the UNION of static occluders seen across the whole run (not the
+        # decaying end-of-run snapshot) so the plot shows every wall the ego actually
+        # reacted to, including ones it has since driven past.
+        occ_pts = np.array(list(occ_seen.keys())) if occ_seen else None
+        if seg_track:
+            _vals = np.array(list(seg_track.values()), dtype=float)
+            occ_segments = _vals[:, :4].reshape(-1, 2, 2)
+            occ_ego = _vals[:, 4:]
+        else:
+            occ_segments = occ_ego = None
+        _save_trajectory(save_traj, verdict, goal_xy, np.asarray(traj),
+                         np.asarray(obs_track) if obs_track else None, occ_pts,
+                         occ_segments=occ_segments, occ_ego=occ_ego,
+                         # OCC_HORIZON (shared with MPPI), not the planning horizon,
+                         # so the drawn radius always equals the enforced one.
+                         capsule_horizon=(OCC_D_TARGET_HORIZON if OCC_SINGLE_CIRCLE
+                                          else OCC_HORIZON),
+                         show_occlusion=show_occlusion_plot,
+                         single_radius=OCC_SINGLE_CIRCLE)
 
-    print(f"Mean min_dist  : {np.mean(dists):.2f} m  (median {np.median(dists):.2f} m)")
-    print(f"Worst min_dist : {np.min(dists):.2f} m  (target >= {d_safe:.1f} m)")
-    print(f"Worst min_h    : {np.min([e['min_h'] for e in episode_stats]):.2f}  (target >= 0)")
-
-    print("\n  scenario      episodes  collisions   rate    genuine  cond.rate   median min_dist[m]")
-    for name in SCENARIO_NAMES:
-        grp = [e for e in episode_stats if e["scenario"] == name]
-        if not grp:
-            continue
-        g_col   = sum(1 for e in grp if e["collided"])
-        g_med   = np.median([e["min_dist"] for e in grp])
-        grp_gen = [e for e in grp if e["min_dist"] <= DUD_DIST]
-        gc_col  = sum(1 for e in grp_gen if e["collided"])
-        cond    = f"{gc_col/len(grp_gen):5.1%}" if grp_gen else "  n/a"
-        print(f"  {name:<12s}  {len(grp):8d}  {g_col:10d}   {g_col/len(grp):5.1%}   "
-              f"{len(grp_gen):7d}    {cond}   {g_med:14.2f}")
-
-    return episode_stats
+    mean_ms = solve_ms_acc / max(ep_steps, 1)
+    print(f"\n[MPC] steps={ep_steps:4d}  min_dist={min_dist:5.2f} m (target >= {d_safe:.1f} m)  "
+          f"min_h={min_h:8.2f} (target >= 0)  solve≈{mean_ms:4.1f}ms  fails={solve_fail}  "
+          f"→ {verdict.upper()}")
 
 
 if __name__ == "__main__":
@@ -1110,14 +1026,8 @@ if __name__ == "__main__":
     p.add_argument("--exec",           default=None)
     p.add_argument("--port",           default=5004, type=int)
     p.add_argument("--sysid",          default=False, type=lambda x: x.lower() == "true")
-    p.add_argument("--episodes",       default=20, type=int)
-    p.add_argument("--min-difficulty", default=0.0, type=float)
-    p.add_argument("--max-difficulty", default=1.0, type=float)
     p.add_argument("--noise-std",      default=0.0, type=float,
                    help="Std-dev of Gaussian noise injected into obstacle obs [m]. 0=off.")
-    p.add_argument("--scenario",       default="standard",
-                   choices=SCENARIO_NAMES + ["mixed"],
-                   help="Force a scenario type for all episodes, or 'mixed' to randomise.")
     p.add_argument("--detect-range",   default=float("inf"), type=float,
                    help="Euclidean detection range [m]; obstacles beyond are masked. Default=inf.")
     p.add_argument("--horizon",        default=N_MPC, type=int,
@@ -1126,8 +1036,6 @@ if __name__ == "__main__":
                    help="Obstacle soft-influence radius [m]. Must stay >= --d-safe.")
     p.add_argument("--d-safe",         default=D_SAFE, type=float,
                    help="Hard keep-out radius [m] (steep penalty inside). Must stay <= --d-infl.")
-    p.add_argument("--pin-episode",    default=None, type=int, metavar="SEED",
-                   help="Replay one fixed scenario every episode.")
     p.add_argument("--lidar-costmap",  action="store_true",
                    help="Down-sample the published PointCloud2 each step and cover the static "
                         "obstacles with circles; the K_STATIC nearest are added to the MPC as "
@@ -1145,26 +1053,20 @@ if __name__ == "__main__":
                         "EXPANDING keep-out circle (radius grows as v_target·t over the horizon), "
                         "so the ego gives occluded corners a wider berth. Requires --lidar-costmap.")
     p.add_argument("--save-traj",      default=None, metavar="DIR",
-                   help="Save each episode's ego trajectory as CSV + a top-down PNG plot into DIR.")
+                   help="Save the run's ego trajectory as CSV + a top-down PNG plot into DIR.")
     args = p.parse_args()
 
     if args.d_infl < args.d_safe:
         p.error(f"--d-infl ({args.d_infl}) must be >= --d-safe ({args.d_safe}).")
 
-    sc_int = -1 if args.scenario == "mixed" else SCENARIO_NAMES.index(args.scenario)
     run(unity_exec_path=args.exec if args.exec != "None" else None,
         port=args.port,
         run_sysid=args.sysid,
-        n_episodes=args.episodes,
-        min_difficulty=args.min_difficulty,
-        max_difficulty=args.max_difficulty,
         noise_std=args.noise_std,
-        scenario_type=sc_int,
         detect_range=args.detect_range,
         d_infl=args.d_infl,
         d_safe=args.d_safe,
         horizon=args.horizon,
-        pin_episode=args.pin_episode,
         lidar_costmap=args.lidar_costmap,
         lidar_topic=args.lidar_topic,
         save_traj=args.save_traj,

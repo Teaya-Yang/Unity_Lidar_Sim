@@ -489,18 +489,18 @@ def occlusion_stage_cost(d, v, t_k, d_goal, *, v_target, d_safe_occ, d_infl_occ,
     sqrt = _np.sqrt if sqrt is None else sqrt
 
     r_grow = v_target * min(t_k, occ_horizon)      # t_k is a PYTHON float in both callers
-    r_infl = d_infl_occ + r_grow
-    r_keep = d_safe_occ + r_grow
+    #r_infl = d_infl_occ + r_grow
+    r_keep = d_infl_occ + r_grow
 
     if clip is None:
         fade = _np.clip(d_goal / goal_occ_clear, 0.0, 1.0)
     else:
         fade = clip(d_goal / goal_occ_clear)
 
-    cost = fade * w_occ * fmax(0.0, r_infl - d) ** 2
-    viol = fmax(0.0, r_keep * r_keep - d * d)
-    cost = cost + fade * (rho * viol + rho2 * viol * viol)
+    #cost = fade * w_occ * fmax(0.0, r_infl - d) ** 2
+    viol = fmax(0.0, r_keep - d)
+    cost = cost + fade * (rho * viol)
 
     v_safe = fmax(sqrt(2.0 * a_brake_sight * d + 1e-6), v_sight_floor)
-    cost = cost + w_sight * fmax(0.0, v - v_safe) ** 2
+    cost = cost
     return cost
