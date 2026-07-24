@@ -61,7 +61,7 @@ unity_ros_lidar_3d_BurstDebugInformation_DoNotShip*
 libdec*
 UnityPlayer*
 Build Profiles*
-data*
+data
 *.npz
 
 
