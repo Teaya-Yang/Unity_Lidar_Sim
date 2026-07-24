@@ -53,6 +53,27 @@ public class TaxiAgent : Unity.MLAgents.Agent
     [Tooltip("Minimum steering authority fraction at high speed (0-1).")]
     public float steerRolloffMin   = 0.25f;
 
+    // ── Unmodeled effect (dataset Condition C) ────────────────────────────────
+    // These have NO analogue in the Python analytic bicycle model, by construction:
+    // Condition C exists to probe structural model mismatch, not parameter drift.
+    // All default to no-ops, so an A/B rollout (which never pushes
+    // unmodeled_enabled=1) behaves exactly like the analytic model.
+
+    [Header("Unmodeled effect (dataset Condition C only)")]
+    [Tooltip("Master gate. Set from the 'unmodeled_enabled' environment parameter.")]
+    public bool  unmodeledEnabled  = false;
+    [Tooltip("Tyre-slip understeer: yaw rate loses slipCoeff * v² * delta [rad/s].")]
+    public float slipCoeff         = 0.0f;
+    [Tooltip("Multiplier on braking commands (a_cmd < 0) — brakes bite harder than thrust.")]
+    public float brakeAsymmetry    = 1.0f;
+    [Tooltip("Amplitude of a smooth spatial friction field modulating effective drag.")]
+    public float frictionNoiseAmp  = 0.0f;
+    [Tooltip("Pure transport delay on commands, in control steps. The command " +
+             "issued now reaches the actuator this many steps later — a time-shift " +
+             "that NO static parameter set (drag/lag/wheelbase) can reproduce, " +
+             "unlike slip/brake/friction. This is the non-absorbable effect.")]
+    public int   actuationDelaySteps = 0;
+
     // ── Scene references ───────────────────────────────────────────────────────
 
     [Header("Performance")]
@@ -112,6 +133,11 @@ public class TaxiAgent : Unity.MLAgents.Agent
     float   _deltaActual;  // current nose-wheel angle [rad] (rate-limited)
     float   _accelActual;  // current acceleration [m/s²] (lag-filtered)
 
+    // Condition-C actuation delay: FIFO of (a_cmd, delta_cmd) awaiting arrival.
+    // Cleared each episode in ApplyDomainRandomizationParams so a delay change
+    // between rollouts never carries stale commands across the boundary.
+    readonly Queue<Vector2> _cmdDelayBuffer = new Queue<Vector2>();
+
     // Legacy single-agent velocity estimation
     Vector3 _obsPosPrev;
     Vector3 _obsVel;
@@ -148,6 +174,11 @@ public class TaxiAgent : Unity.MLAgents.Agent
         _stoppedAtGoal = false;
 
         var ep = Academy.Instance.EnvironmentParameters;
+
+        // Per-rollout dynamics randomisation. Read HERE (not in Initialize) so a
+        // fresh eta is picked up every episode — collect_dataset.py pushes one
+        // eta per rollout immediately BEFORE env.reset().
+        ApplyDomainRandomizationParams(ep);
 
         // ── Spawn airplane ─────────────────────────────────────────────────────
         float latOff = ep.GetWithDefault("spawn_lateral", float.NaN);
@@ -396,6 +427,38 @@ public class TaxiAgent : Unity.MLAgents.Agent
             EndEpisode();
     }
 
+    // ── Domain randomisation (dataset collection) ─────────────────────────────
+    //
+    // Receives the per-rollout eta pushed by dataset_collection/collect_dataset.py
+    // over ML-Agents' EnvironmentParametersChannel. Keys are the lower-snake_case
+    // names written by domain_sampler.RolloutEta.env_channel_payload():
+    //   l, drag_coeff, accel_tau, max_steer_rate, steer_rolloff_spd,
+    //   steer_rolloff_min, a_min, a_max, delta_lim,
+    //   unmodeled_enabled, slip_coeff, brake_asymmetry, friction_noise_amp
+    // Every lookup falls back to the current Inspector value, so a normal
+    // (non-dataset) Play-mode run is completely unaffected.
+
+    void ApplyDomainRandomizationParams(EnvironmentParameters ep)
+    {
+        wheelbase         = ep.GetWithDefault("l",                 wheelbase);
+        dragCoeff         = ep.GetWithDefault("drag_coeff",        dragCoeff);
+        accelTau          = ep.GetWithDefault("accel_tau",         accelTau);
+        maxSteerRate      = ep.GetWithDefault("max_steer_rate",    maxSteerRate);
+        steerRolloffSpeed = ep.GetWithDefault("steer_rolloff_spd", steerRolloffSpeed);
+        steerRolloffMin   = ep.GetWithDefault("steer_rolloff_min", steerRolloffMin);
+        maxAccel          = ep.GetWithDefault("a_max",             maxAccel);
+        maxSteer          = ep.GetWithDefault("delta_lim",         maxSteer);
+        // Python's A_MIN is a signed lower bound (≈ -4); maxBrake is its magnitude.
+        maxBrake          = Mathf.Abs(ep.GetWithDefault("a_min",  -maxBrake));
+
+        unmodeledEnabled   = ep.GetWithDefault("unmodeled_enabled", 0f) > 0.5f;
+        slipCoeff          = ep.GetWithDefault("slip_coeff",        0f);
+        brakeAsymmetry     = ep.GetWithDefault("brake_asymmetry",   1f);
+        frictionNoiseAmp   = ep.GetWithDefault("friction_noise_amp", 0f);
+        actuationDelaySteps = Mathf.RoundToInt(ep.GetWithDefault("actuation_delay_steps", 0f));
+        _cmdDelayBuffer.Clear();   // fresh pipeline each rollout
+    }
+
     // ── Bicycle kinematic model (with realistic extensions) ──────────────────────
     //
     // Four additions over the simple model:
@@ -408,6 +471,30 @@ public class TaxiAgent : Unity.MLAgents.Agent
     {
         float dt = Time.fixedDeltaTime;
 
+        // 0 — Condition-C actuation delay (applied BEFORE the actuator dynamics,
+        // as a physical transport/computation delay would be). The command issued
+        // this step is buffered; the command that actually drives the actuators is
+        // the one issued `actuationDelaySteps` steps ago. While the pipeline fills
+        // at episode start, the actuator coasts (neutral command). A pure delay is
+        // a time-shift of the whole command sequence, which no static (drag/lag/
+        // wheelbase) parameterisation can mimic — that is what makes condition C a
+        // genuine structural mismatch rather than an absorbable parameter drift.
+        if (unmodeledEnabled && actuationDelaySteps > 0)
+        {
+            _cmdDelayBuffer.Enqueue(new Vector2(a_cmd, delta_cmd));
+            if (_cmdDelayBuffer.Count > actuationDelaySteps)
+            {
+                Vector2 arrived = _cmdDelayBuffer.Dequeue();
+                a_cmd     = arrived.x;
+                delta_cmd = arrived.y;
+            }
+            else
+            {
+                a_cmd     = 0f;   // no command has arrived yet — coast
+                delta_cmd = 0f;
+            }
+        }
+
         // 1 + 2 — rate-limited, speed-dependent nose-wheel steering
         float speedFraction  = Mathf.Clamp01(_speed / Mathf.Max(1f, steerRolloffSpeed));
         float effectiveLimit = maxSteer * Mathf.Lerp(1f, steerRolloffMin, speedFraction);
@@ -416,6 +503,12 @@ public class TaxiAgent : Unity.MLAgents.Agent
         _deltaActual = Mathf.MoveTowards(_deltaActual, deltaTarget, maxDelta);
 
         // 3 — first-order acceleration lag  (τ·ȧ + a = a_cmd)
+        // Condition C: asymmetric brake response — real brakes bite harder than
+        // thrust pushes, so scale negative commands only. Applied BEFORE the clamp
+        // so the actuator box itself is still respected.
+        if (unmodeledEnabled && a_cmd < 0f)
+            a_cmd *= brakeAsymmetry;
+
         float a_clamped  = Mathf.Clamp(a_cmd, -maxBrake, maxAccel);
         if (accelTau > 1e-3f)
             _accelActual += (a_clamped - _accelActual) * (dt / accelTau);
@@ -423,12 +516,31 @@ public class TaxiAgent : Unity.MLAgents.Agent
             _accelActual  = a_clamped;
 
         // 4 — aerodynamic + rolling drag (acts opposite to motion)
-        float drag    = dragCoeff * _speed;
+        // Condition C: a smooth pseudo-random spatial friction field, so effective
+        // drag varies across the taxiway in a way no single dragCoeff scalar can
+        // represent.
+        float dragScale = 1f;
+        if (unmodeledEnabled && frictionNoiseAmp > 0f)
+        {
+            Vector3 p = transform.position;
+            dragScale = 1f + frictionNoiseAmp
+                      * Mathf.Sin(p.x * 0.05f) * Mathf.Cos(p.z * 0.07f);
+        }
+        float drag    = dragCoeff * dragScale * _speed;
         float v_dot   = _accelActual - drag;
         _speed        = Mathf.Max(0f, _speed + v_dot * dt);
 
         // Bicycle yaw rate: dθ/dt = (v/L) * tan(δ)
         float dTheta = (_speed / wheelbase) * Mathf.Tan(_deltaActual) * dt;
+
+        // Condition C: tyre slip. Lateral force ~ slipCoeff * v² * δ opposes the
+        // turn, so the realised yaw rate understeers relative to the kinematic
+        // prediction — growing with v². The Python model's dθ = (v/L)·tan(δ)·dt has
+        // no v² term at any parameter setting, which is exactly the structural
+        // mismatch this condition probes.
+        if (unmodeledEnabled && slipCoeff > 0f)
+            dTheta -= slipCoeff * _speed * _speed * _deltaActual * dt / wheelbase;
+
         transform.Rotate(Vector3.up, dTheta * Mathf.Rad2Deg);
         transform.position += transform.forward * (_speed * dt);
     }

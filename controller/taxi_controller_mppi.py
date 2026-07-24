@@ -394,16 +394,6 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         dy = py[:, None] - occ_y[None, :]
         return np.sqrt(np.min(dx * dx + dy * dy, axis=1))
 
-    # ── TEMP sightline diagnostic: is the cap even active at the ego's current pose? ──
-    if occ_x is not None:
-        _dv = float(_dist_to_occ(np.array([s0_fwd]), np.array([s0_lat]))[0])
-        _vs = max((2.0 * A_BRAKE_SIGHT * _dv) ** 0.5, V_SIGHT_FLOOR)
-        print(f"[sightline] ready d_vis(ego)={_dv:8.2f}  v_safe={_vs:5.2f}  "
-              f"v={s0[3]:5.2f}  nOcc={0 if occ_x is None else len(occ_x)}")
-    else:
-        print(f"[sightline] INACTIVE  ready="
-              f"{None if LIDAR_COSTMAP is None else LIDAR_COSTMAP.ready}")
-
     for k in range(H_MPPI):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]

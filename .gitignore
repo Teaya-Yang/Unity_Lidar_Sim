@@ -56,3 +56,13 @@ log/*
 out*
 
 mono_crash.*
+DatasetCollection_Data*
+unity_ros_lidar_3d_BurstDebugInformation_DoNotShip*
+libdec*
+UnityPlayer*
+Build Profiles*
+data*
+*.npz
+
+
+runs/
