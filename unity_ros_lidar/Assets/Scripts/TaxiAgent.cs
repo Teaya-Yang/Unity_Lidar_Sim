@@ -13,16 +13,21 @@ using UnityEngine;
 /// bearing to a goal marker, in free space. Obstacle avoidance (CBF/MPPI for dynamic agents,
 /// the LiDAR static costmap for buildings/walls) is frame-independent and unaffected.
 ///
-/// OBSERVATION VECTOR (20 floats — must match Python OBS_SIZE=20), always WORLD frame:
+/// OBSERVATION VECTOR (7 floats — must match Python OBS_SIZE=7), always WORLD frame:
 ///   [0]  x_ego    — Unity Z position [m]
 ///   [1]  y_ego    — Unity X position [m]
 ///   [2]  theta    — world heading [rad]
 ///   [3]  v
-///   [4..15]        3 × obstacle (dx_global, dy_global, vx, vy)
-///   [16] goal_dx  — true Euclidean distance to the goal [m] (999 if no goal marker)
-///   [17] cbf_h
-///   [18] goal_z   — goal world Z position [m] (same axis as [0]); = x_ego if no goal marker
-///   [19] goal_x   — goal world X position [m] (same axis as [1]); = y_ego if no goal marker
+///   [4]  goal_dx  — true Euclidean distance to the goal [m] (999 if no goal marker)
+///   [5]  goal_z   — goal world Z position [m] (same axis as [0]); = x_ego if no goal marker
+///   [6]  goal_x   — goal world X position [m] (same axis as [1]); = y_ego if no goal marker
+///
+/// NO DYNAMIC-OBSTACLE SLOTS. Until now this vector carried the nearest K_OBS agents'
+/// exact positions and velocities, plus a cbf_h barrier value derived from the nearest
+/// one — an ORACLE, straight out of the scenario manager, with no sensing involved. The
+/// controller now perceives other aircraft only through the LiDAR point cloud, the same
+/// way it perceives buildings, so what it plans against is what it can actually see.
+/// Re-adding a slot here re-introduces ground truth the sensor model cannot justify.
 ///
 /// COORDINATE MAPPING:
 ///   Python X (forward) = Unity +Z
@@ -118,7 +123,6 @@ public class TaxiAgent : Unity.MLAgents.Agent
 
     // ── Constants ─────────────────────────────────────────────────────────────
 
-    const int K_OBS = 3;   // nearest obstacles packed into the observation vector
 
     // ── Private state ──────────────────────────────────────────────────────────
 
@@ -138,9 +142,6 @@ public class TaxiAgent : Unity.MLAgents.Agent
     // between rollouts never carries stale commands across the boundary.
     readonly Queue<Vector2> _cmdDelayBuffer = new Queue<Vector2>();
 
-    // Legacy single-agent velocity estimation
-    Vector3 _obsPosPrev;
-    Vector3 _obsVel;
 
     // Current scenario type (from the side channel) — used for scenario-specific goal/
     // arrival logic (e.g. the follow-vehicle arrival test).
@@ -255,14 +256,11 @@ public class TaxiAgent : Unity.MLAgents.Agent
             incursionController.ResetCrossing(start, speed);
         }
 
-        // Legacy velocity estimator seed
-        if (incursionAgent != null) { _obsPosPrev = incursionAgent.position; _obsVel = Vector3.zero; }
-
         _episodeIndex++;
     }
 
-    // ── Observations (20 floats) ───────────────────────────────────────────────
-    // Layout: [ego(4)] [obs0..2 (4 each, 12 total)] [goal_dist(1)] [cbf_h(1)] [goal_pos(2)]
+    // ── Observations (7 floats) ────────────────────────────────────────────────
+    // Layout: [ego(4)] [goal_dist(1)] [goal_pos(2)]
     // See class doc-comment for full slot descriptions.
 
     public override void CollectObservations(VectorSensor sensor)
@@ -304,59 +302,12 @@ public class TaxiAgent : Unity.MLAgents.Agent
         sensor.AddObservation(ego2);
         sensor.AddObservation(_speed);
 
-        // ── Nearest-K obstacle observations [4..15] ───────────────────────────
-        var slots = new List<(float dx, float dy, float vx, float vy, float dist2)>();
-
-        if (scenarioManager != null)
-        {
-            foreach (var a in scenarioManager.ActiveAgents)
-            {
-                Vector3 pos = a.transform.position;
-
-                float   dx  = pos.z - transform.position.z;  // global delta
-                float   dy  = pos.x - transform.position.x;
-                Vector3 vel = a.Velocity;
-                slots.Add((dx, dy, vel.z, vel.x, dx * dx + dy * dy));
-            }
-        }
-        else if (incursionAgent != null)
-        {
-            Vector3 obsPos  = incursionAgent.position;
-            _obsVel         = (obsPos - _obsPosPrev) / Time.fixedDeltaTime;
-            _obsPosPrev     = obsPos;
-            float dx = obsPos.z - transform.position.z;
-            float dy = obsPos.x - transform.position.x;
-            slots.Add((dx, dy, _obsVel.z, _obsVel.x, dx * dx + dy * dy));
-        }
-
-        slots.Sort((a, b) => a.dist2.CompareTo(b.dist2));
-
-        float cbf_h_nearest = float.MaxValue;
-        for (int i = 0; i < K_OBS; i++)
-        {
-            if (i < slots.Count)
-            {
-                var s = slots[i];
-                sensor.AddObservation(s.dx);
-                sensor.AddObservation(s.dy);
-                sensor.AddObservation(s.vx);
-                sensor.AddObservation(s.vy);
-                if (i == 0) cbf_h_nearest = s.dist2 - dSafe * dSafe;
-            }
-            else
-            {
-                sensor.AddObservation(0f);
-                sensor.AddObservation(999f);
-                sensor.AddObservation(0f);
-                sensor.AddObservation(0f);
-            }
-        }
-
-        // ── Goal distance, CBF, goal world position [16..19] ──────────────────
+        // ── Goal distance and goal world position [4..6] ──────────────────────
+        // The scenario manager's agents are deliberately NOT reported here — see the
+        // class doc-comment. They reach the controller only as LiDAR returns.
         sensor.AddObservation(goal_val);
-        sensor.AddObservation(cbf_h_nearest == float.MaxValue ? 999f : cbf_h_nearest);
-        sensor.AddObservation(goalZ);      // [18] goal world Z (x_fwd axis)
-        sensor.AddObservation(goalX);      // [19] goal world X (y_lat axis)
+        sensor.AddObservation(goalZ);      // [5] goal world Z (x_fwd axis)
+        sensor.AddObservation(goalX);      // [6] goal world X (y_lat axis)
     }
 
     // ── Actions received from Python ───────────────────────────────────────────

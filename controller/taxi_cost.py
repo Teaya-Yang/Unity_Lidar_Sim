@@ -13,15 +13,21 @@ Stage k (state after the step: px, py, th, v; control uk, previous control u_km1
   + W_V        · (v − v_des)²                            speed tracking
   + R_ACT      · uk²      (elementwise, summed)          control effort
   + R_DACT     · (uk − u_km1)²                           control rate / smoothness
-  + Σ_obstacles  W_OBS · max(0, D_INFL − d)²  +  ρ·viol + ρ₂·viol²,  viol = (D_SAFE² − d²)₊
   + static       W_HARD · max(0, D_SAFE_HARD − ds)²
   + occlusion    occlusion_capsules.occlusion_stage_cost(...)
 
 The static and occlusion terms share ONE keep-out radius (D_SAFE_HARD) and ONE weight
 (W_HARD, large enough to act as a hard constraint), so they cannot be traded off against
-each other or against the goal pull. Only the DYNAMIC-obstacle term keeps the older
-soft-ring + exact-penalty shape, because a moving agent has to be negotiated with rather
-than simply avoided.
+each other or against the goal pull.
+
+NO DYNAMIC-OBSTACLE TERM. It used to sit here with a soft influence ring plus an exact
+penalty — the shape a moving agent needs, since it has to be negotiated with rather than
+simply avoided. It is gone because its input was an ORACLE: exact positions and velocities
+of other aircraft, handed to the controller by Unity rather than sensed. Moving agents now
+enter the cost only through the LiDAR static-circle term, with no velocity model. The MPC
+still carries the full dynamic terms (P_opos/P_ovel), so this module is NO LONGER at parity
+with it on that one term — restoring parity means giving BOTH a sensed, tracked estimate of
+the moving agents, not re-adding the oracle.
 
 Terminal:  W_GOAL_TERM · sqrt(d_goal² + 1)
 
@@ -64,7 +70,6 @@ RHO_SLACK2    = _dyn["rho_slack2"]     # quadratic term
 
 
 def stage_cost(px, py, th, v, uk, u_km1, *, goal_xy, v_des, t_k,
-               obstacles=None, d_infl, d_safe, w_obs, rho, rho2,
                r_act, r_dact, w_goal_run, w_head, w_v,
                d_static=None, d_safe_static=None,
                w_static=None):
@@ -72,7 +77,6 @@ def stage_cost(px, py, th, v, uk, u_km1, *, goal_xy, v_des, t_k,
 
     px, py, th, v : (K,) rollout state AFTER this step
     uk, u_km1     : (K, 2) control at this stage and the previous one
-    obstacles     : list of (world_x, world_y) arrays already advanced to t_k, or None
     d_static      : (K,) distance to the nearest static surface, or None to skip
     Returns (K,) cost.
     """

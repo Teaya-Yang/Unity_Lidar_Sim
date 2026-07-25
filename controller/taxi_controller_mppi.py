@@ -5,25 +5,27 @@ External Python controller for the Unity taxiing environment.
 Connects via the ML-Agents Python API, runs MPPI + HOCBF-QP, and sends
 [a, delta] actions back to Unity each decision step.
 
-Observation contract (must match TaxiAgent.cs CollectObservations, OBS_SIZE=20):
+Observation contract (must match TaxiAgent.cs CollectObservations, OBS_SIZE=7):
 
   World/Euclidean frame:
     obs[0]   x_ego    — Unity Z position [m]
     obs[1]   y_ego    — Unity X position [m]
     obs[2]   theta    — heading [rad]
     obs[3]   v        — speed [m/s]
-    obs[4..15]        3 × obstacle (dx_global, dy_global, vx, vy) — 12 floats
-    obs[16]  goal     — remaining Euclidean distance to goal [m]
-    obs[17]  cbf_h    — barrier value h = dist^2 - D^2 of nearest obstacle
-    obs[18]  goal_z   — goal world Z position [m] (same axis as obs[0])
-    obs[19]  goal_x   — goal world X position [m] (same axis as obs[1])
+    obs[4]   goal     — remaining Euclidean distance to goal [m]
+    obs[5]   goal_z   — goal world Z position [m] (same axis as obs[0])
+    obs[6]   goal_x   — goal world X position [m] (same axis as obs[1])
+
+  NO DYNAMIC-OBSTACLE SLOTS. Other aircraft used to arrive here as exact positions
+  and velocities lifted straight from Unity's scenario manager — an oracle. They are
+  now perceived ONLY through the LiDAR point cloud, like every other obstacle, so the
+  planner cannot use knowledge the sensor model does not provide.
 
 Action contract:
   act[0]  a_cmd     — acceleration [m/s^2], clipped to [A_MIN, A_MAX]
   act[1]  delta_cmd — steering [rad],       clipped to [-DELTA_LIM, DELTA_LIM]
 
 MPPI runs entirely in the world frame: s0 = [x, y, theta, v, delta, accel].
-CBF uses Euclidean obstacle distances in the same frame.
 """
 
 import numpy as np
@@ -169,6 +171,9 @@ OCC_RANGE_DBG   = None   # (min_ego_dist, corner_x, corner_y, ego_x, ego_y) for 
                          # is right to reject it.
 OCC_GATE_DBG    = None   # (n_in, n_after_goal_drop, r_goal, min_goal_dist) from the LAST
                          # solve — lets the [DEBUG occ] trace name the gate that emptied the set.
+OCC_SEGS_USED   = None   # (M,2,2) the segments the LAST solve actually constrained against —
+                         # post-gating, so it is what the cost saw, not what perception found.
+                         # The trajectory plot replays these per timestamp.
 OCC_USED_N      = 0      # boundaries that actually entered the LAST solve's cost. Written by
                          # mppi(), read by the [DEBUG occ] trace in run(): if this is 0 while
                          # segments exist, the ego is provably driving the occlusion-UNAWARE
@@ -178,11 +183,11 @@ OCCLUSION_AWARE = False   # set True by --occlusion-aware (needs --lidar-costmap
                           # FRS keep-out + sightline speed cap above (mirrors the MPC controller).
 VISIBILITY_COST = False   # vestigial: --visibility-cost is a documented no-op
 
-DETECTION_RANGE = float("inf")   # default: oracle (off). Set via --detect-range.
+DETECTION_RANGE = float("inf")   # vestigial: it masked ORACLE obstacle slots beyond a radius,
+                                 # and there are no such slots any more. Real sensor range is
+                                 # now whatever the LiDAR reports (scan.max_range).
 
-# Number of obstacles packed in the observation vector (must match TaxiAgent K_OBS)
-K_OBS    = _dyn["k_obs"]
-OBS_SIZE = 4 + K_OBS * 4 + 2 + 2   # 20: ego(4) + K_OBS*4 + goal(1) + cbf_h(1) + tangent(2)
+OBS_SIZE = 4 + 1 + 2   # 7: ego(4) + goal distance(1) + goal position(2)
 
 rng = np.random.default_rng(42)
 
@@ -192,57 +197,26 @@ rng = np.random.default_rng(42)
 
 def obs_to_state(obs: np.ndarray, prev_delta: float = 0.0, prev_accel: float = 0.0):
     """
-    Unpack the Unity 20-D observation vector into world/Euclidean coordinates.
+    Unpack the Unity 7-D observation vector into world/Euclidean coordinates.
 
     Returns
     -------
     s          : np.ndarray shape (6,) — [x_fwd, y_lat, theta, v, delta_actual, accel_actual]
-    obstacles  : list of (rel_xy, obs_v), rel_xy ego-relative (dx, dy) in world coords.
-    goal_xy    : np.ndarray shape (2,) — goal world position (z, x), same axes as ego (obs[18:20]).
+    goal_xy    : np.ndarray shape (2,) — goal world position (z, x), same axes as ego (obs[5:7]).
 
-    A zero-padded obstacle slot has dy == 999; those are skipped.
+    Dynamic agents are NOT unpacked here — they are not in the vector any more. The only
+    obstacle information the planner receives is the LiDAR circle map, so there is nothing
+    to inject sensor noise into either (the old inject_sensor_noise corrupted the obstacle
+    slots and deliberately left ego/goal clean; with the slots gone it had no effect).
     """
     ego0    = float(obs[0])   # x_ego (world)
     ego1    = float(obs[1])   # y_ego (world)
     ego2    = float(obs[2])   # theta (world)
     v       = float(obs[3])
-    goal_xy = np.array([float(obs[18]), float(obs[19])])   # goal world (z, x)
+    goal_xy = np.array([float(obs[5]), float(obs[6])])   # goal world (z, x)
 
     s = np.array([ego0, ego1, ego2, v, prev_delta, prev_accel])
-
-    obstacles = []
-    for i in range(K_OBS):
-        base   = 4 + i * 4
-        dx     = float(obs[base + 0])
-        dy     = float(obs[base + 1])
-        vx_obs = float(obs[base + 2])
-        vy_obs = float(obs[base + 3])
-
-        if abs(dy) > 900:   # zero-padded sentinel
-            continue
-
-        dist = np.hypot(dx, dy)
-        if dist > DETECTION_RANGE:  # outside sensor range — not observable
-            continue
-
-        # rel_xy: obstacle position relative to ego, regardless of frame
-        rel_xy = np.array([dx, dy])
-        obs_v  = np.array([vx_obs, vy_obs])
-        obstacles.append((rel_xy, obs_v))
-
-    return s, obstacles, goal_xy
-
-
-def inject_sensor_noise(obs: np.ndarray, noise_std: float, rng_local) -> np.ndarray:
-    """
-    Add Gaussian noise to the obstacle observation slots [4..15].
-    Ego state [0..3], goal/cbf [16..17], and goal position [18..19] are not corrupted.
-    """
-    if noise_std <= 0.0:
-        return obs
-    noisy = obs.copy()
-    noisy[4:16] += rng_local.normal(0.0, noise_std, 12).astype(obs.dtype)
-    return noisy
+    return s, goal_xy
 
 
 # ── MPPI ─────────────────────────────────────────────────────────────────────
@@ -286,7 +260,7 @@ def _rollout_step(st, a_cmd, delta_cmd):
     return st_new
 
 
-def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
+def mppi(s0, mean, goal_xy, u_prev=None):
     """
     Sample K_MPPI rollouts with realistic 6D state dynamics.
 
@@ -294,11 +268,14 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     goal_xy = goal world position (x_fwd, y_lat), same axes as the rollout state.
     u_prev  = last APPLIED control [a, delta], used for the Δu_0 = u_0 - u_prev term
               (defaults to zero if None).
-    Lane cost penalises lateral position y; obstacles in world coords.
+
+    Obstacles are NOT an argument: dynamic agents no longer arrive as an oracle feed.
+    Everything the rollouts avoid comes from the LiDAR — static circles via
+    LIDAR_COSTMAP.distance() and occlusion boundaries via occ_segs below.
 
     Returns (u_nom, new_mean).
     """
-    global OCC_USED_N, OCC_GATE_DBG, OCC_RANGE_DBG
+    global OCC_USED_N, OCC_GATE_DBG, OCC_RANGE_DBG, OCC_SEGS_USED
     # Nominal MPPI weights / limits. The frontal-threat "go-around" gate (in_corridor / aimed_at_us)
     # has been removed to keep the planner simple: plain lane-following + obstacle rings, and the
     # LiDAR visibility term is what drives any deliberate off-lane motion.
@@ -307,8 +284,6 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     w_lat_eff  = W_LAT
     a_min_eff  = A_MIN
     lane_bias  = 0.0
-    d_infl_arr = np.full(len(obstacles), D_INFL)   # per-obstacle influence ring
-    d_safe_arr = np.full(len(obstacles), D_SAFE)   # per-obstacle hard keep-out
 
     noise = rng.normal(0, [SIG_A, sig_d_eff], (K_MPPI, H_MPPI, 2))
     na    = mean + noise
@@ -347,6 +322,7 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     OCC_USED_N = 0
     OCC_GATE_DBG = None
     OCC_RANGE_DBG = None
+    OCC_SEGS_USED = None
     if OCCLUSION_AWARE and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
         # Range-jump boundary SEGMENTS, tracked across scans (same source as the MPC).
         # The keep-out is the segment dilated by r_keep — a CAPSULE (a disc at each
@@ -396,6 +372,7 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
                     _near = _seg[_in]
                     occ_segs = _near[np.argsort(_d[_in])[:K_OCC]]
                     OCC_USED_N = len(occ_segs)
+                    OCC_SEGS_USED = occ_segs
 
     def _dist_to_occ(px, py):
         """(K,) distance from each rollout pose to the nearest occlusion CAPSULE axis [m].
@@ -413,28 +390,22 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
         u_k   = na[:, k, :]                                  # (K, 2)
         u_km1 = u_prev[None, :] if k == 0 else na[:, k - 1, :]
 
-        # MPC-REFERENCE stage cost (taxi_cost.stage_cost): bounded linear goal pull,
-        # heading alignment, speed tracking, control effort + rate, dynamic-obstacle and
-        # static keep-outs. This REPLACES MPPI's former closure/progress rewards and the
+        # MPC-REFERENCE stage cost (taxi_cost.stage_cost): bounded linear goal pull plus the
+        # static keep-out. This REPLACES MPPI's former closure/progress rewards and the
         # exp-weighted velocity term: those applied ~400x more goal pressure than the MPC,
         # so the identical occlusion penalty was far weaker in relative terms and the ego
-        # cut corners the MPC would not. Obstacles are advanced by a constant-velocity ray
-        # to t_k, exactly as the MPC's P_opos + P_ovel*t_k does.
-        _obs_world = [(s0_fwd + rel[0] + ov[0] * ((k + 1) * DT),
-                       s0_lat + rel[1] + ov[1] * ((k + 1) * DT))
-                      for rel, ov in obstacles]
+        # cut corners the MPC would not. The constant-velocity obstacle ray that used to be
+        # built here (mirroring the MPC's P_opos + P_ovel*t_k) is gone with the oracle feed.
         _d_static = None
         if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
             # ABSOLUTE world (a0,a1): the circles live in world coords and distance()
-            # expects absolute queries (see the [CHK] debug and stage_cost's obstacles/
-            # goal, which are all absolute too). Passing ego-relative deltas here made the
+            # expects absolute queries (as does stage_cost's goal). Passing ego-relative deltas made the
             # clearance huge, so the static keep-out never fired (ego drove through walls).
             _d_static = LIDAR_COSTMAP.distance(fwd, lat)
         cost += tcost.stage_cost(
             fwd, lat, th, vv, u_k, u_km1,
             goal_xy=(goal_fwd, goal_lat), v_des=v_des_eff, t_k=(k + 1) * DT,
-            obstacles=_obs_world, d_infl=D_INFL, d_safe=D_SAFE, w_obs=W_OBS,
-            rho=RHO_SLACK, rho2=RHO_SLACK2, r_act=R_ACT, r_dact=R_DACT,
+            r_act=R_ACT, r_dact=R_DACT,
             w_goal_run=W_GOAL_RUN, w_head=W_HEAD, w_v=W_V,
             d_static=_d_static, d_safe_static=D_SAFE_HARD, w_static=W_HARD)
 
@@ -444,34 +415,7 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
             cost += occlusion_stage_cost(
                 _dist_to_occ(fwd, lat), vv, (k + 1) * DT,
                 V_TARGET, D_SAFE_HARD, W_HARD)
-
-        # (The forward-reachable-set keep-out now lives in the unified occlusion-aware block
-        # above, gated on OCCLUSION_AWARE with the shared constants — see the MPC for parity.)
-
-        # Obstacles — world frame in both modes. rel_xy is ego-relative (world Z, X).
-        # t_elapsed = (k + 1) * DT
-        # if scen is not None:
-        #     # Scenario-based prediction: each obstacle has N_SCEN sampled futures.
-        #     for oi, ((rel_xy, _ov), (ovx, ovy), ent_b) in enumerate(zip(obstacles, scen, ent)):
-        #         di, ds = d_infl_arr[oi], d_safe_arr[oi]
-        #         oz = s0_fwd + rel_xy[0] + ovx * t_elapsed        # (N_SCEN,)
-        #         ox = s0_lat + rel_xy[1] + ovy * t_elapsed        # (N_SCEN,)
-        #         d_obs = np.hypot(fwd[:, None] - oz[None, :],
-        #                          lat[:, None] - ox[None, :])      # (K, N_SCEN)
-        #         cost_obs_scen += np.where(d_obs < di, W_OBS * (di - d_obs)**2, 0.)
-        #         cost_obs_scen += np.where(d_obs < ds, BIG, 0.)
-        # else:
-        #     # Deterministic (single constant-velocity ray) obstacle cost: soft influence ring +
-        #     # hard keep-out, per obstacle.
-        #     # hard keep-out, per obstacle.
-        #     for oi, (rel_xy, obs_v) in enumerate(obstacles):
-        #         di, ds = d_infl_arr[oi], d_safe_arr[oi]
-        #         obs_z = s0_fwd + rel_xy[0] + obs_v[0] * t_elapsed
-        #         obs_x = s0_lat + rel_xy[1] + obs_v[1] * t_elapsed
-        #         d_obs = np.hypot(fwd - obs_z, lat - obs_x)
-        #         cost += np.where(d_obs < di, W_OBS * (di - d_obs)**2, 0.)
-        #         cost += np.where(d_obs < ds, BIG, 0.)
-
+                
     # Terminal goal cost ℓgoal,H-1 = -C_GOAL_TERM * max(0, d0 - d_{H-1}): a heavier copy of the
     # goal reward evaluated at the FINAL rollout state, so a rollout that ENDS closer to the goal
     # wins even if it detoured en route (lets the planner go around obstacles instead of stopping
@@ -527,9 +471,9 @@ def identify_bicycle_model(env, behavior_name, n_steps=200):
 # ── Main control loop ─────────────────────────────────────────────────────────
 
 def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=None,
-                     occ_segments=None, capsule_horizon=None,
-                     max_capsules=12, single_radius=False, show_expansion=True,
-                     occ_ego=None, show_occlusion=True):
+                     occ_frames=None, capsule_horizon=None,
+                     max_frames=6, single_radius=False, show_expansion=False,
+                     show_occlusion=True):
     """Persist the run's ego trajectory as CSV + a top-down PNG plot.
 
     verdict: short outcome tag ("reached" / "collision" / "timeout") used in the
@@ -539,28 +483,49 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     positions (t, x, y), same frame as traj — overlaid on the plot.
     occ_pts (optional): (M, 2) array of static occluder (OCC) cell centres
     (x, y) from the LiDAR costmap, same frame — the buildings/walls.
-    occ_segments (optional): (S, 2, 2) occlusion BOUNDARY segments from the
-    range-jump detector, [[near, far], ...] in the same frame. Each is drawn as
-    the nested forward-reachable-set CAPSULES the MPC constrained against, at
-    radius D_SAFE_HARD + V_TARGET·t for t across the horizon.
+    occ_frames (optional): per-control-step snapshots (t, ego_x, ego_y, segments) of
+    the keep-out the planner was ACTUALLY constrained by at that instant, recorded in
+    run() straight from mppi()'s post-gating set.
+
+    THE PLOT IS A TIME SERIES, not an episode-wide union. max_frames timestamps are
+    sampled evenly across the recorded ones; each contributes
+      * a large dot ON the trajectory at the ego pose at that instant, and
+      * the expanding keep-out shape as it stood at that instant,
+    both in ONE colour, distinct per timestamp. Reading the plot is then a
+    colour match: this is where the ego was, and this is what it was avoiding, at the
+    same moment. Earlier versions drew every boundary the run ever saw, tied to the ego
+    pose where each was FIRST constrained, which mixed timestamps in a single picture.
+
+    The shape is the one MPPI evaluates — capsule_polygon(near, far, r), the level set
+    of the point-to-SEGMENT distance that _dist_to_occ measures. A boundary collapsed to
+    its corner (circle mode) is a degenerate segment and comes out as a circle through
+    the same call.
+
+    WHAT THE GROWTH ACROSS FRAMES MEANS. The radius drawn at a frame is
+    r = D_SAFE_HARD + V_TARGET·min(t − t_first_seen, capsule_horizon): the forward
+    reachable set of a phantom that could have been at the corner when it was first
+    constrained, given the time elapsed SINCE. That is the physical set, and it is what
+    makes the expansion visible along the path.
+
+    It is NOT step-for-step what the cost enforces. Each solve re-applies the growth
+    over its OWN prediction horizon, from D_SAFE_HARD at t_k=0 out to
+    D_SAFE_HARD + V_TARGET·H·DT at the last stage — it does not accumulate across
+    episode time, because a corner still in view is re-observed and the phantom
+    re-anchored every scan. So read the rings as "how far a hidden agent could have got
+    by this timestamp", not as "the radius the planner used at this timestamp".
+
     capsule_horizon (optional): horizon length [s] the keep-out expanded over
     (N·DT). Defaults to 3 s if not given.
     single_radius: True ⇒ Algorithm 1 mode, the ENFORCED radius is the fixed
     D_SAFE_HARD + V_TARGET·capsule_horizon (no per-stage growth).
-    show_occlusion: False ⇒ draw none of the occlusion artifacts (keep-out circles,
-    expansion rings, corner centres, ego-at-detection markers and their connectors),
-    leaving just the trajectory, static occluders, obstacles and goal. The second
-    (horizon-time) colorbar is suppressed too.
-    occ_ego (optional): (S, 3) array of (ego_x, ego_y, t_episode) recorded when each
-    occlusion segment was FIRST constrained — used to tie each keep-out back to the
-    point on the trajectory where it applied.
-    show_expansion: also draw the intermediate reachable sets at t < horizon,
-    showing how the worst-case hidden agent's reachable disc grows. In single-circle
-    mode these are illustrative only — the MPC enforces the outermost radius at every
-    stage — so they are drawn thin and never as the enforced boundary.
-    max_capsules: cap on how many segments get capsules drawn — an episode
-    accumulates far more boundaries than are legible at once, so the ones
-    nearest the ego path are kept.
+    show_occlusion: False ⇒ draw none of the occlusion artifacts, leaving just the
+    trajectory, static occluders, obstacles and goal.
+    show_expansion: unused — kept so existing callers do not break. The expansion is
+    now shown ACROSS TIMESTAMPS (one ring per sampled frame, growing with the time the
+    boundary has been known) rather than as nested rings inside a single frame, which
+    is what buried the trajectory before.
+    max_frames: how many timestamps to draw. More than a handful and the keep-outs
+    overlap into mush, since consecutive frames differ by only a few metres.
     """
     import os
     os.makedirs(out_dir, exist_ok=True)
@@ -582,60 +547,80 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     if occ_pts is not None and len(occ_pts):
         ax.scatter(occ_pts[:, 0], occ_pts[:, 1], c="0.35", s=8, marker="s",
                    alpha=0.5, label="static occluders", zorder=1)
-    # Expanding forward-reachable-set capsules around each occlusion boundary segment.
-    # Drawn first (lowest zorder) so the ego path stays readable on top of them.
-    if show_occlusion and occ_segments is not None and len(occ_segments):
-        from occlusion_capsules import capsule_polygon, point_segment_distance_np
-        segs = np.asarray(occ_segments, float).reshape(-1, 2, 2)
-        occ_ego = None if occ_ego is None else np.asarray(occ_ego, float).reshape(-1, 3)
-        # Rings are coloured by HORIZON time t_k, on a scale distinct from the speed
-        # colormap so the two readings never get confused.
-        horizon_cmap = plt.get_cmap("autumn_r")
+    # Per-timestamp keep-outs. Drawn first (lowest zorder) so the ego path stays
+    # readable on top of them.
+    frames = []
+    if show_occlusion and occ_frames is not None and len(occ_frames):
+        from occlusion_capsules import capsule_polygon
+        # One DISTINCT colour per timestamp, from a qualitative palette. A continuous
+        # ramp (cool/viridis-like) was hard to read here: neighbouring frames came out
+        # nearly the same hue, which is the opposite of what this plot needs — the
+        # frames are discrete and the whole point is telling them apart. Hues chosen to
+        # stay clear of the viridis speed scatter's green-yellow band.
+        # Mid-dark values only: a capsule outline is a thin line on white, so pale
+        # hues (pure yellow/cyan) vanish at 0.8 lw.
+        frame_colors = ["#e6194b", "#f58231", "#b8860b", "#3cb44b",
+                        "#4363d8", "#911eb4", "#008080", "#f032e6"]
 
-        # An episode accumulates far more boundaries than are legible; keep those
-        # nearest the ego path, which are the ones that actually shaped the trajectory.
-        if len(segs) > max_capsules:
-            path = np.column_stack((x, y))
-            dmin = np.array([point_segment_distance_np(path, s[0], s[1]).min()
-                             for s in segs])
-            keep = np.argsort(dmin)[:max_capsules]
-            segs = segs[keep]
-            if occ_ego is not None and len(occ_ego) >= len(dmin):
-                occ_ego = occ_ego[keep]
+        # Sample evenly across the recorded steps. Consecutive frames differ by a few
+        # metres of ego motion, so drawing all of them just overlaps into mush; evenly
+        # spaced ones show how the keep-out evolved over the run.
+        idx = (np.linspace(0, len(occ_frames) - 1, min(max_frames, len(occ_frames)))
+               .round().astype(int))
+        frames = [occ_frames[i] for i in dict.fromkeys(idx.tolist())]
 
         T = float(capsule_horizon) if capsule_horizon else 3.0
-        for si, seg in enumerate(segs):
-            first = (si == 0)
 
-            # Intermediate reachable sets along the horizon, COLOURED BY HORIZON TIME t_k.
-            # When the radius grows per stage (the paper's Fig. 6) each ring is the
-            # constraint enforced at its own timestep — the ego is checked against the set
-            # as it stands at that future instant. In single_radius mode they are
-            # illustrative, because the outermost radius is applied at every stage.
-            n_rings = 6
-            for ti, t in enumerate(np.linspace(0.0, T, n_rings)):
-                if not show_expansion and t < T:
-                    continue
-                poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD + V_TARGET * t)
-                ax.plot(poly[:, 0], poly[:, 1], "-",
-                        color=horizon_cmap(t / T if T else 0.0),
-                        lw=1.4 if ti == n_rings - 1 else 0.8,
-                        alpha=0.95 if ti == n_rings - 1 else 0.6,
+        # WHICH radius each timestamp gets. The keep-out is r(tau) = D_SAFE_HARD +
+        # V_TARGET*tau, where tau is how long the worst-case hidden agent has had to
+        # move. Drawing every frame at the same tau (the enforced tau = T) makes a
+        # persistent corner render as N identical circles — that is why the plot showed
+        # one outline. So tau is measured from when each boundary was FIRST constrained:
+        # the frame that introduced it gets tau = 0, later frames get tau = t - t_first,
+        # and the corner blooms outward across the timestamps exactly as the forward
+        # reachable set does.
+        #
+        # tau is CAPPED at T because the cost caps it there (occlusion.horizon): past
+        # that the planner stops growing the radius, so drawing further growth would
+        # overstate the constraint. Timestamps beyond t_first + T therefore share the
+        # outermost ring rather than each getting a bigger one.
+        t_first = {}          # rounded geometry key -> episode time first constrained
+        corner_labelled = False
+
+        def _key(seg):
+            # 2 m quantisation: the tracker's EMA jitters a corner well under that
+            # between scans, while distinct corners in these scenes sit much further
+            # apart — so re-sightings merge and real boundaries do not.
+            return tuple(np.round(np.asarray(seg).ravel() / 2.0).astype(int))
+
+        for fi, (t_ep, ex, ey, segs) in enumerate(frames):
+            col = frame_colors[fi % len(frame_colors)]
+            segs = np.asarray(segs, float).reshape(-1, 2, 2)
+
+            for seg in segs:
+                k = _key(seg)
+                t0 = t_first.setdefault(k, float(t_ep))
+                tau = min(float(t_ep) - t0, T)
+
+                # capsule_polygon is the level set of the point-to-SEGMENT distance
+                # _dist_to_occ measures, so this is the constraint MPPI applied, not an
+                # illustration of it. A boundary collapsed to its corner is a degenerate
+                # segment and comes out as a circle through the same call.
+                poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD + V_TARGET * tau)
+                ax.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.6, alpha=0.95,
                         zorder=0)
 
-            # Circle centre = the detected occlusion corner.
-            ax.plot(seg[0, 0], seg[0, 1], ".", color="k", ms=5, zorder=2,
-                    label="occlusion corner (centre)" if first else None)
+                # The blind corner the phantom is anchored to. Labelled once for the
+                # legend: len(t_first)==1 stayed true across frames while a single
+                # boundary persisted, so it emitted a duplicate entry per frame.
+                ax.plot(seg[0, 0], seg[0, 1], ".", color="k", ms=5, zorder=2,
+                        label=None if corner_labelled else "occlusion corner (centre)")
+                corner_labelled = True
 
-            # Tie the keep-out to WHERE the ego was when this boundary was constrained:
-            # a hollow marker on the path plus a hairline to the corner. Without this the
-            # episode-wide union gives no clue which part of the run each circle came from.
-            if occ_ego is not None and si < len(occ_ego):
-                ex, ey = float(occ_ego[si][0]), float(occ_ego[si][1])
-                ax.plot([ex, seg[0, 0]], [ey, seg[0, 1]], "-", color="0.35",
-                        lw=0.7, alpha=0.55, zorder=2)
-                ax.plot(ex, ey, "o", mfc="none", mec="k", ms=7, mew=1.2, zorder=3,
-                        label="ego when boundary first constrained" if first else None)
+            # The ego ON the trajectory at this timestamp, in the SAME colour as the
+            # rings drawn for it above.
+            ax.plot(ex, ey, "o", mfc=col, mec="k", ms=11, mew=1.4, zorder=6,
+                    label=f"ego + keep-out @ t = {float(t_ep):.1f} s")
 
     sc = ax.scatter(x, y, c=v, cmap="viridis", s=10, zorder=3)
     ax.plot(x, y, "-", color="0.6", lw=0.8, zorder=2)
@@ -648,13 +633,8 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
         ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18,
                 markeredgecolor="k", label="goal", zorder=5)
     fig.colorbar(sc, ax=ax, label="speed [m/s]")
-    # Second colorbar for the keep-out rings: which future instant each one constrains.
-    if show_occlusion and occ_segments is not None and len(occ_segments):
-        import matplotlib as _mpl
-        T_cb = float(capsule_horizon) if capsule_horizon else 3.0
-        sm = _mpl.cm.ScalarMappable(cmap=horizon_cmap,
-                                    norm=_mpl.colors.Normalize(vmin=0.0, vmax=T_cb))
-        fig.colorbar(sm, ax=ax, label="keep-out horizon time $t_k$ [s]")
+    # No colorbar for the keep-outs: the palette is qualitative, and each timestamp
+    # names itself in the legend.
     # Frame the view on the EGO trajectory (not the full scatter of occluders, which
     # can sit hundreds of metres away and would shrink the path to a dot). Square,
     # equal-scale box centred on the path extent with a fixed margin; far occluders
@@ -694,8 +674,14 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         print(f"[Controller] Planning radii : D_INFL={d_infl:.1f} m (plan-start), "
               f"D_SAFE={d_safe:.1f} m (keep-out)")
     print(f"[Controller] Connecting to Unity on port {port} ...")
+    # Both flags acted on the removed oracle obstacle slots, so they are now no-ops.
+    # Announced rather than silently ignored, matching how --visibility-cost is handled.
     if detect_range < float("inf"):
-        print(f"[Controller] Detection range : {detect_range:.1f} m  (obstacles beyond masked)")
+        print("[Controller] --detect-range no longer applies (it masked the removed oracle "
+              "obstacle slots; LiDAR range is set by scan.max_range) — IGNORED.")
+    if noise_std > 0.0:
+        print("[Controller] --noise-std no longer applies (it corrupted the removed oracle "
+              "obstacle slots) — IGNORED.")
     if visibility_cost:
         # The active-perception visibility term was a product of the removed persistent
         # occupancy grid; the circle model has no accumulated UNKNOWN volume to score.
@@ -751,8 +737,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     act_size = spec.action_spec.continuous_size
     assert obs_size == OBS_SIZE, (
         f"Expected {OBS_SIZE} observations, got {obs_size}. "
-        f"Set BehaviorParameters Vector Observations = {OBS_SIZE} in Unity Inspector "
-        f"and ensure TaxiAgent.cs K_OBS = {K_OBS}."
+        f"Set BehaviorParameters Vector Observations = {OBS_SIZE} in the Unity Inspector "
+        f"(every scene under Assets/Scenes) to match TaxiAgent.CollectObservations."
     )
     assert act_size == 2, (
         f"Expected 2 continuous actions, got {act_size}."
@@ -768,18 +754,19 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     # still writes its trajectory) instead of dying with a traceback.
     unity_stopped = False
     mean      = np.zeros((H_MPPI, 2))
-    min_h     = np.inf
-    min_dist  = np.inf
+    min_clear = np.inf   # closest approach to any LiDAR circle SURFACE over the run
     collided  = False
     reached   = False
     traj      = []   # per-step ego pose: (t, x, y, theta, v, a_cmd, delta_cmd)
-    obs_track = []   # per-step obstacle world positions: list of (t, x, y) rows
     # Union across the run (deduped by rounded world cell) of the static occluders and
     # occlusion boundaries the perception produced. Perception is frame-based (no memory),
     # so a single end-of-run snapshot only shows what is visible at the goal — accumulate to
     # show the full extent the ego actually reacted to.
     occ_seen  = {}   # static occluder points  → plotted as "static occluders"
-    occ_track = {}   # tracked occlusion boundaries, keyed on stable track id
+    # Per-control-step snapshots (t, ego_x, ego_y, segments) of what the planner was
+    # ACTUALLY constrained by at that instant. The plot samples these, so each drawn
+    # keep-out belongs to one timestamp rather than to an episode-wide union.
+    occ_frames = []
 
     env.reset()
     decision_steps, terminal_steps = env.get_steps(behavior_name)
@@ -793,7 +780,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     while not episode_done:
         # ── Terminal step (episode just ended) ──────────────────────────────
         if len(terminal_steps) > 0:
-            collided = min_h < 0.
+            collided = min_clear < 0.0
             reached  = not terminal_steps.interrupted[0] and not collided
             episode_done = True
             break
@@ -806,12 +793,13 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         obs   = decision_steps.obs[0][0]          # shape (OBS_SIZE,)
         ep_steps += 1
 
-        obs_n = inject_sensor_noise(obs, noise_std, rng)
-        s, obstacles, goal_xy = obs_to_state(obs_n, delta_actual, accel_actual)
+        s, goal_xy = obs_to_state(obs, delta_actual, accel_actual)
 
-        # Rebuild the LiDAR map from the latest cloud+pose, scrubbing returns near
-        # the known dynamic agents (the oracle handles those). ego_fwd (world a0,a1)
-        # orients the visibility ROI wedge — same axes as the mppi rollout frame.
+        # Rebuild the LiDAR map from the latest cloud+pose. Returns from OTHER AIRCRAFT
+        # are deliberately kept: they are the only signal about moving agents now that the
+        # oracle obstacle slots are gone, so scrubbing them would blind the ego entirely.
+        # ego_fwd (world a0,a1) orients the visibility ROI wedge — same axes as the mppi
+        # rollout frame.
         if LIDAR_COSTMAP is not None:
             ego_fwd = np.array([np.cos(s[2]), np.sin(s[2])])
             LIDAR_COSTMAP.update(ego_fwd)
@@ -859,27 +847,14 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 if _circ is not None:
                     for wx, wy, _r in _circ:
                         occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
-                # Only track occlusion boundaries when occlusion-awareness is actually
-                # active — otherwise the planner ignores them and plotting them is
-                # misleading (the purple diamonds imply a constraint that isn't there).
-                if OCCLUSION_AWARE and OCC_TRACKER is not None:
-                    # Record the TRACKED range-jump boundaries within OCC_QUERY_R,
-                    # keyed on stable track id so a corner re-seen across scans is ONE
-                    # entry, not a smear of jittered near-duplicates. Value keeps the
-                    # ego pose + episode time of the first sighting.
-                    _segs = OCC_SEGS_NOW
-                    if _segs is not None and len(_segs):
-                        _tids = OCC_TRACKER.ids()
-                        _ego = np.array([s[0], s[1]])
-                        for _i, _sg in enumerate(_segs):
-                            if _i >= len(_tids):
-                                break
-                            if point_segment_distance_np(_ego[None, :], _sg[0],
-                                                         _sg[1])[0] <= OCC_QUERY_R:
-                                occ_track.setdefault(
-                                    _tids[_i], (_sg[0][0], _sg[0][1], _sg[1][0],
-                                                _sg[1][1], s[0], s[1], ep_steps * DT))
-        u_nom, mean = mppi(s, mean, obstacles, goal_xy, u_prev)
+        u_nom, mean = mppi(s, mean, goal_xy, u_prev)
+
+        # Snapshot what the solve just above was constrained by, tagged with this
+        # timestamp and ego pose. Taken AFTER mppi() so it is the post-gating set that
+        # entered the cost — the same geometry _dist_to_occ measured against.
+        if save_traj is not None and OCC_SEGS_USED is not None and len(OCC_SEGS_USED):
+            occ_frames.append((ep_steps * DT, float(s[0]), float(s[1]),
+                               np.array(OCC_SEGS_USED, dtype=float)))
 
         u_cmd      = u_nom
         cbf_engaged = False
@@ -911,20 +886,19 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         else:
             accel_actual = float(np.clip(a_cmd, A_MIN, A_MAX))
 
-        # Log nearest obstacle distance — measured directly from geometry (min |rel_xy|) so it's
-        # correct regardless of the Unity-side dSafe baked into obs[17]. (Back-computing it from
-        # obs[17] + D_SAFE² read 0.00 whenever the retuned Python D_SAFE < Unity's dSafe.)
-        h_val = float(obs[17])
-        dist  = float(min((np.hypot(rel[0], rel[1]) for rel, _ in obstacles), default=np.inf))
-        min_h    = min(min_h, h_val)
-        min_dist = min(min_dist, dist)
+        # Closest approach, now measured from PERCEPTION rather than the removed oracle
+        # slots: clearance to the nearest LiDAR circle surface. This covers buildings and
+        # other aircraft alike, since both are just returns. A negative value means the ego
+        # drove inside a covering circle, which is what now counts as a collision.
+        if LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
+            _c = LIDAR_COSTMAP.circles()
+            if _c is not None and len(_c):
+                min_clear = min(min_clear, float(
+                    np.min(np.hypot(_c[:, 0] - s[0], _c[:, 1] - s[1]) - _c[:, 2])))
 
 
         # Record ego pose this step (world frame: x=Unity Z, y=Unity X).
         traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd))
-        # Record obstacle world positions this step (rel_xy is ego-relative world coords).
-        for rel, _ov in obstacles:
-            obs_track.append((ep_steps * DT, s[0] + rel[0], s[1] + rel[1]))
 
         action = ActionTuple(
             continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)
@@ -952,25 +926,19 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     if save_traj is not None and traj:
         # Overlay the run-wide UNION of static occluders and occlusion boundaries the
         # perception produced (not a single decaying end-of-run frame), so the plot shows
-        # every wall/blind corner the ego reacted to. obs_track dynamic slots are often
-        # empty when no agent ever enters range.
+        # every wall/blind corner the ego reacted to.
         occ_pts = np.array(list(occ_seen.keys())) if occ_seen else None
-        if occ_track:
-            _vals = np.array(list(occ_track.values()), dtype=float)
-            occ_segments, occ_ego = _vals[:, :4].reshape(-1, 2, 2), _vals[:, 4:]
-        else:
-            occ_segments = occ_ego = None
         _save_trajectory(save_traj, verdict, goal_xy, np.asarray(traj),
-                         np.asarray(obs_track) if obs_track else None,
-                         occ_pts, occ_segments=occ_segments, occ_ego=occ_ego,
+                         None,   # dynamic-obstacle track: no oracle feed to record
+                         occ_pts, occ_frames=occ_frames,
                          # OCC_HORIZON, not the PLANNING horizon: the keep-out is
                          # capped at OCC_HORIZON in the cost, so drawing H_MPPI*DT
                          # would overstate the constraint by V_TARGET*(6.0-3.0)=9 m.
                          capsule_horizon=OCC_HORIZON,
                          show_occlusion=show_occlusion_plot)
 
-    print(f"\n[Controller] steps={ep_steps:4d}  min_dist={min_dist:5.2f} m "
-          f"(target >= {D_SAFE:.1f} m)  min_h={min_h:8.2f} (target >= 0)  → {verdict.upper()}")
+    print(f"\n[Controller] steps={ep_steps:4d}  min_clearance={min_clear:5.2f} m "
+          f"(LiDAR circle surfaces, target >= {D_SAFE_HARD:.1f} m)  → {verdict.upper()}")
 
 
 if __name__ == "__main__":

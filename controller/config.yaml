@@ -132,7 +132,7 @@ keepout:
 # Keep v_target REALISTIC — too high and the bubble swallows the horizon and the
 # ego freezes.
 occlusion:
-  v_target: 10.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
+  v_target: 5.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
   horizon: 3.0              # [s] cap on the expansion time. Sizes the Algorithm-1 single circle
                             #   and the plotted capsules; NOT applied inside
                             #   occlusion_capsules.occlusion_stage_cost.
@@ -193,7 +193,7 @@ scan:
 
 # ── MPPI (sampling planner) ──────────────────────────────────────────────────
 mppi:
-  horizon: 40               # planning steps (x vehicle.dt seconds)
+  horizon: 60               # planning steps (x vehicle.dt seconds)
   samples: 1500             # rollouts per control step
   lambda: 1.0               # temperature. See the scaling note under `cost`: this is the
                             #   correct knob for softmax discrimination.

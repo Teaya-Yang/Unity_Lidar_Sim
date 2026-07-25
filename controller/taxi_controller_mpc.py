@@ -24,9 +24,14 @@ Closed-loop re-solves every DT correct any small mismatch against Unity's exact
 (clamped) dynamics. State is [x, y, theta, v, accel]; the rate-limited delta_actual
 of the MPPI rollout is not a model state here.
 
-Everything else — observation contract (OBS_SIZE=20), action contract ([a, delta]),
+Everything else — observation contract (OBS_SIZE=7), action contract ([a, delta]),
 the sys-id probe, and trajectory logging — is shared with `taxi_controller_mppi.py`
-via direct import, so the two controllers stay in lock-step.
+via direct import.
+
+NOT CURRENTLY RUNNABLE. The oracle dynamic-obstacle slots were removed from the Unity
+observation vector; the MPPI controller was migrated to LiDAR-only perception, this NLP
+was not. run() refuses to start rather than plan against obstacle slots that no longer
+arrive — see the SystemExit there.
 
 Observation / action contract: see taxi_controller.py (unchanged).
 
@@ -55,13 +60,13 @@ from taxi_controller_mppi import (
     DT, L, V_DES, GOAL_SLOWDOWN_DIST, GOAL_MIN_SPEED,
     A_MIN, A_MAX, DELTA_LIM,
     DRAG_COEFF, ACCEL_TAU, MAX_STEER_RATE, STEER_ROLLOFF_SPD, STEER_ROLLOFF_MIN,
-    D_SAFE, D_INFL, K_OBS, OBS_SIZE,
+    D_SAFE, D_INFL, OBS_SIZE,
     D_SAFE_HARD, W_HARD,
     V_TARGET, K_OCC, OCC_QUERY_R, OCC_FWD_HALF_ANGLE,
     SCAN_FOV_H, SCAN_FOV_V, SCAN_RES_H, SCAN_RES_V, SCAN_MAX_RANGE,
     OCC_TRACK_ASSOC, OCC_TRACK_ALPHA, OCC_TRACK_TTL, OCC_TRACK_HITS,
     W_SIGHT, A_BRAKE_SIGHT, V_SIGHT_FLOOR, OCC_HORIZON,
-    obs_to_state, inject_sensor_noise,
+    obs_to_state,
     identify_bicycle_model, _save_trajectory,
 )
 from occlusion_capsules import (point_segment_distance_sym, point_segment_distance_np,
@@ -101,6 +106,11 @@ from taxi_cost import (W_GOAL_RUN, W_GOAL_TERM, W_HEAD, W_V, R_ACT, R_DACT)
 # bounded goal pull, so no rollout buys its way through the keep-out. A soft
 # influence ring gives smooth early deflection before the hard radius is reached.
 from taxi_cost import W_OBS, RHO_SLACK, RHO_SLACK2
+
+# Obstacle-slot count. Bound here from the config rather than imported from the MPPI
+# controller, which dropped it along with the oracle observation slots. It sizes NLP
+# slots that run() now refuses to feed — see the SystemExit there.
+K_OBS = CFG["dynamic_obstacles"]["k_obs"]
 
 # Static-obstacle (LiDAR costmap) avoidance. Enabled with --lidar-costmap. Each
 # control step the K_STATIC nearest occupied (OCC) cell centres to the ego are fed
@@ -723,9 +733,20 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, noise_std=0.0,
         d_infl=D_INFL, d_safe=D_SAFE, horizon=N_MPC,
         lidar_costmap=False, lidar_topic="/point_cloud", save_traj=None,
         occlusion_aware=False, show_occlusion_plot=True):
-    # Detection range lives as a module global inside taxi_controller (obs_to_state
-    # reads it), so set it there rather than shadowing a local copy.
-    tc.DETECTION_RANGE = detect_range
+    # The oracle dynamic-obstacle slots were removed from the Unity observation vector
+    # (TaxiAgent.CollectObservations, now 7 floats). The MPPI planner was migrated with
+    # them; this NLP was NOT — P_opos/P_ovel, the per-stage constant-velocity prediction
+    # and the keep-out/influence-ring terms are all still wired to obstacles that no
+    # longer arrive. Refusing here is deliberate: running anyway would silently pack
+    # every obstacle slot with the far-parked sentinel, and the MPC would drive as if the
+    # airfield were empty of moving traffic while still reporting "obstacle avoidance ON".
+    raise SystemExit(
+        "[MPC] Unsupported: the dynamic-obstacle oracle was removed from the observation "
+        "vector, but this controller still plans against it (see TaxiMPC._pack_params / "
+        "P_opos / P_ovel).\n"
+        "      Use taxi_controller_mppi.py, which perceives obstacles through the LiDAR, "
+        "or port the MPC's dynamic terms onto a sensed estimate first."
+    )
 
     print(f"[MPC] Connecting to Unity on port {port} ...")
     print(f"[MPC] Horizon N={horizon} ({horizon * DT:.1f} s)  "
