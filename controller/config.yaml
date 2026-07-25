@@ -1,0 +1,226 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Taxiing controller configuration — SINGLE SOURCE OF TRUTH for both planners.
+#
+# taxi_controller_mppi.py (sampling), taxi_controller_mpc.py (CasADi/IPOPT) and
+# taxi_cost.py (the shared stage cost) all read their tunables from this file via
+# taxi_config.py. Anything that is a NUMBER YOU MIGHT TUNE lives here; anything
+# derived (OBS_SIZE), contractual (the observation layout) or runtime state (the
+# LiDAR costmap handle, CLI flags) stays in code.
+#
+# Sections marked SHARED are read by both controllers — that is the point. Before
+# this file existed, scan geometry, occlusion-tracker gains, K_OCC and OCC_QUERY_R
+# were declared TWICE (once per controller) and had already drifted apart.
+#
+# Load an alternative tuning with  --config path/to/other.yaml  on either
+# controller. Values are validated on load: unknown keys and missing keys are
+# both errors, so a typo fails loudly at startup rather than silently keeping a
+# default.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Vehicle model — MUST match TaxiAgent.cs inspector fields ─────── SHARED ───
+# The MPC's smooth prediction model and the MPPI rollout both use these. They are
+# also what identify_bicycle_model() checks against when the sys-id probe runs.
+vehicle:
+  dt: 0.1                   # [s] Unity Fixed Timestep (Project Settings -> Time)
+  wheelbase: 6.0            # [m]
+  v_des: 8.0                # [m/s] desired taxi speed
+  drag_coeff: 0.04          # [1/s] aerodynamic + rolling drag
+  accel_tau: 0.5            # [s] thrust/brake first-order lag
+  max_steer_rate: 0.6       # [rad/s] nose-wheel steering rate limit
+  steer_rolloff_spd: 15.0   # [m/s] speed at which steering authority starts rolling off
+  steer_rolloff_min: 0.25   # minimum steering authority fraction at high speed
+
+# ── Control limits ───────────────────────────────────────────────── SHARED ───
+limits:
+  a_min: -4.0               # [m/s^2]
+  a_max: 1.5                # [m/s^2]
+  delta_lim: 0.5            # [rad]
+
+# ── Goal approach ────────────────────────────────────────────────── SHARED ───
+# At v_des the aircraft's minimum turn radius can exceed the remaining distance
+# once it is close in, so it geometrically cannot curve tightly enough to hit the
+# 2 m arrival threshold — it sweeps past and loops back, which reads as circling.
+# Tapering the speed TARGET shrinks the turn radius enough for a precise approach.
+goal:
+  slowdown_dist: 15.0       # [m] remaining distance at which the speed target starts tapering
+  min_speed: 1.5            # [m/s] target floor away from the goal. NOT 0: the bicycle model's
+                            #   steering authority rolls off toward zero speed, so a 0 floor
+                            #   stalls the ego mid-course.
+  stop_dist: 5.0            # [m] MPC only — inside this the target ramps to 0 so it brakes to a
+                            #   halt ON the goal instead of overshooting the capture radius.
+                            #   Continuous with the outer taper (factor = 1 beyond this).
+
+# ── Shared stage-cost weights — THE MPC IS THE REFERENCE ─────────── SHARED ───
+# taxi_cost.stage_cost re-expresses the MPC's NLP objective in NumPy so the MPPI
+# rollout evaluates the same function. Changing anything here changes BOTH.
+#
+# WHY THE GOAL PULL IS DELIBERATELY WEAK: a linear distance term has a BOUNDED
+# gradient, unlike ||p - p_goal||^2 whose gradient grows without limit far from the
+# goal and would dwarf the keep-out penalties. That is what lets the obstacle and
+# occlusion terms reliably win near a surface.
+#
+# NOTE FOR MPPI: rollouts are weighted by exp(-cost / lambda). With these
+# (intentionally small) weights, cost differences between rollouts can fall far
+# below lambda, leaving the softmax nearly uniform and the planner unable to
+# discriminate. Scale the WHOLE cost — equivalently, divide mppi.lambda — which
+# leaves the argmin and every relative trade-off untouched. Re-weighting
+# individual terms instead would change the optimum and break MPC parity.
+cost:
+  w_goal_run: 0.05          # running goal pull (LINEAR distance -> bounded gradient)
+  w_goal_term: 2.0          # terminal pull on the FINAL state (LINEAR)
+  w_head: 6.0               # heading alignment toward the goal bearing
+  w_v: 2.0                  # speed tracking toward the goal-tapered desired speed
+  r_act: [0.05, 0.20]       # control effort, diagonal of R, per channel [a, delta]
+  r_dact: [0.10, 0.70]      # control rate (smoothness), diagonal of R_delta
+
+# ── Dynamic obstacles (other aircraft) ───────────────────────────── SHARED ───
+# These are NEGOTIATED with rather than simply avoided, so unlike the static and
+# occlusion keep-outs they retain the soft influence ring + exact-penalty shape:
+# on a head-on pass the ego cannot keep d_safe either way (the oncoming agent
+# comes to it), and a pure hard keep-out would make "stop and wait" the cheapest
+# option.
+dynamic_obstacles:
+  k_obs: 3                  # obstacles in the observation vector (sets OBS_SIZE — see the
+                            #   contract in taxi_controller_mppi.py's docstring)
+  d_safe: 14.0              # [m] keep-out radius
+  d_infl: 30.0              # [m] soft influence radius
+  w_obs: 8.0                # soft influence ring weight
+  rho_slack: 10.0           # linear exact-penalty weight on a keep-out violation. LINEAR is the
+                            #   principled choice: above a finite threshold an L1 penalty is
+                            #   EXACT (its minimizer is the constrained minimizer), whereas a
+                            #   quadratic penalty always leaves a residual violation ~ 1/weight.
+  rho_slack2: 5.0           # quadratic companion term
+  d_infl_pass: 15.0         # [m] influence ring for a FRONTAL blocker being passed (go-around).
+                            #   Must sit well ABOVE d_safe so a wide soft band builds lateral
+                            #   offset early; only ~1 m above and the ego feels the agent at the
+                            #   last metre and clips the keep-out.
+  unc_growth: 1.0           # [m per s of prediction time] influence-ring inflation, applied ONLY
+                            #   to frontal blockers being passed. Constant-velocity prediction
+                            #   degrades with t, so pass clearance grows mildly with it. NOT
+                            #   applied to crossers/convergers: an inflated ring covers the whole
+                            #   lane and its lateral gradient shoves the ego off-road when braking
+                            #   in-lane is the right response.
+  unc_growth_max: 4.0       # [m] cap on that inflation, so it cannot grow unbounded
+  headon_giveway: 6.0       # [m] lateral give-way target: the moment an oncoming agent is
+                            #   detected the lane target shifts this far AWAY from it, so the ego
+                            #   eases off-centre EARLY and holds that side through the pass.
+  w_half: 10.0              # [m] taxiway half-width
+
+# ── The ONE hard keep-out: static surfaces AND occlusion boundaries ─ SHARED ──
+# Both are hazards the ego must simply not enter, so they share a radius and a
+# weight. The only difference is that the occlusion radius EXPANDS along the
+# horizon by occlusion.v_target * t_k (the hidden agent's forward reachable set)
+# while the static one is fixed.
+#
+# CAVEAT — w_hard is a PENALTY, not a constraint. A quadratic penalty is inexact
+# at any finite weight: the residual violation is about |grad(other terms)| /
+# (2*w_hard), so ~5e-7 m here. Hard in practice, not in theory. Raising it further
+# buys nothing and costs IPOPT conditioning (this weight against w_goal_run = 0.05
+# is already ~7 orders of magnitude of spread in the Hessian). If IPOPT starts
+# returning Restoration_Failed, drop this to 1e4 — still overwhelmingly dominant.
+keepout:
+  d_safe_hard: 16.0         # [m] ~1 aircraft width
+  w_hard: 1.0e+6             # "infinite" hard-constraint weight
+
+# ── Occlusion-aware safety (Firoozi et al., forward reachable sets) ─ SHARED ──
+# Each detected occlusion boundary (a LiDAR range-jump blind corner) seeds an
+# EXPANDING keep-out: a worst-case hidden agent starts on the boundary and
+# advances at up to v_target, so the forbidden radius grows as v_target * t_k and
+# the ego gives blind corners a wider berth the further ahead it plans. The base
+# radius and weight come from the `keepout` section above.
+#
+# Keep v_target REALISTIC — too high and the bubble swallows the horizon and the
+# ego freezes.
+occlusion:
+  v_target: 5.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
+  horizon: 3.0              # [s] cap on the expansion time. Sizes the Algorithm-1 single circle
+                            #   and the plotted capsules; NOT applied inside
+                            #   occlusion_capsules.occlusion_stage_cost.
+  k_occ: 10                 # nearest boundaries constrained/evaluated per step (0 => off)
+  query_r: 60.0             # [m] only consider boundaries within this radius of the ego
+  fwd_half_angle: 90.0      # [deg] only boundaries AHEAD of the ego seed keep-outs — a phantom
+                            #   emerging from a corner already driven past cannot be run into,
+                            #   and constraining it just brakes the ego for nothing.
+  use_capsules: true        # MPC: segment-dilated capsules vs degenerate point circles
+  single_circle: false      # MPC: Algorithm 1 — ONE fixed circle of radius v_target * horizon
+                            #   per boundary, rebuilt each scan, instead of a nested set
+                            #   growing along the horizon.
+  # RSS sightline speed cap (MPC objective): slow enough to stop before the nearest
+  # occlusion. Widening the arc alone would let the ego round a blind corner at
+  # cruise speed; this makes it slow INTO the corner.
+  w_sight: 15.0             # over-speed^2 penalty weight
+  a_brake_sight: 0.4        # [m/s^2] assumed braking decel for the RSS stopping distance
+                            #   (deliberately gentle => the ego slows early)
+  v_sight_floor: 2.5        # [m/s] never cap the sightline speed below this
+
+# ── Occlusion corner tracking ────────────────────────────────────── SHARED ───
+# Corners are re-derived from scratch every scan, so the SAME physical corner
+# lands on a different beam each time and returns displaced by up to the beam
+# spacing (~r*dtheta, e.g. 0.5 m at 30 m with 1 deg resolution). Untracked, that
+# reads downstream as a stream of brand-new boundaries: the plot smears with
+# near-duplicates and the constraint centre jitters every step, which shows up as
+# steering chatter.
+occlusion_tracker:
+  assoc_radius: 3.0         # [m] association gate — above beam-quantisation jitter, below
+                            #   typical corner spacing
+  alpha: 0.35               # EMA weight on each new measurement
+  ttl: 0.6                  # [s] drop a track unseen this long, so corners genuinely left
+                            #   behind do expire
+  min_hits: 2               # confirmations before a track is used (kills one-off flickers)
+
+# ── LiDAR scan geometry ──────────────────────────────────────────── SHARED ───
+# MUST match the Unity PointCloudPublisher Inspector fields. The flat PointCloud2
+# is reshaped back into its beam grid using exactly these numbers, so a mismatch
+# is detected and the scan ignored — the range-jump detector needs beam adjacency.
+scan:
+  fov_h: 360.0              # [deg]
+  fov_v: 45.0               # [deg]
+  res_h: 1.0                # [deg]
+  res_v: 1.0                # [deg]
+  max_range: 1000.0         # [m]
+
+# ── MPPI (sampling planner) ──────────────────────────────────────────────────
+mppi:
+  horizon: 40               # planning steps (x vehicle.dt seconds)
+  samples: 1500             # rollouts per control step
+  lambda: 1.0               # temperature. See the scaling note under `cost`: this is the
+                            #   correct knob for softmax discrimination.
+  sig_a: 1.0                # noise std for acceleration samples
+  sig_d: 0.70               # noise std for steering samples
+  # MPPI-local stage costs, layered on top of the shared `cost` section.
+  w_lat: 0.05               # lane-centre lateral offset
+  w_head: 4.0               # MPPI-local heading weight (shadows cost.w_head in the MPPI rollout)
+  w_v: 1.2                  # MPPI-local speed weight (shadows cost.w_v)
+  w_ctrl: 0.05              # control magnitude
+  w_off: 2.0                # off-lane penalty
+  w_prog: 1.0               # forward-progress reward. Raised (from 0.4) together with lowering
+                            #   w_obs: an over-weighted obstacle term made "stop and wait" the
+                            #   cheapest option on a head-on pass. Trade-off: slightly less
+                            #   conservative around crossers/convergers.
+  # Goal-approach reward: -c_goal * max(0, d0 - d_k), with d0 the distance at
+  # rollout start. The heavier TERMINAL copy weights the END position of the
+  # rollout.
+  c_goal: 20.0
+  c_goal_term: 10.0
+  c_progress: 10.0
+  # Defaults for the --n-scenarios / --w-info / --info-range flags.
+  n_scen: 10                # sampled futures per obstacle in scenario mode
+  w_info: 10                # belief-entropy caution weight (--uncertainty)
+  info_range: 10            # [m] radius of that caution term. Raise toward d_infl so the ego
+                            #   slows for ambiguous distant threats.
+
+# ── MPC (CasADi + IPOPT) ─────────────────────────────────────────────────────
+mpc:
+  horizon: 30               # planning steps. IPOPT solves a real NLP each step, so this trades
+                            #   look-ahead against the per-step solve budget.
+  k_static: 12              # nearest static obstacle-circles constrained per step — coverage of
+                            #   nearby walls vs solve time
+  static_query_r: 35.0      # [m] only consider static circles within this radius of the ego
+  # Dead-ahead symmetry breaking (warm-start only — constraints untouched, so the
+  # full keep-out is preserved). A frontal obstacle on the ego->goal line leaves
+  # IPOPT with two symmetric go-around basins and no reason to prefer either;
+  # curving the initial guess breaks the tie.
+  sym_lat_thresh: 5.0       # [m] |lateral offset| below which an obstacle counts as dead-ahead
+  sym_ahead_range: 22.0     # [m] only bias for obstacles this close ahead
+  sym_bias: 0.35            # [rad] steering bias applied in the seeded guess
+  sym_bias_frac: 0.5        # fraction of the horizon over which the bias is applied

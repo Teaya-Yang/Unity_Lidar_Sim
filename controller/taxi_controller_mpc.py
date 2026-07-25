@@ -56,27 +56,32 @@ from taxi_controller_mppi import (
     A_MIN, A_MAX, DELTA_LIM,
     DRAG_COEFF, ACCEL_TAU, MAX_STEER_RATE, STEER_ROLLOFF_SPD, STEER_ROLLOFF_MIN,
     D_SAFE, D_INFL, K_OBS, OBS_SIZE,
-    D_SAFE_STATIC, D_INFL_STATIC,
-    V_TARGET, D_SAFE_OCC, D_INFL_OCC, W_OCC,
-    W_SIGHT, A_BRAKE_SIGHT, V_SIGHT_FLOOR, GOAL_OCC_CLEAR, OCC_HORIZON,
+    D_SAFE_HARD, W_HARD,
+    V_TARGET, K_OCC, OCC_QUERY_R, OCC_FWD_HALF_ANGLE,
+    SCAN_FOV_H, SCAN_FOV_V, SCAN_RES_H, SCAN_RES_V, SCAN_MAX_RANGE,
+    OCC_TRACK_ASSOC, OCC_TRACK_ALPHA, OCC_TRACK_TTL, OCC_TRACK_HITS,
+    W_SIGHT, A_BRAKE_SIGHT, V_SIGHT_FLOOR, OCC_HORIZON,
     obs_to_state, inject_sensor_noise,
     identify_bicycle_model, _save_trajectory,
 )
 from occlusion_capsules import (point_segment_distance_sym, point_segment_distance_np,
-                                OcclusionCornerTracker)
+                                OcclusionCornerTracker, occlusion_stage_cost)
 
 # ── MPC-specific tuning ───────────────────────────────────────────────────────
 # Horizon: MPPI uses H=60 (6 s) because sampling is cheap. IPOPT solves a real NLP
 # each step, so a shorter horizon keeps the per-step solve well under the DT budget
 # while still seeing far enough ahead for taxi-speed avoidance. 25 steps = 2.5 s.
-N_MPC   = 30
+from taxi_config import CFG
+_mpc, _occ, _goal = CFG["mpc"], CFG["occlusion"], CFG["goal"]
+
+N_MPC   = _mpc["horizon"]
 
 # Goal capture zone. The imported speed taper floors the target at GOAL_MIN_SPEED so
 # the ego never stalls mid-course — but right at the goal that floor means it can't
 # brake to a halt, so it overshoots the small arrival radius and orbits back around.
 # Inside GOAL_STOP_DIST we multiply the target down to 0 at the goal so the MPC brakes
 # to a stop on it. Continuous with the outer taper (factor = 1 beyond this distance).
-GOAL_STOP_DIST = 5.0    # [m] remaining distance within which the speed target ramps to 0
+GOAL_STOP_DIST = _goal["stop_dist"]   # [m] distance within which the speed target ramps to 0
 
 # Stage-cost weights. Everything is kept well-scaled (O(1) gradients) so the NLP
 # is well-conditioned. The driving objective uses BOUNDED-gradient terms — heading
@@ -100,21 +105,20 @@ from taxi_cost import W_OBS, RHO_SLACK, RHO_SLACK2
 # Static-obstacle (LiDAR costmap) avoidance. Enabled with --lidar-costmap. Each
 # control step the K_STATIC nearest occupied (OCC) cell centres to the ego are fed
 # as fixed keep-out points into dedicated NLP slots, reusing the slack machinery
-# above with the static radii D_SAFE_STATIC / D_INFL_STATIC (imported from the MPPI
+# above with the shared hard keep-out D_SAFE_HARD / W_HARD (imported from the MPPI
 # controller). K_STATIC trades coverage of nearby walls against solve time.
-K_STATIC       = 12       # number of nearest static OCC points constrained per step
-from taxi_cost import W_STATIC_RING
-STATIC_QUERY_R = 35.0     # only consider OCC cells within this radius of the ego [m]
+K_STATIC       = _mpc["k_static"]        # nearest static OCC points constrained per step
+STATIC_QUERY_R = _mpc["static_query_r"]  # only consider OCC cells within this radius [m]
 
 # Dead-ahead symmetry breaking (warm-start only — constraints are untouched, so
 # full D_SAFE is preserved). A frontal obstacle within SYM_AHEAD_RANGE whose lateral
 # offset from the ego→goal line is under SYM_LAT_THRESH is treated as "on the line";
 # the initial guess is then curved to one side with SYM_BIAS steering for the first
 # SYM_BIAS_FRAC of the horizon so IPOPT descends into a go-around basin.
-SYM_LAT_THRESH  = 5.0    # |lateral offset| below which an obstacle counts as dead-ahead [m]
-SYM_AHEAD_RANGE = 22.0   # only bias for obstacles this close ahead [m]
-SYM_BIAS        = 0.35   # steering bias applied in the seeded guess [rad]
-SYM_BIAS_FRAC   = 0.5    # fraction of the horizon over which the bias is applied
+SYM_LAT_THRESH  = _mpc["sym_lat_thresh"]
+SYM_AHEAD_RANGE = _mpc["sym_ahead_range"]
+SYM_BIAS        = _mpc["sym_bias"]
+SYM_BIAS_FRAC   = _mpc["sym_bias_frac"]
 
 # ── Occlusion-aware MPC (Firoozi et al., forward reachable sets) ──────────────
 # Undetected agents may emerge from occluded regions. Following the paper's
@@ -127,24 +131,16 @@ SYM_BIAS_FRAC   = 0.5    # fraction of the horizon over which the bias is applie
 # ego therefore gives occluded corners a wider berth the further ahead it plans.
 # Enabled only with --lidar-costmap (needs the map); off ⇒ k_occ=0, zero cost.
 #
-# The occlusion model + constants (V_TARGET, D_SAFE_OCC, D_INFL_OCC, W_OCC, and the
+# The occlusion model + constants (V_TARGET, D_SAFE_HARD, W_HARD, and the
 # sightline cap W_SIGHT / A_BRAKE_SIGHT / V_SIGHT_FLOOR) are imported from
 # taxi_controller so the MPC and MPPI controllers stay in lock-step. Only the two
 # NLP-specific knobs below are local: K_OCC (number of solver slots) and OCC_QUERY_R.
 # Scan geometry for the range-jump boundary detector. MUST match the Unity
 # PointCloudPublisher Inspector fields — the flat cloud is reshaped back into its beam
 # grid, and a mismatch is detected and the scan ignored (no silent misreading).
-SCAN_FOV_H     = 360.0
-SCAN_FOV_V     = 45.0
-SCAN_RES_H     = 1.0
-SCAN_RES_V     = 1.0
-SCAN_MAX_RANGE = 1000.0
-
-# Only boundaries within this half-angle of the ego's heading seed capsules. A phantom
-# emerging from a corner already driven past cannot be run into, so constraining it just
-# brakes the ego for nothing. 180 ⇒ no filter; 90 ⇒ strictly ahead; 100 keeps a little
-# past abeam so a corner isn't dropped the instant it draws level.
-OCC_FWD_HALF_ANGLE = 90.0   # [deg]
+# SCAN_* and OCC_FWD_HALF_ANGLE are imported above, from the one definition both
+# controllers share (config.yaml -> scan / occlusion). They used to be declared here
+# too, which is exactly how the two copies drifted apart.
 
 # Keep-out SHAPE around each detected occlusion boundary.
 #   False (default) ⇒ expanding CIRCLE about the boundary's CORNER point — the paper's
@@ -155,21 +151,21 @@ OCC_FWD_HALF_ANGLE = 90.0   # [deg]
 #                     contains the circle, so the ego gives every corner a wider berth.
 # The constraint code is identical either way — a zero-length segment IS a circle — so
 # this only changes the geometry fed in, never the solver.
-OCC_USE_CAPSULES = False
+OCC_USE_CAPSULES = _occ["use_capsules"]
 
 # Per-step circle enlargement (the paper's Algorithm 1 + Fig. 6). The circle seeded at
 # each occlusion boundary is enlarged by d_target = V_TARGET · DT — the furthest an
 # invisible agent can travel in ONE timestep — at every step of the prediction horizon.
 # Stage k is therefore constrained against ITS OWN radius
 #
-#     r_k = D_SAFE_OCC + V_TARGET · t_k ,   t_k = (k+1)·DT
+#     r_k = D_SAFE_HARD + V_TARGET · t_k ,   t_k = (k+1)·DT
 #
 # so the ego is checked against the reachable set as it stands at that future instant,
 # NOT against the horizon-end maximum. Over N_MPC steps this grows 16.0 → 25.0 m.
 #
 # True here would instead apply one fixed radius at every stage — more conservative
 # early in the horizon and not what the paper describes. Kept only as an A/B switch.
-OCC_SINGLE_CIRCLE     = False
+OCC_SINGLE_CIRCLE     = _occ["single_circle"]
 OCC_D_TARGET_HORIZON  = N_MPC * DT     # [s] only used when OCC_SINGLE_CIRCLE is True
 
 # Per-step enlargement increment, for reference/printing: 3.0 m/s · 0.1 s = 0.3 m.
@@ -181,13 +177,7 @@ D_TARGET_PER_STEP     = V_TARGET * DT
 # near-duplicate keep-outs. Associate within OCC_TRACK_ASSOC and smooth; expire after
 # OCC_TRACK_TTL unseen. OCC_TRACK_ASSOC must exceed the beam-quantisation displacement
 # (~r·Δθ ≈ 0.5 m at 30 m / 1°) but stay under the spacing of genuinely distinct corners.
-OCC_TRACK_ASSOC = 3.0    # [m] association gate
-OCC_TRACK_ALPHA = 0.35   # EMA weight on each new measurement
-OCC_TRACK_TTL   = 0.6    # [s] drop a track unseen this long
-OCC_TRACK_HITS  = 2      # confirmations before a track is used (kills one-off flickers)
-
-K_OCC       = 10        # nearest occlusion-boundary points constrained per step (0 ⇒ off)
-OCC_QUERY_R = 60.0     # only consider occlusion boundaries within this radius of the ego [m]
+# OCC_TRACK_*, K_OCC and OCC_QUERY_R are imported above — same single definition.
 
 
 class TaxiMPC:
@@ -207,22 +197,22 @@ class TaxiMPC:
     NU = 2   # control [a_cmd, delta_cmd]
 
     def __init__(self, N=N_MPC, k_obs=K_OBS, d_infl=D_INFL, d_safe=D_SAFE,
-                 k_static=0, d_infl_static=D_INFL_STATIC, d_safe_static=D_SAFE_STATIC,
-                 k_occ=0, d_infl_occ=D_INFL_OCC, d_safe_occ=D_SAFE_OCC, v_target=V_TARGET,
+                 k_static=0, d_safe_hard=D_SAFE_HARD, w_hard=W_HARD,
+                 k_occ=0, v_target=V_TARGET,
                  occ_d_target=None, verbose=False):
         self.N     = int(N)
         self.k_obs = int(k_obs)
         self.d_infl = float(d_infl)
         self.d_safe = float(d_safe)
         self.k_static = int(k_static)          # 0 ⇒ no static (LiDAR) keep-out
-        self.d_infl_static = float(d_infl_static)
-        self.d_safe_static = float(d_safe_static)
+        # ONE keep-out radius and ONE weight for BOTH static surfaces and occlusion
+        # boundaries — see the block comment on D_SAFE_HARD/W_HARD in taxi_controller_mppi.
+        self.d_safe_hard = float(d_safe_hard)
+        self.w_hard      = float(w_hard)
         self.k_occ = int(k_occ)                # 0 ⇒ no occlusion-aware keep-out
         # None ⇒ radius grows per stage (v_target·t_k, nested set). A float ⇒ Algorithm 1:
         # ONE circle of that fixed radius per boundary, rebuilt each scan.
         self.occ_d_target = None if occ_d_target is None else float(occ_d_target)
-        self.d_infl_occ = float(d_infl_occ)
-        self.d_safe_occ = float(d_safe_occ)
         self.v_target   = float(v_target)
 
         nx, nu, Nh = self.NX, self.NU, self.N
@@ -253,7 +243,7 @@ class TaxiMPC:
         P_ovel  = [ca.MX.sym(f"ov_{i}", 2) for i in range(self.k_obs)]  # obstacle velocity
         # Static keep-out CIRCLES (x, y, radius) — the obstacle-covering circles from
         # ObstacleCircles. The per-circle radius is added to the robot margin below, so
-        # the constraint is ‖p_ego − c‖ ≥ d_safe_static + r (robot-circle vs obstacle-circle).
+        # the constraint is ‖p_ego − c‖ ≥ d_safe_hard + r (robot-circle vs obstacle-circle).
         P_spos  = [ca.MX.sym(f"sp_{i}", 3) for i in range(self.k_static)]
         # Occlusion boundary SEGMENTS (ax, ay, bx, by) — the boundary LINES found by the
         # range-jump detector, expanded into capsules below. A degenerate segment
@@ -312,8 +302,9 @@ class TaxiMPC:
                 cost += RHO_SLACK * viol + RHO_SLACK2 * viol * viol
 
             # Static-obstacle terms (obstacle-covering circles) — fixed, no velocity.
-            # Keep-out and influence radii are widened by the circle's own radius r_s,
-            # so a bigger covering circle pushes the ego out proportionally.
+            # The keep-out radius is widened by the circle's own radius r_s, so a bigger
+            # covering circle pushes the ego out proportionally. Single hard term at
+            # W_HARD, matching taxi_cost.stage_cost's static block exactly.
             for i in range(self.k_static):
                 sp   = P_spos[i]
                 r_s  = sp[2]
@@ -321,44 +312,34 @@ class TaxiMPC:
                 dy_s = py - sp[1]
                 d2s  = dx_s * dx_s + dy_s * dy_s
                 ds   = ca.sqrt(d2s + 1e-6)
-                r_keep_s = self.d_safe_static + r_s
-                r_infl_s = self.d_infl_static + r_s
-                cost += W_STATIC_RING * ca.fmax(0.0, r_infl_s - ds) ** 2
-                viols = ca.fmax(0.0, r_keep_s * r_keep_s - d2s)
-                cost += RHO_SLACK * viols + RHO_SLACK2 * viols * viols
+                r_keep_s = self.d_safe_hard + r_s
+                cost += self.w_hard * ca.fmax(0.0, r_keep_s - ds) ** 2
 
             # Occlusion forward-reachable-set terms (Firoozi et al.). A worst-case
             # hidden agent starts on the occlusion boundary and advances at up to
-            # v_target, so the keep-out circle EXPANDS along the horizon by
-            # v_target · t_k. The influence ring expands identically. (The paper's
-            # d_target = v_target/Δt is a typo; distance = speed · time is used.)
+            # v_target, so the keep-out EXPANDS along the horizon by v_target · t_k.
+            # (The paper's d_target = v_target/Δt is a typo; distance = speed · time.)
             # Single-circle mode (Algorithm 1): ONE circle of radius d_target per detected
             # boundary, rebuilt from scratch at every LiDAR scan, rather than a nested set
-            # growing along the horizon. The radius is therefore stage-INDEPENDENT.
-            # Canonical formula (occlusion_capsules.occlusion_stage_cost), expressed in
-            # CasADi so IPOPT gets differentiable fmax/sqrt. The horizon cap is what keeps
-            # this the same SIZE as MPPI's keep-out despite the shorter planning horizon.
-            r_grow = (self.occ_d_target if self.occ_d_target is not None
-                      else self.v_target * min(t_k, OCC_HORIZON))
-            d_vis  = ca.MX(1e6)          # distance to the NEAREST occlusion boundary this stage
+            # growing along the horizon — expressed here as a stage-INDEPENDENT effective
+            # time d_target/v_target so the one shared cost function covers both modes.
+            # The cost itself is occlusion_capsules.occlusion_stage_cost called with CasADi
+            # primitives, so MPPI and the MPC evaluate the SAME code, not two transcriptions.
+            t_eff = (self.occ_d_target / self.v_target if self.occ_d_target is not None
+                     else t_k)
+            d_vis = ca.MX(1e6)           # distance to the NEAREST occlusion boundary this stage
             for i in range(self.k_occ):
                 oc = P_occ[i]
-                # Distance to the boundary SEGMENT, so the r_grow level set is a capsule
+                # Distance to the boundary SEGMENT, so the keep-out level set is a capsule
                 # (rectangle + two end circles) rather than a circle: the hidden agent is
                 # assumed to lurk anywhere along the boundary line, not just at its corner.
                 d2c, dc = point_segment_distance_sym(
                     px, py, oc[0], oc[1], oc[2], oc[3],
                     ca.fmin, ca.fmax, ca.sqrt)
                 d_vis = ca.fmin(d_vis, dc)
-                r_infl_occ = self.d_infl_occ + r_grow
-                r_keep_occ = self.d_safe_occ + r_grow
-                # Goal is known-safe: fade the repelling terms out near it, matching MPPI,
-                # so the expanding circle can't cover the ego's own destination. (The
-                # hard pre-filter in _pack_params remains as a coarser first line.)
-                goal_fade = ca.fmin(1.0, ca.fmax(0.0, d_goal / GOAL_OCC_CLEAR))
-                cost += goal_fade * W_OCC * ca.fmax(0.0, r_infl_occ - dc) ** 2
-                violc = ca.fmax(0.0, r_keep_occ * r_keep_occ - d2c)
-                cost += goal_fade * (RHO_SLACK * violc + RHO_SLACK2 * violc * violc)
+                cost += occlusion_stage_cost(dc, v, t_eff, self.v_target,
+                                             self.d_safe_hard, self.w_hard,
+                                             fmax=ca.fmax, sqrt=ca.sqrt)
 
             # Sightline (RSS) speed cap: slow so the ego can brake to a stop before the
             # nearest occlusion boundary. Widening the arc alone would let it round a
@@ -502,7 +483,7 @@ class TaxiMPC:
                 # Test the NEAR endpoint (the corner) against the goal: that is the point
                 # the phantom is anchored to.
                 gd = np.hypot(segs[:, 0, 0] - goal_xy[0], segs[:, 0, 1] - goal_xy[1])
-                r_goal_clear = self.d_safe_occ + self.v_target * self.N * DT
+                r_goal_clear = self.d_safe_hard + self.v_target * self.N * DT
                 segs = segs[gd > r_goal_clear]
             os_ = self._nearest_segments(s0, segs, self.k_occ, OCC_QUERY_R)
             for row in os_:
@@ -709,12 +690,12 @@ class TaxiMPC:
         delta_cmd = float(np.clip(u0[1], -DELTA_LIM, DELTA_LIM))
 
         # ── Static keep-out diagnostics ──────────────────────────────────────
-        # max_sst: largest static keep-out violation (D_SAFE_STATIC² − d²)₊ [m²] the
+        # max_sst: largest static keep-out violation (D_SAFE_HARD² − d²)₊ [m²] the
         #   PLANNED trajectory incurs — how much the penalised keep-out is breached
         #   (0 ⇒ plan clears every constrained static point).
         # min_pred_stat: the SMALLEST clearance to the constrained static points the
         #   PLANNED trajectory achieves [m] — compare to the measured nearStatic to see
-        #   whether the plan intends to keep D_SAFE_STATIC but can't, or plans to breach.
+        #   whether the plan intends to keep D_SAFE_HARD but can't, or plans to breach.
         max_sst = 0.0
         min_pred_stat = np.inf
         if self._spos_used is not None:
@@ -722,8 +703,8 @@ class TaxiMPC:
             if len(sp):
                 dxy = (Xopt[1:, None, :2] - sp[None, :, :2])       # (Nh, K, 2)
                 d   = np.hypot(dxy[..., 0], dxy[..., 1])
-                # Clearance/violation are to the circle SURFACE: keep-out = d_safe_static + r.
-                r_keep = self.d_safe_static + sp[None, :, 2]       # (1, K)
+                # Clearance/violation are to the circle SURFACE: keep-out = d_safe_hard + r.
+                r_keep = self.d_safe_hard + sp[None, :, 2]       # (1, K)
                 min_pred_stat = float((d - sp[None, :, 2]).min())  # nearest surface clearance
                 max_sst = float(np.max(np.maximum(0.0, r_keep ** 2 - d ** 2)))
 
@@ -768,7 +749,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, noise_std=0.0,
             costmap  = cm
             k_static = K_STATIC
             print(f"[MPC] LiDAR map     : ON  (topic={lidar_topic}) — static keep-out "
-                  f"K_STATIC={K_STATIC}, D_SAFE_STATIC={D_SAFE_STATIC:.1f} m")
+                  f"K_STATIC={K_STATIC}, D_SAFE_HARD={D_SAFE_HARD:.1f} m")
             if occlusion_aware:
                 k_occ = K_OCC
                 # Declare the scan geometry so range-jump boundary SEGMENTS (capsules)
@@ -776,7 +757,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, noise_std=0.0,
                 cm.configure_scan(SCAN_FOV_H, SCAN_FOV_V, SCAN_RES_H, SCAN_RES_V,
                                   SCAN_MAX_RANGE)
                 print(f"[MPC] Occlusion-aware: ON  — forward reachable sets K_OCC={K_OCC}, "
-                      f"v_target={V_TARGET:.1f} m/s, D_SAFE_OCC={D_SAFE_OCC:.1f} m "
+                      f"v_target={V_TARGET:.1f} m/s, D_SAFE_HARD={D_SAFE_HARD:.1f} m "
                       f"(expands +{V_TARGET*horizon*DT:.1f} m over the horizon); "
                       f"{'capsules' if OCC_USE_CAPSULES else 'circles'} from range-jump corners "
                       f"({SCAN_FOV_H:g}°x{SCAN_FOV_V:g}° @ {SCAN_RES_H:g}°)")
@@ -1023,6 +1004,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=False, noise_std=0.0,
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="MPC (CasADi/IPOPT) taxiing controller.")
+    p.add_argument("--config",         default=None,
+                   help="Path to a tuning YAML (default: config.yaml next to this script). "
+                        "Applied at IMPORT time by taxi_config, not here — this entry exists "
+                        "so the flag appears in --help. $TAXI_CONFIG does the same.")
     p.add_argument("--exec",           default=None)
     p.add_argument("--port",           default=5004, type=int)
     p.add_argument("--sysid",          default=False, type=lambda x: x.lower() == "true")
@@ -1039,7 +1024,7 @@ if __name__ == "__main__":
     p.add_argument("--lidar-costmap",  action="store_true",
                    help="Down-sample the published PointCloud2 each step and cover the static "
                         "obstacles with circles; the K_STATIC nearest are added to the MPC as "
-                        "keep-out constraints ‖p_ego−c‖ ≥ D_SAFE_STATIC + r. Needs ROS 2 sourced "
+                        "keep-out constraints ‖p_ego−c‖ ≥ D_SAFE_HARD + r. Needs ROS 2 sourced "
                         "(rclpy) and the ros_tcp_endpoint running. WITHOUT this the MPC only avoids "
                         "the dynamic obstacles in the observation vector.")
     p.add_argument("--lidar-topic",    default="/point_cloud",

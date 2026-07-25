@@ -299,7 +299,7 @@ def capsule_radius(d_base: float, v_target: float, t_k: float) -> float:
     A hidden agent anywhere on the segment moving at up to v_target in an arbitrary
     direction can be anywhere within v_target*t_k of it, so the reachable set is the
     segment dilated by that radius — a capsule. d_base is the ego's own safety margin
-    (D_SAFE_OCC / D_INFL_OCC), added on top.
+    (D_SAFE_HARD), added on top.
     """
     return d_base + v_target * t_k
 
@@ -356,6 +356,36 @@ def capsule_polygon(a: np.ndarray, b: np.ndarray, r: float, n_arc: int = 24) -> 
         a + r * np.column_stack([np.cos(arc_a), np.sin(arc_a)]),
     ])
     return np.vstack([pts, pts[:1]])       # close the ring
+
+
+def point_segments_min_distance(px: np.ndarray, py: np.ndarray,
+                                segs: np.ndarray) -> np.ndarray:
+    """(K,) distance from each of K points to the NEAREST of M capsule axes.
+
+    px, py : (K,) rollout coordinates.
+    segs   : (M, 2, 2) boundary segments [[near, far], ...].
+
+    This is the capsule distance written as one expression rather than three. The
+    keep-out around a boundary is the union of a disc at each endpoint and the
+    rectangle spanning them; the distance to that union is
+        min( |P-A|, |P-B|, perpendicular distance to AB )
+    and that minimum IS the point-to-SEGMENT distance: the clamp of the projection
+    parameter to [0,1] in point_segment_distance_sym selects the rectangle when the
+    foot of the perpendicular lands within the span and the nearer endpoint disc
+    when it does not. Computing the three pieces separately would evaluate the same
+    numbers by a longer route.
+
+    Deliberately routed through point_segment_distance_sym with NumPy primitives —
+    the exact function the MPC feeds CasADi primitives — so the sampling planner and
+    the NLP cannot disagree about where a capsule is.
+    """
+    segs = np.asarray(segs, float).reshape(-1, 2, 2)
+    a, b = segs[:, 0, :], segs[:, 1, :]
+    _, d = point_segment_distance_sym(
+        px[:, None], py[:, None],
+        a[None, :, 0], a[None, :, 1], b[None, :, 0], b[None, :, 1],
+        np.minimum, np.maximum, np.sqrt)
+    return d.min(axis=1)
 
 
 def point_segment_distance_np(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -454,53 +484,37 @@ class OcclusionCornerTracker:
 # ── Canonical occlusion stage cost ────────────────────────────────────────────
 # ONE definition of the occlusion-aware stage cost, so the MPPI and MPC controllers
 # cannot drift apart. MPPI calls occlusion_stage_cost() directly on its rollout arrays;
-# the MPC re-expresses the SAME formula in CasADi symbolics (it needs differentiable
-# fmax/sqrt for IPOPT), and test parity is asserted by evaluating both on equal inputs.
+# the MPC calls the SAME function with CasADi primitives (it needs differentiable
+# fmax/sqrt for IPOPT), so there is no second transcription to keep in sync.
 #
-#   r_grow = v_target · min(t_k, occ_horizon)
-#   r_infl = d_infl_occ + r_grow            soft influence ring (early deflection)
-#   r_keep = d_safe_occ + r_grow            hard keep-out (exact penalty)
-#   fade   = clip(d_goal / goal_occ_clear, 0, 1)
+#   r_keep = d_safe + v_target · t_k        expanding hard keep-out
+#   cost   = w_obs · max(0, r_keep − d)²     single one-sided quadratic
 #
-#   cost = fade · w_occ · max(0, r_infl − d)²
-#        + fade · (rho · viol + rho2 · viol²),      viol = max(0, r_keep² − d²)
-#        + w_sight · max(0, v − v_safe)²,           v_safe = max(√(2·a_brake·d), v_floor)
-#
-# fade exists because the goal is known-safe: without it the expanding circle can cover
-# the ego's own destination and repel it (the orbit failure mode). The sightline term is
-# NOT faded — slowing down never pushes the ego away from its goal.
-# The horizon cap keeps both controllers' keep-out the same size even though their
-# PLANNING horizons differ (MPPI 6 s, MPC 3 s); without it MPPI is far more conservative.
+# w_obs is the HARD-CONSTRAINT weight (W_HARD): large enough that any breach of the
+# keep-out dominates every other term in the objective, so the penalty behaves as a
+# constraint rather than a trade-off. There is no separate soft influence ring and no
+# goal fade — one radius, one weight, shared with the static-surface keep-out.
 
-def occlusion_stage_cost(d, v, t_k, d_goal, *, v_target, d_safe_occ, d_infl_occ,
-                         w_occ, rho, rho2, w_sight, a_brake_sight, v_sight_floor,
-                         goal_occ_clear, occ_horizon,
-                         fmax=None, sqrt=None, clip=None):
+def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=None, clip=None):
     """Occlusion stage cost. Backend-agnostic: pass numpy or CasADi primitives.
 
-    d      : distance from the (rollout/predicted) pose to the nearest occlusion boundary
-    v      : speed at this stage
-    t_k    : horizon time of this stage [s]
-    d_goal : distance from this pose to the goal (drives the fade)
+    d        : distance from the (rollout/predicted) pose to the nearest occlusion boundary
+    v        : speed at this stage (unused until the sightline term lands — see TODO)
+    t_k      : horizon time of this stage [s]
+    v_target : assumed max speed of the hidden agent [m/s]
+    d_safe   : base (t=0) keep-out radius [m]
+    w_obs    : hard-constraint weight
     Returns the scalar/array stage cost contribution.
     """
     import numpy as _np
     fmax = _np.maximum if fmax is None else fmax
     sqrt = _np.sqrt if sqrt is None else sqrt
 
-    r_grow = v_target * min(t_k, occ_horizon)      # t_k is a PYTHON float in both callers
-    #r_infl = d_infl_occ + r_grow
-    r_keep = d_infl_occ + r_grow
+    r_grow = v_target * t_k          # t_k is a PYTHON float in both callers
+    r_keep = r_grow + d_safe
 
-    if clip is None:
-        fade = _np.clip(d_goal / goal_occ_clear, 0.0, 1.0)
-    else:
-        fade = clip(d_goal / goal_occ_clear)
+    cost = w_obs * fmax(0.0, r_keep - d) ** 2
 
-    #cost = fade * w_occ * fmax(0.0, r_infl - d) ** 2
-    viol = fmax(0.0, r_keep - d)
-    cost = cost + fade * (rho * viol)
-
-    v_safe = fmax(sqrt(2.0 * a_brake_sight * d + 1e-6), v_sight_floor)
-    cost = cost
+    # TODO add v_safe (RSS sightline) cost
+    # v_safe = fmax(sqrt(2.0 * a_brake_sight * d + 1e-6), v_sight_floor)
     return cost

@@ -79,6 +79,12 @@ public class LaserSensor3D
     public bool drawOcclusionFov = false;
     public float fovDrawRadius = 60f;      // matches OCC_QUERY_R
 
+    // A beam that escapes to max range gives an unboundedly long boundary, and the capsule
+    // it seeds would span the whole apron. Clip it, exactly as max_seg_len does in
+    // controller/occlusion_capsules.py:segments_from_ordered_cloud. Measured on the ground
+    // plane, since the controller's geometry is 2-D in (a0, a1).
+    public float maxSegLenMeters = 30f;
+
     // Per-beam ranges and ray endpoints, retained across the scan so the edge pass
     // can compare neighbours after all raycasts are done. Indexed [i * NumV + j].
     float[] beamRange;
@@ -87,6 +93,27 @@ public class LaserSensor3D
     // Corner points from the last scan's edge pass — the blind-corner mouths a hidden
     // agent is assumed to emerge from. Read by PhantomAgentVisualizer.
     public List<Vector3> OcclusionCorners { get; private set; } = new List<Vector3>();
+
+    /// <summary>
+    /// One occlusion boundary: the corner beam's hit point and where the beam that grazed
+    /// past it landed. This is the CAPSULE AXIS the controllers dilate by r_keep — the
+    /// Unity-side analogue of one row of occlusion_capsules.segments_from_ordered_cloud.
+    ///
+    /// The axis runs from the corner roughly ALONG THE SIGHTLINE, radially away from the
+    /// sensor into the occluded region — not along the occluder's face. It is offset from
+    /// the exact sensor->corner ray by about one beam spacing, because the two endpoints
+    /// are adjacent beams.
+    /// </summary>
+    public struct OcclusionSegment
+    {
+        public Vector3 corner;   // near endpoint — the edge the hidden agent would round
+        public Vector3 far;      // far endpoint — where the escaping beam landed (clipped)
+    }
+
+    // Boundary SEGMENTS from the last scan, index-aligned with OcclusionCorners
+    // (OcclusionCorners[i] == OcclusionSegments[i].corner).
+    public List<OcclusionSegment> OcclusionSegments { get; private set; }
+        = new List<OcclusionSegment>();
 
     // float avg_time;
     // int total_counts;
@@ -306,6 +333,7 @@ public class LaserSensor3D
     void DrawOcclusionEdges(Transform sensor_transform)
     {
         OcclusionCorners.Clear();
+        OcclusionSegments.Clear();
         float mergeSq = cornerMergeRadius * cornerMergeRadius;
 
         float dtheta = Mathf.Deg2Rad * angularResolution_horizontal;
@@ -351,6 +379,15 @@ public class LaserSensor3D
                 var corner = (rA < rB) ? pA : pB;
                 var far = (rA < rB) ? pB : pA;
 
+                // Clip an over-long boundary to maxSegLenMeters, mirroring max_seg_len in
+                // segments_from_ordered_cloud. The length is measured on the GROUND PLANE
+                // (the controller's geometry is 2-D), but the whole 3-D vector is scaled by
+                // the same factor so the far endpoint keeps its direction.
+                var segVec = far - corner;
+                float segLenFlat = new Vector2(segVec.x, segVec.z).magnitude;
+                if (segLenFlat > maxSegLenMeters && segLenFlat > 1e-6f)
+                    far = corner + segVec * (maxSegLenMeters / segLenFlat);
+
                 // Is this corner inside the forward wedge the controller constrains?
                 var toCorner = corner - sensor_transform.position;
                 toCorner.y = 0f;
@@ -389,7 +426,10 @@ public class LaserSensor3D
                     if (d.sqrMagnitude < mergeSq) { merged = true; break; }
                 }
                 if (!merged)
+                {
                     OcclusionCorners.Add(corner);
+                    OcclusionSegments.Add(new OcclusionSegment { corner = corner, far = far });
+                }
             }
         }
     }

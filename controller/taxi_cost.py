@@ -14,8 +14,14 @@ Stage k (state after the step: px, py, th, v; control uk, previous control u_km1
   + R_ACT      · uk²      (elementwise, summed)          control effort
   + R_DACT     · (uk − u_km1)²                           control rate / smoothness
   + Σ_obstacles  W_OBS · max(0, D_INFL − d)²  +  ρ·viol + ρ₂·viol²,  viol = (D_SAFE² − d²)₊
-  + static       W_STATIC_RING · max(0, D_INFL_STATIC − ds)²  +  ρ·viols + ρ₂·viols²
+  + static       W_HARD · max(0, D_SAFE_HARD − ds)²
   + occlusion    occlusion_capsules.occlusion_stage_cost(...)
+
+The static and occlusion terms share ONE keep-out radius (D_SAFE_HARD) and ONE weight
+(W_HARD, large enough to act as a hard constraint), so they cannot be traded off against
+each other or against the goal pull. Only the DYNAMIC-obstacle term keeps the older
+soft-ring + exact-penalty shape, because a moving agent has to be negotiated with rather
+than simply avoided.
 
 Terminal:  W_GOAL_TERM · sqrt(d_goal² + 1)
 
@@ -35,28 +41,33 @@ re-weighting individual terms would change the optimum and break parity with the
 
 import numpy as np
 
+from taxi_config import CFG
+
 # ── Reference weights (MPC IS THE REFERENCE) ─────────────────────────────────
-# Defined here rather than in taxi_controller_mpc.py because taxi_controller_mpc
-# imports taxi_controller, so the MPC cannot be the import source without a cycle.
-# Both controllers import these, so there is exactly one definition of each.
-W_GOAL_RUN    = 0.05    # running goal pull (LINEAR distance -> bounded gradient)
-W_GOAL_TERM   = 2.0     # terminal pull on the FINAL state (LINEAR)
-W_HEAD        = 6.0     # heading alignment toward the goal bearing
-W_V           = 2.0     # speed tracking toward the goal-tapered desired speed
-R_ACT         = np.array([0.05, 0.20])   # control effort
-R_DACT        = np.array([0.10, 0.70])   # control rate (smoothness)
-W_OBS         = 8.0     # dynamic-obstacle soft influence ring
-W_STATIC_RING = 15.0    # static-surface soft influence ring
-RHO_SLACK     = 10.0    # linear exact-penalty weight on a keep-out violation
-RHO_SLACK2    = 5.0     # quadratic term
+# VALUES live in config.yaml; the names are bound here because taxi_controller_mpc
+# imports taxi_controller_mppi, so the MPC cannot be the import source without a
+# cycle. Both controllers import these names, so there is exactly one binding of
+# each. Tune in the YAML, not here.
+_cost = CFG["cost"]
+_dyn  = CFG["dynamic_obstacles"]
+
+W_GOAL_RUN    = _cost["w_goal_run"]    # running goal pull (LINEAR -> bounded gradient)
+W_GOAL_TERM   = _cost["w_goal_term"]   # terminal pull on the FINAL state (LINEAR)
+W_HEAD        = _cost["w_head"]        # heading alignment toward the goal bearing
+W_V           = _cost["w_v"]           # speed tracking toward the goal-tapered speed
+R_ACT         = _cost["r_act"]         # control effort
+R_DACT        = _cost["r_dact"]        # control rate (smoothness)
+W_OBS         = _dyn["w_obs"]          # dynamic-obstacle soft influence ring
+RHO_SLACK     = _dyn["rho_slack"]      # linear exact-penalty weight on a DYNAMIC violation
+RHO_SLACK2    = _dyn["rho_slack2"]     # quadratic term
 
 
 
 def stage_cost(px, py, th, v, uk, u_km1, *, goal_xy, v_des, t_k,
                obstacles=None, d_infl, d_safe, w_obs, rho, rho2,
                r_act, r_dact, w_goal_run, w_head, w_v,
-               d_static=None, d_infl_static=None, d_safe_static=None,
-               w_static_ring=None):
+               d_static=None, d_safe_static=None,
+               w_static=None):
     """MPC-reference stage cost, vectorized over rollouts.
 
     px, py, th, v : (K,) rollout state AFTER this step
@@ -72,32 +83,21 @@ def stage_cost(px, py, th, v, uk, u_km1, *, goal_xy, v_des, t_k,
     d_goal = np.sqrt(dx * dx + dy * dy + 1.0)
     cost = w_goal_run * d_goal
 
-    # Heading alignment toward the goal bearing.
-    psi = np.arctan2(gy - py, gx - px)
-    cost = cost + w_head * (1.0 - np.cos(th - psi))
+    # # Heading alignment toward the goal bearing.
+    # psi = np.arctan2(gy - py, gx - px)
+    # cost = cost + w_head * (1.0 - np.cos(th - psi))
 
     # Speed tracking toward the (goal-tapered) desired speed.
-    cost = cost + w_v * (v - v_des) ** 2
+    # cost = cost + w_v * (v - v_des) ** 2
 
-    # Control effort and rate.
-    du = uk - u_km1
-    cost = cost + (np.asarray(r_act) * uk * uk).sum(axis=1)
-    cost = cost + (np.asarray(r_dact) * du * du).sum(axis=1)
-
-    # Dynamic obstacles: soft influence ring + exact keep-out penalty.
-    if obstacles:
-        for ox, oy in obstacles:
-            d2 = (px - ox) ** 2 + (py - oy) ** 2
-            d = np.sqrt(d2 + 1e-6)
-            cost = cost + w_obs * np.maximum(0.0, d_infl - d) ** 2
-            viol = np.maximum(0.0, d_safe * d_safe - d2)
-            cost = cost + rho * viol + rho2 * viol * viol
+    # # Control effort and rate.
+    # du = uk - u_km1
+    # cost = cost + (np.asarray(r_act) * uk * uk).sum(axis=1)
+    # cost = cost + (np.asarray(r_dact) * du * du).sum(axis=1)
 
     # Static surfaces (LiDAR OCC), same shape as the obstacle terms.
     if d_static is not None:
-        cost = cost + w_static_ring * np.maximum(0.0, d_infl_static - d_static) ** 2
-        viols = np.maximum(0.0, d_safe_static ** 2 - d_static ** 2)
-        cost = cost + rho * viols + rho2 * viols * viols
+        cost = cost + w_static * np.maximum(0.0, d_safe_static - d_static) ** 2
 
     return cost
 

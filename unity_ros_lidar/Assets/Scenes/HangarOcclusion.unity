@@ -2059,8 +2059,8 @@ MonoBehaviour:
   grazingDeg: 10
   minJumpMeters: 2
   cornerMergeRadius: 1.5
-  drawOcclusionFov: 1
-  filterCornersToFov: 1
+  drawOcclusionFov: 0
+  filterCornersToFov: 0
   occFwdHalfAngleDeg: 180
   fovDrawRadius: 60
 --- !u!4 &1156722712
@@ -2231,6 +2231,11 @@ MonoBehaviour:
   maxSteerRate: 0.6
   steerRolloffSpeed: 15
   steerRolloffMin: 0.25
+  unmodeledEnabled: 0
+  slipCoeff: 0
+  brakeAsymmetry: 1
+  frictionNoiseAmp: 0
+  actuationDelaySteps: 0
   simulationTimeScale: 1
   goalMarker: {fileID: 0}
   taxiwayHalfWidth: 10

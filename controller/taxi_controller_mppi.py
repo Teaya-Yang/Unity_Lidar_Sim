@@ -32,92 +32,69 @@ import time
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.base_env import ActionTuple
 from mlagents_envs.exception import UnityCommunicatorStoppedException
-import quadprog
 
-from occlusion_capsules import occlusion_stage_cost
+from occlusion_capsules import (occlusion_stage_cost, point_segments_min_distance,
+                                point_segment_distance_np)
 import taxi_cost as tcost
 # MPC-reference weights — single definition in taxi_cost, imported by both controllers.
-from taxi_cost import (W_GOAL_RUN, W_GOAL_TERM, W_HEAD, W_V, W_OBS, W_STATIC_RING,
-                       R_ACT, R_DACT)
+from taxi_cost import (W_GOAL_RUN, W_GOAL_TERM, W_HEAD, W_V, W_OBS,
+                       RHO_SLACK, RHO_SLACK2, R_ACT, R_DACT)
+
+# ── Tuning comes from config.yaml ────────────────────────────────────────────
+# Every constant below that is a NUMBER YOU MIGHT TUNE is bound from the config;
+# the ALL_CAPS names are kept so call sites read exactly as before. Rationale for
+# each value lives next to it in the YAML. Derived values (OBS_SIZE), contract
+# values (the observation layout) and runtime state (LIDAR_COSTMAP, the CLI flags)
+# stay in code. --config swaps the file — see _apply_config_arg() below.
+from taxi_config import CFG
+_veh, _lim, _goal = CFG["vehicle"], CFG["limits"], CFG["goal"]
+_dyn, _keep, _occ = CFG["dynamic_obstacles"], CFG["keepout"], CFG["occlusion"]
+_trk, _scan       = CFG["occlusion_tracker"], CFG["scan"]
+_mppi             = CFG["mppi"]
 
 # ── Parameters — keep in sync with TaxiAgent.cs inspector fields ─────────────
-DT        = 0.1          # Fixed Timestep in Unity (Project Settings → Time)
-L         = 6.0          # wheelbase [m]
-V_DES     = 8.0          # desired taxi speed [m/s]
-# Goal-approach deceleration: at V_DES the aircraft's minimum turn radius can exceed the
-# remaining distance once it's close to the goal, so it geometrically can't curve tightly enough
-# to hit the small arrival capture radius (TaxiAgent's 2 m "reached" threshold) — it sweeps past
-# and has to loop back around, which looks like circling/overshoot right at arrival. Taper the
-# MPPI speed TARGET down as remaining goal distance shrinks below GOAL_SLOWDOWN_DIST so the turn
-# radius shrinks enough for a precise final approach.
-GOAL_SLOWDOWN_DIST = 15.0   # [m] remaining distance at which speed target starts tapering
-GOAL_MIN_SPEED     = 1.5    # [m/s] speed target floor right at the goal (not 0 — avoid stalling
-                            # the bicycle model's steering authority, which rolls off toward 0 speed)
-W_HALF    = 10.0         # taxiway half-width [m]
-D_SAFE    = 14.0          # keep-out radius [m]
-D_INFL    = 30.0         # MPPI obstacle influence radius [m]
-UNC_GROWTH  = 1.0        # influence-ring inflation rate [m/s of prediction time], applied ONLY to
-                         # frontal blockers being passed (see the deterministic obstacle branch).
-                         # The constant-velocity prediction degrades with t, so the pass clearance
-                         # grows mildly with prediction time. NOT applied to crossers/convergers:
-                         # an inflated ring covers the whole lane and its lateral gradient shoves
-                         # the ego off-road when braking in-lane is the right response.
-UNC_GROWTH_MAX = 4.0     # cap on the inflation [m] so the ring can't grow unbounded on long horizons
-D_INFL_PASS = 15.0       # influence ring for a FRONTAL blocker being passed (go-around) [m]. Must sit
-                         # well ABOVE D_SAFE so there's a wide soft band that builds lateral offset
-                         # early; if it's only ~1 m above D_SAFE the ego feels the agent only at the
-                         # last metre and clips the keep-out. (The capped braking + relaxed lane cost
-                         # keep the wider ring from re-causing the freeze.)
-HEADON_GIVEWAY = 6.0     # lateral give-way target [m]: the moment an oncoming agent is detected (out
-                         # to D_BYPASS), the ego's lane target shifts this far to the side AWAY from
-                         # it, so it eases off-centre EARLY and holds that side through the pass —
-                         # proactive clearance, rather than reacting only when the ring bites.
-A_MIN     = -4.0
-A_MAX     =  1.5
-DELTA_LIM = 0.5
-ALPHA1    = 1.8          # HOCBF first-order gain
-ALPHA2    = 1.8          # HOCBF second-order gain
-ALPHA_W   = 6.0          # QP acceleration vs steering weight
-
-# CBF Constraint
-CBF_MOVER_MIN   = 1.0    # [m/s] below this the obstacle is a static blocker → always engage
-CBF_COS_GATE    = 0.5    # engage only if |v_obs·ê|/|v_obs| >= this (i.e. within ~60° of the
-                         #   heading axis — head-on/along-track); pure crossers fall below it
+DT        = _veh["dt"]          # Fixed Timestep in Unity (Project Settings → Time)
+L         = _veh["wheelbase"]   # [m]
+V_DES     = _veh["v_des"]       # desired taxi speed [m/s]
+GOAL_SLOWDOWN_DIST = _goal["slowdown_dist"]
+GOAL_MIN_SPEED     = _goal["min_speed"]
+W_HALF    = _dyn["w_half"]      # taxiway half-width [m]
+D_SAFE    = _dyn["d_safe"]      # keep-out radius [m]
+D_INFL    = _dyn["d_infl"]      # MPPI obstacle influence radius [m]
+UNC_GROWTH     = _dyn["unc_growth"]
+UNC_GROWTH_MAX = _dyn["unc_growth_max"]
+D_INFL_PASS    = _dyn["d_infl_pass"]
+HEADON_GIVEWAY = _dyn["headon_giveway"]
+A_MIN     = _lim["a_min"]
+A_MAX     = _lim["a_max"]
+DELTA_LIM = _lim["delta_lim"]
 
 # ── Realistic kinematic extensions — must match TaxiAgent.cs inspector values ─
-DRAG_COEFF        = 0.04   # aerodynamic + rolling drag [1/s]
-ACCEL_TAU         = 0.5    # thrust/brake lag time constant [s]
-MAX_STEER_RATE    = 0.6    # nose-wheel steering rate limit [rad/s]
-STEER_ROLLOFF_SPD = 15.0   # speed at which steering authority starts rolling off [m/s]
-STEER_ROLLOFF_MIN = 0.25   # minimum steering authority fraction at high speed
+DRAG_COEFF        = _veh["drag_coeff"]
+ACCEL_TAU         = _veh["accel_tau"]
+MAX_STEER_RATE    = _veh["max_steer_rate"]
+STEER_ROLLOFF_SPD = _veh["steer_rolloff_spd"]
+STEER_ROLLOFF_MIN = _veh["steer_rolloff_min"]
 
-H_MPPI    = 30           # planning horizon (steps)
-K_MPPI    = 1500         # rollout samples
-LAMBDA    = 1.0          # MPPI temperature
-SIG_A     = 1.0          # noise std for acceleration samples
-SIG_D     = 0.70         # noise std for steering samples
+H_MPPI    = _mppi["horizon"]    # planning horizon (steps)
+K_MPPI    = _mppi["samples"]    # rollout samples
+LAMBDA    = _mppi["lambda"]     # MPPI temperature
+SIG_A     = _mppi["sig_a"]      # noise std for acceleration samples
+SIG_D     = _mppi["sig_d"]      # noise std for steering samples
 
 # MPPI stage costs
-W_LAT, W_HEAD, W_V, W_CTRL = 0.05, 4.0, 1.2, 0.05
+W_LAT, W_HEAD, W_V, W_CTRL = (_mppi["w_lat"], _mppi["w_head"],
+                              _mppi["w_v"], _mppi["w_ctrl"])
 # Action cost   ℓact = ||u||²_R + ||Δu||²_RΔ,  u = [a, delta], Δu_k = u_k - u_{k-1}.
 #   R  (R_ACT)  — diagonal effort weight: penalises large commands (energy/effort).
 #   RΔ (R_DACT) — diagonal rate weight: penalises command CHANGE (smoothness, no jerk).
 # Stored as the diagonals of the R / RΔ matrices, per channel [a, delta].
 # R_ACT / R_DACT now come from taxi_cost (MPC reference) — see the import below.
-# Velocity cost  ℓvel = W_VEL · exp(-C_VEL · d_k²) · ||v_k||²,  d_k = distance to goal, v_k = speed.
-# The exp(-C_VEL·d_k²) envelope is ~0 far from the goal (speed unpenalised while transiting) and
-# →1 as d_k→0, so the ego is driven to bleed off speed and arrive stopped at the goal. C_VEL sets
-# the envelope's half-strength RADIUS: d_half = sqrt(ln2 / C_VEL). 0.02 gives ~5.9m — too late to
-# brake a fast-moving plane; 0.003 gives ~15m, matching GOAL_SLOWDOWN_DIST so braking starts with
-# enough room. W_VEL scales overall strength — must be large enough to outweigh ℓprogress, which
-# unconditionally rewards continued movement (including flying past the goal).
-C_VEL  = 0.003
-W_VEL  = 3.0
 # W_OBS lowered and W_PROG raised (was 12.0 / 0.4) so forward progress competes with the obstacle
 # penalty. On a head-on pass the ego can't keep D_SAFE either way (the oncoming agent comes to it),
 # so an over-weighted W_OBS made "stop and wait" the cheapest option; a stronger progress pull makes
 # driving through win. Trade-off: the ego is slightly less conservative around crossers/convergers.
-W_OFF, W_PROG               = 2.0, 1.0   # (W_OBS now imported from taxi_cost)
+W_OFF, W_PROG               = _mppi["w_off"], _mppi["w_prog"]   # (W_OBS from taxi_cost)
 # Goal-approach reward (paper's ℓgoal). Per stage k:  ℓgoal = -C_GOAL * max(0, d0 - d_k), with
 # d0 = Euclidean distance to the goal at the rollout start and d_k = ||p_k - p_goal|| the true
 # Euclidean distance to the goal at stage k. A heavier TERMINAL copy at the last stage H-1
@@ -125,9 +102,9 @@ W_OFF, W_PROG               = 2.0, 1.0   # (W_OBS now imported from taxi_cost)
 # a rollout is allowed to detour around an obstacle as long as it ENDS closer to the goal — this
 # is what prevents greedy stop-short behaviour. Paper values: C_GOAL 5.0 (goal in line-of-sight)
 # or 0.125 (goal occluded → encourage exploration); C_GOAL_TERM 10.0.
-C_GOAL                      = 20.0
-C_GOAL_TERM                 = 10.0
-C_PROGRESS                  = 10.0
+C_GOAL                      = _mppi["c_goal"]
+C_GOAL_TERM                 = _mppi["c_goal_term"]
+C_PROGRESS                  = _mppi["c_progress"]
 
 # ── Occlusion-aware safety: forward-reachable-set keep-out + RSS sightline speed cap ──
 # SHARED with taxi_controller_mpc.py (the MPC imports these), so both controllers use the SAME
@@ -136,60 +113,52 @@ C_PROGRESS                  = 10.0
 # constrains, filtered to within OCC_QUERY_R of the ego), and
 # could be anywhere within V_TARGET·t_k of it after t_k = (k+1)·DT. Two coupled terms, gated on
 # --occlusion-aware:
-#   * expanding keep-out circle:  r_keep = D_SAFE_OCC + V_TARGET·t_k  (soft ring at D_INFL_OCC,
-#     steep exact penalty inside r_keep) — the ego swings wide around the blind corner;
+#   * expanding keep-out circle:  r_keep = D_SAFE_HARD + V_TARGET·t_k, penalised with the
+#     hard-constraint weight W_HARD — the ego swings wide around the blind corner;
 #   * RSS sightline speed cap:     v_safe = sqrt(2·A_BRAKE_SIGHT·d_vis), floored at V_SIGHT_FLOOR —
 #     the ego slows so it can always stop before the nearest occlusion.
 # Keep V_TARGET realistic — too high and the bubble swallows the horizon and the ego freezes.
-V_TARGET       = 3.0    # assumed max speed of a hidden agent emerging from occlusion [m/s]
-D_SAFE_OCC     = 16.0   # base (t=0) hard keep-out radius around an occlusion boundary [m]
-D_INFL_OCC     = 24.0   # base (t=0) soft-influence radius (early deflection). Must stay >= D_SAFE_OCC.
-W_OCC          = 20.0   # soft-influence ring penalty weight for occlusion boundaries
-OCC_QUERY_R    = 60.0   # only track occlusion boundaries within this radius of the ego (plot only) [m]
-# Occlusion keep-out expansion horizon, SHARED by MPPI and the MPC so both size their
-# phantom-agent circles identically even though their PLANNING horizons differ
-# (MPPI H_MPPI·DT = 6.0 s, MPC N_MPC·DT = 3.0 s). Without this cap MPPI's terminal
-# keep-out is 16+3·6 = 34 m against the MPC's 25 m — same formula, very different berth.
-OCC_HORIZON    = 3.0    # [s] r_grow = V_TARGET · min(t_k, OCC_HORIZON)
-K_OCC          = 10     # nearest occlusion boundaries used per rollout (== the MPC)
-W_SIGHT        = 15.0    # sightline over-speed² penalty weight
-A_BRAKE_SIGHT  = 0.4    # assumed braking decel for the RSS stopping distance [m/s²] (gentle ⇒ slows early)
-V_SIGHT_FLOOR  = 2.5    # never cap the sightline speed below this [m/s]
-GOAL_OCC_CLEAR = 31.0   # within this distance of the goal, fade the (repelling) keep-out to 0 — the
-                        # goal is known-safe, so the expanding circle must not push the ego off it
+V_TARGET       = _occ["v_target"]
+OCC_USE_CAPSULES = _occ["use_capsules"]   # False ⇒ collapse each boundary to its corner
+OCC_QUERY_R    = _occ["query_r"]
+OCC_HORIZON    = _occ["horizon"]
+K_OCC          = _occ["k_occ"]
+W_SIGHT        = _occ["w_sight"]
+A_BRAKE_SIGHT  = _occ["a_brake_sight"]
+V_SIGHT_FLOOR  = _occ["v_sight_floor"]
 
-N_SCEN = 10
-W_INFO = 10
-INFO_RANGE = 10
+N_SCEN = _mppi["n_scen"]
+W_INFO = _mppi["w_info"]
+INFO_RANGE = _mppi["info_range"]
 
 # Lister obstacles cost
 LIDAR_COSTMAP  = None    # ObstacleCircles instance when --lidar-costmap is set (name kept for
                          # brevity across the many call sites; it is the circle-cover model now)
 STATIC_AVOID   = False   # set True by --lidar-costmap: adds the static keep-out/soft-ring cost
                          # to MPPI, using clearance to the nearest obstacle-circle surface.
-W_STATIC       = 20.0     # weight of the static-surface soft influence ring (graded, gives a gradient)
-D_SAFE_STATIC  = 10.0     # hard keep-out from any observed static surface [m] — ~1 aircraft width
-D_INFL_STATIC  = 14.0      # soft influence ring around static surfaces [m]
-# Exact-penalty weights on a keep-out VIOLATION (d < D_SAFE_STATIC), mirroring the MPC's
-# RHO_SLACK/RHO_SLACK2 on (d_safe² − d²)_+. Unlike the old flat `BIG`, this is graded and
-# grows unbounded (quadratically) as d→0, so it (a) always has a gradient the sampler can
-# follow away from the wall — even when every rollout is inside D_INFL — and (b) cannot be
-# outweighed by the accumulated goal/progress reward. This is what stops the corner clip.
-RHO_STATIC     = 10.0
-RHO_STATIC2    = 5.0
+# ── ONE hard keep-out, shared by static surfaces AND occlusion boundaries ─────
+# Both hazards are things the ego must simply not enter, so they get the same radius and
+# the same weight; the only difference is that the occlusion radius EXPANDS along the
+# horizon by V_TARGET·t_k (the hidden agent's forward reachable set) while the static one
+# is fixed. W_HARD stands in for an infinite (hard-constraint) weight: it is large enough
+# that any breach dominates the goal pull, so the optimiser will not trade clearance for
+# progress. There is no soft influence ring on either — see taxi_cost.stage_cost and
+# occlusion_capsules.occlusion_stage_cost, which now share the same one-sided quadratic.
+D_SAFE_HARD    = _keep["d_safe_hard"]
+W_HARD         = _keep["w_hard"]
 
 # Range-jump occlusion boundaries (shared with taxi_controller_mpc.py). The scan geometry
 # MUST match the Unity PointCloudPublisher Inspector fields; a mismatch is detected and the
 # scan ignored. Corners are tracked across scans so the same physical corner keeps ONE
 # stable centre instead of a fresh jittered one every detection.
-SCAN_FOV_H, SCAN_FOV_V = 360.0, 45.0
-SCAN_RES_H, SCAN_RES_V = 1.0, 1.0
-SCAN_MAX_RANGE         = 1000.0
-OCC_FWD_HALF_ANGLE     = 90.0    # [deg] only boundaries ahead of the ego seed keep-outs
-OCC_TRACK_ASSOC = 3.0    # [m] association gate (> beam-quantisation jitter, < corner spacing)
-OCC_TRACK_ALPHA = 0.35   # EMA weight on each new measurement
-OCC_TRACK_TTL   = 0.6    # [s] drop a track unseen this long
-OCC_TRACK_HITS  = 2      # confirmations before a track is used
+SCAN_FOV_H, SCAN_FOV_V = _scan["fov_h"], _scan["fov_v"]
+SCAN_RES_H, SCAN_RES_V = _scan["res_h"], _scan["res_v"]
+SCAN_MAX_RANGE         = _scan["max_range"]
+OCC_FWD_HALF_ANGLE     = _occ["fwd_half_angle"]
+OCC_TRACK_ASSOC = _trk["assoc_radius"]
+OCC_TRACK_ALPHA = _trk["alpha"]
+OCC_TRACK_TTL   = _trk["ttl"]
+OCC_TRACK_HITS  = _trk["min_hits"]
 OCC_TRACKER     = None   # OcclusionCornerTracker, created in run()
 OCC_SEGS_NOW    = None   # (M,2,2) tracked boundaries for THIS control step, set by run()
                          # once per step and consumed by mppi() — mirrors how the MPC
@@ -197,22 +166,18 @@ OCC_SEGS_NOW    = None   # (M,2,2) tracked boundaries for THIS control step, set
 
 OCCLUSION_AWARE = False   # set True by --occlusion-aware (needs --lidar-costmap): enables the
                           # FRS keep-out + sightline speed cap above (mirrors the MPC controller).
-VISIBILITY_COST = False
-W_VIS           = 20.0   # weight on the per-step hidden-fraction ∈[0,1]. Summed over H_MPPI steps
-                         # its worst case is ~H·W_VIS, kept comparable to the goal terms so the pull
-                         # to reveal a blind corner competes without overriding goal-seeking. 0=off.
+VISIBILITY_COST = False   # vestigial: --visibility-cost is a documented no-op
 
 DETECTION_RANGE = float("inf")   # default: oracle (off). Set via --detect-range.
 
 # Number of obstacles packed in the observation vector (must match TaxiAgent K_OBS)
-K_OBS    = 3
+K_OBS    = _dyn["k_obs"]
 OBS_SIZE = 4 + K_OBS * 4 + 2 + 2   # 20: ego(4) + K_OBS*4 + goal(1) + cbf_h(1) + tangent(2)
 
 rng = np.random.default_rng(42)
 
 
 
-W_STRAIGHT = 1e10
 # ── Observation unpacking ────────────────────────────────────────────────────
 
 def obs_to_state(obs: np.ndarray, prev_delta: float = 0.0, prev_accel: float = 0.0):
@@ -367,38 +332,56 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     # P_occ), taken as the NEAR endpoints (corners) of the range-jump boundary segments. Filter
     # to within OCC_QUERY_R of the ego (== the MPC) and hold them fixed over the horizon; d_occ
     # per rollout pose = distance to the nearest.
-    occ_x = occ_y = None
+    occ_segs = None
     if OCCLUSION_AWARE and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-        # Range-jump boundary corners, tracked across scans (same source as the MPC).
+        # Range-jump boundary SEGMENTS, tracked across scans (same source as the MPC).
+        # The keep-out is the segment dilated by r_keep — a CAPSULE (a disc at each
+        # endpoint plus the rectangle between them), so the hidden agent is assumed to
+        # lurk anywhere along the sightline, not only at the corner. Selection and
+        # ordering still key on the CORNER (segs[:, 0]): that is the point the phantom
+        # is anchored to, and it is what the MPC's _pack_params filters on too.
         _seg = OCC_SEGS_NOW
-        _op = _seg[:, 0, :] if _seg is not None and len(_seg) else None
-        if _op is not None and len(_op):
+        _seg = np.asarray(_seg, float).reshape(-1, 2, 2) if (
+            _seg is not None and len(_seg)) else None
+        if _seg is not None and len(_seg):
+            if not OCC_USE_CAPSULES:
+                # Collapse each boundary onto its corner ⇒ a degenerate segment, whose
+                # capsule is exactly the old expanding CIRCLE. Same switch, same place
+                # in the pipeline as the MPC's.
+                _seg = _seg.copy()
+                _seg[:, 1, :] = _seg[:, 0, :]
+            _op = _seg[:, 0, :]
             # Same selection the MPC's _pack_params does: drop boundaries sitting within
             # the fully-expanded keep-out of the GOAL (the goal is known-safe, so a phantom
             # must not be assumed to hide on it), then take the K_OCC nearest in range.
             if goal_xy is not None:
-                _rgc = D_SAFE_OCC + V_TARGET * OCC_HORIZON
+                _rgc = D_SAFE_HARD + V_TARGET * H_MPPI * DT
                 _gd = np.hypot(_op[:, 0] - goal_xy[0], _op[:, 1] - goal_xy[1])
-                _op = _op[_gd > _rgc]
-            if len(_op):
-                _d = np.hypot(_op[:, 0] - s0_fwd, _op[:, 1] - s0_lat)
-                _near = _op[_d < OCC_QUERY_R]
-                if len(_near):
-                    _dn = _d[_d < OCC_QUERY_R]
-                    _near = _near[np.argsort(_dn)[:K_OCC]]
-                    occ_x, occ_y = _near[:, 0], _near[:, 1]
+                _seg = _seg[_gd > _rgc]
+            if len(_seg):
+                # Range-gate on true point-to-CAPSULE-axis distance, not on the corner:
+                # a long boundary whose corner sits beyond OCC_QUERY_R can still have its
+                # far end sweeping past the ego, and dropping it would silently un-see it.
+                _ego = np.array([[s0_fwd, s0_lat]])
+                _d = np.array([point_segment_distance_np(_ego, s[0], s[1])[0]
+                               for s in _seg])
+                _in = _d < OCC_QUERY_R
+                if _in.any():
+                    _near = _seg[_in]
+                    occ_segs = _near[np.argsort(_d[_in])[:K_OCC]]
 
     def _dist_to_occ(px, py):
-        """(K,) distance from each rollout pose to the nearest occlusion boundary point [m]."""
-        dx = px[:, None] - occ_x[None, :]
-        dy = py[:, None] - occ_y[None, :]
-        return np.sqrt(np.min(dx * dx + dy * dy, axis=1))
+        """(K,) distance from each rollout pose to the nearest occlusion CAPSULE axis [m].
+
+        min over boundaries of min(disc at corner, disc at far end, rectangle between)
+        — see occlusion_capsules.point_segments_min_distance for why that is one
+        point-to-segment evaluation rather than three.
+        """
+        return point_segments_min_distance(px, py, occ_segs)
 
     for k in range(H_MPPI):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
-
-        d_k = np.hypot(goal_fwd - fwd, goal_lat - lat)   # used by the occlusion goal-fade
 
         u_k   = na[:, k, :]                                  # (K, 2)
         u_km1 = u_prev[None, :] if k == 0 else na[:, k - 1, :]
@@ -424,21 +407,16 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
             fwd, lat, th, vv, u_k, u_km1,
             goal_xy=(goal_fwd, goal_lat), v_des=v_des_eff, t_k=(k + 1) * DT,
             obstacles=_obs_world, d_infl=D_INFL, d_safe=D_SAFE, w_obs=W_OBS,
-            rho=RHO_STATIC, rho2=RHO_STATIC2, r_act=R_ACT, r_dact=R_DACT,
+            rho=RHO_SLACK, rho2=RHO_SLACK2, r_act=R_ACT, r_dact=R_DACT,
             w_goal_run=W_GOAL_RUN, w_head=W_HEAD, w_v=W_V,
-            d_static=_d_static, d_infl_static=D_INFL_STATIC,
-            d_safe_static=D_SAFE_STATIC, w_static_ring=W_STATIC_RING)
+            d_static=_d_static, d_safe_static=D_SAFE_HARD, w_static=W_HARD)
 
         # ── Occlusion-aware safety: FRS keep-out + RSS sightline cap ──────────
         # Canonical formula shared with the MPC (occlusion_capsules.occlusion_stage_cost).
-        if occ_x is not None:
+        if occ_segs is not None:
             cost += occlusion_stage_cost(
-                _dist_to_occ(fwd, lat), vv, (k + 1) * DT, d_k,
-                v_target=V_TARGET, d_safe_occ=D_SAFE_OCC, d_infl_occ=D_INFL_OCC,
-                w_occ=W_OCC, rho=RHO_STATIC, rho2=RHO_STATIC2,
-                w_sight=W_SIGHT, a_brake_sight=A_BRAKE_SIGHT,
-                v_sight_floor=V_SIGHT_FLOOR, goal_occ_clear=GOAL_OCC_CLEAR,
-                occ_horizon=OCC_HORIZON)
+                _dist_to_occ(fwd, lat), vv, (k + 1) * DT,
+                V_TARGET, D_SAFE_HARD, W_HARD)
 
         # (The forward-reachable-set keep-out now lives in the unified occlusion-aware block
         # above, gated on OCCLUSION_AWARE with the shared constants — see the MPC for parity.)
@@ -537,11 +515,11 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     occ_segments (optional): (S, 2, 2) occlusion BOUNDARY segments from the
     range-jump detector, [[near, far], ...] in the same frame. Each is drawn as
     the nested forward-reachable-set CAPSULES the MPC constrained against, at
-    radius D_SAFE_OCC + V_TARGET·t for t across the horizon.
+    radius D_SAFE_HARD + V_TARGET·t for t across the horizon.
     capsule_horizon (optional): horizon length [s] the keep-out expanded over
     (N·DT). Defaults to 3 s if not given.
     single_radius: True ⇒ Algorithm 1 mode, the ENFORCED radius is the fixed
-    D_SAFE_OCC + V_TARGET·capsule_horizon (no per-stage growth).
+    D_SAFE_HARD + V_TARGET·capsule_horizon (no per-stage growth).
     show_occlusion: False ⇒ draw none of the occlusion artifacts (keep-out circles,
     expansion rings, corner centres, ego-at-detection markers and their connectors),
     leaving just the trajectory, static occluders, obstacles and goal. The second
@@ -611,7 +589,7 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
             for ti, t in enumerate(np.linspace(0.0, T, n_rings)):
                 if not show_expansion and t < T:
                     continue
-                poly = capsule_polygon(seg[0], seg[1], D_SAFE_OCC + V_TARGET * t)
+                poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD + V_TARGET * t)
                 ax.plot(poly[:, 0], poly[:, 1], "-",
                         color=horizon_cmap(t / T if T else 0.0),
                         lw=1.4 if ti == n_rings - 1 else 0.8,
@@ -716,8 +694,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 OCC_TRACKER = OcclusionCornerTracker(
                     assoc_radius=OCC_TRACK_ASSOC, alpha=OCC_TRACK_ALPHA,
                     ttl=OCC_TRACK_TTL, min_hits=OCC_TRACK_HITS)
-            feats = [f"static(D_SAFE={D_SAFE_STATIC:.1f}m, circle-cover)"]
-            if OCCLUSION_AWARE:  feats.append(f"occlusion(D_SAFE_OCC={D_SAFE_OCC:.1f}m, "
+            feats = [f"static(D_SAFE={D_SAFE_HARD:.1f}m, circle-cover)"]
+            if OCCLUSION_AWARE:  feats.append(f"occlusion(D_SAFE={D_SAFE_HARD:.1f}m, "
                                              f"v_target={V_TARGET:.1f}m/s, sightline)")
             print(f"[Controller] LiDAR map     : ON  (topic={lidar_topic}) — {' + '.join(feats)} "
                   f"in the MPPI cost; per-scan obstacle circles")
@@ -871,8 +849,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 k = int(np.argmin(surf))
                 d_field = LIDAR_COSTMAP.distance(np.array([s[0]]), np.array([s[1]]))[0]
                 print(f"[CHK] ego=({s[0]:.1f},{s[1]:.1f})  nearest circle=({w0[k]:.1f},{w1[k]:.1f}"
-                      f",r={wr[k]:.1f})  d_surf={surf[k]:.1f}  d_field={d_field:.1f}  "
-                      f"nCircles={len(_circ)}")
+                      f",r={wr[k]:.1f}) d_field={d_field:.1f}")
 
 
         # Advance Python-side kinematic state to match what Unity will compute
@@ -951,6 +928,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
+    p.add_argument("--config",         default=None,
+                   help="Path to a tuning YAML (default: config.yaml next to this script). "
+                        "Applied at IMPORT time by taxi_config, not here — this entry exists "
+                        "so the flag appears in --help. $TAXI_CONFIG does the same.")
     p.add_argument("--exec",           default=None)
     p.add_argument("--port",           default=5004,  type=int)
     p.add_argument("--sysid",          default=False,  type=lambda x: x.lower() == "true")
@@ -980,7 +961,7 @@ if __name__ == "__main__":
     p.add_argument("--lidar-costmap",  action="store_true",
                    help="Down-sample the published PointCloud2 each control step and cover the "
                         "static obstacles (walls/parked aircraft/buildings) with circles, added "
-                        "to the MPPI cost as clearance ≥ D_SAFE_STATIC to each circle surface. "
+                        "to the MPPI cost as clearance ≥ D_SAFE_HARD to each circle surface. "
                         "Needs ROS 2 sourced (rclpy) and the ros_tcp_endpoint running.")
     p.add_argument("--lidar-topic",    default="/point_cloud",
                    help="PointCloud2 topic for the LiDAR map. Default: /point_cloud.")

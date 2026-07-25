@@ -3,3 +3,4 @@ numpy>=1.23.5,<1.24.0
 quadprog>=0.1.11
 scipy>=1.10
 casadi>=3.6        # nonlinear MPC solver (IPOPT) used by taxi_controller_mpc.py
+PyYAML>=5.4              # config.yaml tuning file, loaded by taxi_config.py
