@@ -21,6 +21,12 @@ using UnityEngine.Serialization;
 /// sensor->corner ray by about one beam spacing, because the two endpoints are adjacent
 /// beams.
 ///
+/// The keep-out is time-varying, so it is ANIMATED: each frame shows one horizon step t_k
+/// for every boundary at once, and the sweep walks t_0 -> t_N and loops. That reads as the
+/// reachable set expanding in time, which is what the controller sees step by step. Set
+/// animate = false to fall back to the old view, where all rings are drawn simultaneously
+/// and the picture is really their swept union.
+///
 /// A boundary whose far endpoint was never reached (the beam escaped to max range) is
 /// clipped by LaserSensor3D.maxSegLenMeters, so in open scenes almost every capsule is
 /// exactly that long.
@@ -59,10 +65,25 @@ public class PhantomAgentVisualizer : MonoBehaviour
     [Header("Horizon")]
     [Tooltip("vehicle.dt — controller timestep [s].")]
     public float dt = 0.1f;
-    [Tooltip("Rings drawn across the horizon. Each is one t_k = (k+1)*DT*ringStride.")]
+    [Tooltip("Rings across the horizon. Each is one t_k = (k+1)*DT*ringStride.")]
     [Min(1)] public int ringCount = 5;
-    [Tooltip("Steps between drawn rings — the horizon spans ringCount*ringStride*DT seconds.")]
+    [Tooltip("Steps between rings — the horizon spans ringCount*ringStride*DT seconds.")]
     [Min(1)] public int ringStride = 10;
+
+    [Header("Playback")]
+    [Tooltip("ON: sweep the horizon, showing only the keep-out for the CURRENT t_k and " +
+             "looping back to t_0. OFF: draw every ring at once (the old stacked view).")]
+    public bool animate = true;
+    [Tooltip("Wall-clock seconds per horizon second. 1 = the keep-out grows in real time; " +
+             "lower slows the sweep down.")]
+    [Min(0.01f)] public float playbackSpeed = 1.0f;
+    [Tooltip("Hold on t_0 for this long [s] at the start of each loop, so the restart is " +
+             "readable instead of a flicker.")]
+    [Min(0f)] public float loopPause = 0.5f;
+
+    // Phase of the sweep, in horizon-time seconds. Advanced by unscaled real time so the
+    // animation keeps running while the sim is paused in the Editor.
+    float sweepClock;
 
     [Header("Drawing")]
     [Tooltip("Segments per full circle. Each capsule end-cap uses half of this.")]
@@ -99,6 +120,11 @@ public class PhantomAgentVisualizer : MonoBehaviour
         float queryRSq = occQueryR * occQueryR;
         float planeY = origin.y - sensorHeight + groundOffset;
 
+        // One timestamp for the whole frame, so every boundary shows the SAME t_k — the
+        // reachable set at one instant of the horizon, which is what the controller
+        // constrains at that step. Drawing all k at once instead shows the swept union.
+        int activeRing = AdvanceSweep();
+
         foreach (var seg in segments)
         {
             // Range-gate on the CORNER, matching how the controllers anchor a phantom.
@@ -116,17 +142,48 @@ public class PhantomAgentVisualizer : MonoBehaviour
             if (showAxis)
                 Debug.DrawLine(a, b, new Color(1f, 1f, 1f, 0.6f), 0f, false);
 
-            for (int k = 0; k < ringCount; k++)
+            if (animate)
             {
-                float t = (k + 1) * ringStride * dt;
-                // Fade with horizon time: the near-term reachable set is the confident one,
-                // the far rings are increasingly speculative.
-                // Floored at 0.45 — below roughly that, a debug line is too faint to pick out
-                // against the ground.
-                float fade = Mathf.Max(0.45f, 1f - (float)k / ringCount);
-                DrawCapsule(a, b, dSafeHard + vTarget * t, new Color(1f, 0.35f, 0f, fade));
+                DrawRing(a, b, activeRing);
+            }
+            else
+            {
+                for (int k = 0; k < ringCount; k++)
+                    DrawRing(a, b, k);
             }
         }
+    }
+
+    /// <summary>
+    /// Steps the sweep clock and returns the ring index to draw this frame. The cycle is
+    /// loopPause seconds parked on t_0 followed by the horizon itself, replayed forever.
+    /// Unscaled time keeps it moving while the sim is paused.
+    /// </summary>
+    int AdvanceSweep()
+    {
+        if (!animate)
+            return 0;
+
+        float horizon = ringCount * ringStride * dt;
+        float cycle = loopPause + horizon;
+
+        sweepClock += Time.unscaledDeltaTime * playbackSpeed;
+        if (sweepClock >= cycle)
+            sweepClock -= cycle * Mathf.Floor(sweepClock / cycle);
+
+        float tSweep = sweepClock - loopPause;
+        int k = Mathf.FloorToInt(tSweep / (ringStride * dt));
+        return Mathf.Clamp(k, 0, ringCount - 1);
+    }
+
+    void DrawRing(Vector3 a, Vector3 b, int k)
+    {
+        float t = (k + 1) * ringStride * dt;
+        // Fade with horizon time: the near-term reachable set is the confident one, the far
+        // rings are increasingly speculative. Floored at 0.45 — below roughly that, a debug
+        // line is too faint to pick out against the ground.
+        float fade = Mathf.Max(0.45f, 1f - (float)k / ringCount);
+        DrawCapsule(a, b, dSafeHard + vTarget * t, new Color(1f, 0.35f, 0f, fade));
     }
 
     /// <summary>

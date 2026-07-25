@@ -119,8 +119,8 @@ dynamic_obstacles:
 # is already ~7 orders of magnitude of spread in the Hessian). If IPOPT starts
 # returning Restoration_Failed, drop this to 1e4 — still overwhelmingly dominant.
 keepout:
-  d_safe_hard: 16.0         # [m] ~1 aircraft width
-  w_hard: 1.0e+6             # "infinite" hard-constraint weight
+  d_safe_hard: 10.0         # [m] ~1 aircraft width
+  w_hard: 1.0e+9             # "infinite" hard-constraint weight
 
 # ── Occlusion-aware safety (Firoozi et al., forward reachable sets) ─ SHARED ──
 # Each detected occlusion boundary (a LiDAR range-jump blind corner) seeds an
@@ -132,15 +132,21 @@ keepout:
 # Keep v_target REALISTIC — too high and the bubble swallows the horizon and the
 # ego freezes.
 occlusion:
-  v_target: 5.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
+  v_target: 10.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
   horizon: 3.0              # [s] cap on the expansion time. Sizes the Algorithm-1 single circle
                             #   and the plotted capsules; NOT applied inside
                             #   occlusion_capsules.occlusion_stage_cost.
   k_occ: 10                 # nearest boundaries constrained/evaluated per step (0 => off)
-  query_r: 60.0             # [m] only consider boundaries within this radius of the ego
-  fwd_half_angle: 90.0      # [deg] only boundaries AHEAD of the ego seed keep-outs — a phantom
+  query_r: 60           # [m] only consider boundaries within this radius of the ego
+  fwd_half_angle: 120.0     # [deg] only boundaries AHEAD of the ego seed keep-outs — a phantom
                             #   emerging from a corner already driven past cannot be run into,
                             #   and constraining it just brakes the ego for nothing.
+                            #   Must reach WELL PAST ABEAM (>90): the ego taxis alongside the
+                            #   hangars, so a corner is at ~80-90 deg exactly when it is
+                            #   closest and inside the keep-out. At 90 detection dropped it
+                            #   there, the track then died on ttl, and the occlusion cost went
+                            #   to zero at the one moment it mattered. 120 keeps it until it
+                            #   is genuinely behind.
   use_capsules: true        # MPC: segment-dilated capsules vs degenerate point circles
   single_circle: false      # MPC: Algorithm 1 — ONE fixed circle of radius v_target * horizon
                             #   per boundary, rebuilt each scan, instead of a nested set
@@ -164,8 +170,14 @@ occlusion_tracker:
   assoc_radius: 3.0         # [m] association gate — above beam-quantisation jitter, below
                             #   typical corner spacing
   alpha: 0.35               # EMA weight on each new measurement
-  ttl: 0.6                  # [s] drop a track unseen this long, so corners genuinely left
-                            #   behind do expire
+  ttl: 2.0                  # [s] drop a track unseen this long, so corners genuinely left
+                            #   behind do expire. MUST exceed the scan PERIOD: Unity's
+                            #   PointCloudPublisher runs at ~1 Hz (same measurement that set
+                            #   ObstacleCircles(max_age=1.5) in taxi_controller_mppi.run), so
+                            #   the old 0.6 expired every track BETWEEN scans — no track ever
+                            #   reached min_hits reliably, and corners vanished from the cost
+                            #   just as the ego closed on them. Lower this only together with
+                            #   the Unity publish rate.
   min_hits: 2               # confirmations before a track is used (kills one-off flickers)
 
 # ── LiDAR scan geometry ──────────────────────────────────────────── SHARED ───

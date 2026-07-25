@@ -164,6 +164,16 @@ OCC_SEGS_NOW    = None   # (M,2,2) tracked boundaries for THIS control step, set
                          # once per step and consumed by mppi() — mirrors how the MPC
                          # computes occ_segs in its run loop and passes them to solve().
 
+OCC_RANGE_DBG   = None   # (min_ego_dist, corner_x, corner_y, ego_x, ego_y) for the nearest
+                         # boundary that survived the goal drop — says whether the range gate
+                         # is right to reject it.
+OCC_GATE_DBG    = None   # (n_in, n_after_goal_drop, r_goal, min_goal_dist) from the LAST
+                         # solve — lets the [DEBUG occ] trace name the gate that emptied the set.
+OCC_USED_N      = 0      # boundaries that actually entered the LAST solve's cost. Written by
+                         # mppi(), read by the [DEBUG occ] trace in run(): if this is 0 while
+                         # segments exist, the ego is provably driving the occlusion-UNAWARE
+                         # trajectory no matter what --occlusion-aware was passed.
+
 OCCLUSION_AWARE = False   # set True by --occlusion-aware (needs --lidar-costmap): enables the
                           # FRS keep-out + sightline speed cap above (mirrors the MPC controller).
 VISIBILITY_COST = False   # vestigial: --visibility-cost is a documented no-op
@@ -288,6 +298,7 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
 
     Returns (u_nom, new_mean).
     """
+    global OCC_USED_N, OCC_GATE_DBG, OCC_RANGE_DBG
     # Nominal MPPI weights / limits. The frontal-threat "go-around" gate (in_corridor / aimed_at_us)
     # has been removed to keep the planner simple: plain lane-following + obstacle rings, and the
     # LiDAR visibility term is what drives any deliberate off-lane motion.
@@ -333,6 +344,9 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
     # to within OCC_QUERY_R of the ego (== the MPC) and hold them fixed over the horizon; d_occ
     # per rollout pose = distance to the nearest.
     occ_segs = None
+    OCC_USED_N = 0
+    OCC_GATE_DBG = None
+    OCC_RANGE_DBG = None
     if OCCLUSION_AWARE and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
         # Range-jump boundary SEGMENTS, tracked across scans (same source as the MPC).
         # The keep-out is the segment dilated by r_keep — a CAPSULE (a disc at each
@@ -358,6 +372,10 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
                 _rgc = D_SAFE_HARD + V_TARGET * H_MPPI * DT
                 _gd = np.hypot(_op[:, 0] - goal_xy[0], _op[:, 1] - goal_xy[1])
                 _seg = _seg[_gd > _rgc]
+                # Which gate emptied the set — the goal drop or the range gate below.
+                # r_goal is D_SAFE_HARD + V_TARGET*H_MPPI*DT, so a long MPPI horizon makes
+                # this exclusion zone large enough to swallow every boundary near the goal.
+                OCC_GATE_DBG = (len(_op), int((_gd > _rgc).sum()), _rgc, float(_gd.min()))
             if len(_seg):
                 # Range-gate on true point-to-CAPSULE-axis distance, not on the corner:
                 # a long boundary whose corner sits beyond OCC_QUERY_R can still have its
@@ -366,9 +384,18 @@ def mppi(s0, mean, obstacles, goal_xy, u_prev=None):
                 _d = np.array([point_segment_distance_np(_ego, s[0], s[1])[0]
                                for s in _seg])
                 _in = _d < OCC_QUERY_R
+                # Where the surviving boundaries actually ARE relative to the ego. If the
+                # nearest is far beyond query_r while the ego is metres from a real corner,
+                # the fault is upstream in detection/framing, not in this gate.
+                # Index into the POST-goal-drop set, so use its own corners, not _op.
+                _j = int(np.argmin(_d))
+                _opf = _seg[:, 0, :]
+                OCC_RANGE_DBG = (float(_d.min()), float(_opf[_j, 0]), float(_opf[_j, 1]),
+                                 float(s0_fwd), float(s0_lat))
                 if _in.any():
                     _near = _seg[_in]
                     occ_segs = _near[np.argsort(_d[_in])[:K_OCC]]
+                    OCC_USED_N = len(occ_segs)
 
     def _dist_to_occ(px, py):
         """(K,) distance from each rollout pose to the nearest occlusion CAPSULE axis [m].
@@ -794,15 +821,35 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
             # tracker again with None, so the tracker advanced twice per step and the
             # plot lagged the planner by one step.
             if OCCLUSION_AWARE and OCC_TRACKER is not None and LIDAR_COSTMAP.ready:
-                _s = LIDAR_COSTMAP.occlusion_segments(
+                _raw = LIDAR_COSTMAP.occlusion_segments(
                     ego_fwd=ego_fwd, fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
-                _s = OCC_TRACKER.update(_s, time.monotonic())
+                _s = OCC_TRACKER.update(_raw, time.monotonic())
                 if _s is not None and len(_s):
                     # Circle keep-out ⇒ collapse each boundary onto its corner (as the
                     # MPC does), so cost and plot use identical geometry.
                     _s = _s.copy()
                     _s[:, 1, :] = _s[:, 0, :]
                 OCC_SEGS_NOW = _s
+                # Where the occlusion pipeline is losing boundaries. Each stage can zero the
+                # set on its own, and all of them fail SILENTLY — the ego then drives the
+                # occlusion-unaware trajectory while the flag still reads ON:
+                #   raw=0    perception found no range jumps (scan cfg / min_jump / the
+                #            fwd_half_angle wedge)
+                #   trk=0    raw>0 but the tracker is withholding them until min_hits
+                #   used=0   trk>0 but every boundary was gated out of the cost by
+                #            query_r, K_OCC, or the goal-proximity drop
+                # used is from the PREVIOUS solve (mppi runs after this), which is fine for
+                # spotting a stuck-at-zero stage.
+                if ep_steps % 10 == 1:
+                    print(f"[DEBUG occ] raw={0 if _raw is None else len(_raw)} "
+                          f"trk={0 if _s is None else len(_s)} used={OCC_USED_N} "
+                          f"query_r={OCC_QUERY_R} k_occ={K_OCC} "
+                          + ("" if OCC_GATE_DBG is None else
+                             "goal_drop={}->{} (r_goal={:.1f}m, nearest boundary {:.1f}m "
+                             "from goal)".format(*OCC_GATE_DBG))
+                          + ("" if OCC_RANGE_DBG is None else
+                             "  nearest_to_ego={:.1f}m corner=({:.1f},{:.1f}) "
+                             "ego=({:.1f},{:.1f})".format(*OCC_RANGE_DBG)))
             else:
                 OCC_SEGS_NOW = None
             # Accumulate the per-scan obstacle-circle centres into the episode-wide
