@@ -67,11 +67,16 @@ goal:
 # individual terms instead would change the optimum and break MPC parity.
 cost:
   w_goal_run: 0.05          # running goal pull (LINEAR distance -> bounded gradient)
-  w_goal_term: 2.0          # terminal pull on the FINAL state (LINEAR)
+  w_goal_term: 20.0          # terminal pull on the FINAL state (LINEAR)
   w_head: 6.0               # heading alignment toward the goal bearing
   w_v: 2.0                  # speed tracking toward the goal-tapered desired speed
-  r_act: [0.05, 0.20]       # control effort, diagonal of R, per channel [a, delta]
-  r_dact: [0.10, 0.70]      # control rate (smoothness), diagonal of R_delta
+  r_act: [0.05, 2.0]        # control effort, diagonal of R, per channel [a, delta]
+  r_dact: [0.10, 2.0]       # control rate (smoothness), diagonal of R_delta
+                            # The STEERING channel of these two is the correct knob for "stop
+                            # taking such wide swerves": they penalise steering magnitude and
+                            # rate without referencing the goal bearing, so unlike w_head they
+                            # can never make standing still cheaper than driving, and never
+                            # outrank the keep-out. Raise r_act[1]/r_dact[1] to tighten further.
 
 # ── Dynamic obstacles (other aircraft) ───────────────────────────── SHARED ───
 # These are NEGOTIATED with rather than simply avoided, so unlike the static and
@@ -120,7 +125,14 @@ dynamic_obstacles:
 # returning Restoration_Failed, drop this to 1e4 — still overwhelmingly dominant.
 keepout:
   d_safe_hard: 10.0         # [m] ~1 aircraft width
-  w_hard: 1.0e+9             # "infinite" hard-constraint weight
+  w_hard: 100            # "infinite" hard-constraint weight. See the CAVEAT above: the
+                            #   residual violation is |grad(other terms)| / (2*w_hard), so this
+                            #   is the knob that decides whether the keep-out EXISTS, not how
+                            #   wide the ego swerves. At 50 the residual was ~10 m — i.e. the
+                            #   full d_safe_hard, so the cheapest path ran straight through the
+                            #   obstacle. Use r_act/r_dact to tighten swerves, never this.
+                            #   1e5 (not 1e9) because MPPI weights rollouts by exp(-cost/lambda)
+                            #   and a 1e9-scale spread collapses the effective sample size to 1.
 
 # ── Occlusion-aware safety (Firoozi et al., forward reachable sets) ─ SHARED ──
 # Each detected occlusion boundary (a LiDAR range-jump blind corner) seeds an
@@ -170,7 +182,7 @@ dynamic_clusters:
                             #   returns within ~cell*sqrt(2) are one object. Matches the
                             #   obstacle-circle voxel, so cluster and circle resolution agree.
   min_points: 4             # drop components thinner than this (stray single returns)
-  max_radius: 25.0          # [m] REJECT components wider than this — that is a hangar or an
+  max_radius: 100.0          # [m] REJECT components wider than this — that is a hangar or an
                             #   apron edge, not a vehicle. This is the static/scenery filter
                             #   that keeps the association problem small; a value below the
                             #   largest aircraft you simulate silently blinds the tracker to it.
@@ -237,7 +249,7 @@ dynamic_clusters:
                             #   (mppi.horizon * vehicle.dt = 6 s) the radius reaches
                             #   d_safe_hard + extent + 30 m and one taxiing aircraft pushes
                             #   the ego ~30 m off course. 0 => uncapped.
-  query_r: 60.0             # [m] only clusters within this of the ego are constrained (== the
+  query_r: 6000             # [m] only clusters within this of the ego are constrained (== the
                             #   occlusion gate)
   k_dyn: 5                  # nearest dynamic clusters evaluated per step (0 => off)
   include_age: true         # inflate the keep-out by v_target * (age of the measurement).
@@ -286,7 +298,13 @@ mppi:
   sig_d: 0.70               # noise std for steering samples
   # MPPI-local stage costs, layered on top of the shared `cost` section.
   w_lat: 0.05               # lane-centre lateral offset
-  w_head: 4.0               # MPPI-local heading weight (shadows cost.w_head in the MPPI rollout)
+  w_head: 5.0               # MPPI-local heading weight (shadows cost.w_head in the MPPI rollout —
+                            #   THIS is the live value, cost.w_head is dead). Keep it SMALL:
+                            #   (1-cos(th-psi)) rewards pointing at the goal, so it fights every
+                            #   avoidance manoeuvre (which needs heading error) and is ~0 when
+                            #   parked facing the goal. At 50 that made braking strictly cheaper
+                            #   than swerving, and standstill an absorbing minimum — at v=0 the
+                            #   bicycle model freezes theta, so the ego could not turn to escape.
   w_v: 1.2                  # MPPI-local speed weight (shadows cost.w_v)
   w_ctrl: 0.05              # control magnitude
   w_off: 2.0                # off-lane penalty

@@ -489,13 +489,11 @@ def mppi(s0, mean, goal_xy, u_prev=None):
             # permanent ~45 m no-go disc that shoves the ego off course for a single taxiing
             # aircraft. See dynamic_clusters.grow_horizon in the config.
             t_dyn = (k + 1) * DT
-            if DYN_GROW_HORIZON > 0.0:
-                t_dyn = min(t_dyn, DYN_GROW_HORIZON)
             for c0, c1, r_c, age in dyn_set:
                 d_dyn = np.hypot(fwd - c0, lat - c1)
                 # Base radius at t_k = 0: ego margin + the cluster's own extent + the
                 # travel the agent could already have made since the centroid was measured.
-                d_base = D_SAFE_HARD + r_c + (V_TARGET * age if DYN_INCLUDE_AGE else 0.0)
+                d_base = D_SAFE_HARD + r_c
                 cost += occlusion_stage_cost(
                     d_dyn, vv, t_dyn, V_TARGET, d_base, W_HARD)
 
