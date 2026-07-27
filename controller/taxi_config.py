@@ -58,6 +58,15 @@ SCHEMA: Dict[str, Dict[str, str]] = {
     "occlusion_tracker": {
         "assoc_radius": "float", "alpha": "float", "ttl": "float", "min_hits": "int",
     },
+    "dynamic_clusters": {
+        "cell": "float", "min_points": "int", "max_radius": "float",
+        "assoc_radius": "float", "alpha": "float", "vel_beta": "float",
+        "ttl": "float", "min_hits": "int", "v_min": "float", "min_dyn_hits": "int",
+        "dyn_window": "float", "extent_frac": "float", "resegment_ratio": "float",
+        "require_motion": "bool", "grow_horizon": "float",
+        "query_r": "float", "k_dyn": "int",
+        "include_age": "bool",
+    },
     "scan": {
         "fov_h": "float", "fov_v": "float", "res_h": "float", "res_v": "float",
         "max_range": "float",
@@ -171,6 +180,29 @@ def _check_consistency(cfg, path):
         bad("occlusion.v_target must be positive")
     if not 0.0 < cfg["occlusion_tracker"]["alpha"] <= 1.0:
         bad("occlusion_tracker.alpha must be in (0, 1]")
+    if not 0.0 < cfg["dynamic_clusters"]["alpha"] <= 1.0:
+        bad("dynamic_clusters.alpha must be in (0, 1]")
+    if not 0.0 < cfg["dynamic_clusters"]["vel_beta"] <= 1.0:
+        bad("dynamic_clusters.vel_beta must be in (0, 1]")
+    if cfg["dynamic_clusters"]["cell"] <= 0.0:
+        bad("dynamic_clusters.cell must be positive")
+    if cfg["dynamic_clusters"]["dyn_window"] <= 0.0:
+        bad("dynamic_clusters.dyn_window must be positive (it divides the net displacement)")
+    if cfg["dynamic_clusters"]["extent_frac"] < 0.0:
+        bad("dynamic_clusters.extent_frac must be >= 0")
+    if cfg["dynamic_clusters"]["resegment_ratio"] <= 1.0:
+        bad("dynamic_clusters.resegment_ratio must exceed 1 (it is a ratio of extents, "
+            "and <= 1 would declare EVERY window a re-segmentation, so nothing is ever "
+            "classified as moving)")
+    if cfg["dynamic_clusters"]["min_dyn_hits"] < 1:
+        bad("dynamic_clusters.min_dyn_hits must be >= 1 (it is the number of still windows "
+            "before demotion; 0 would demote a mover in the same window it was promoted)")
+    if cfg["dynamic_clusters"]["assoc_radius"] <= cfg["occlusion"]["v_target"]:
+        # The gate has to cover the distance an agent travels BETWEEN scans, else a moving
+        # cluster is a brand-new track every scan and is never confirmed as dynamic. One
+        # v_target of travel (~1 s of publishing) is the floor; the configured 8 m is ~1.6x.
+        bad("dynamic_clusters.assoc_radius must exceed occlusion.v_target, or a moving "
+            "cluster cannot be associated across scans and is never classified dynamic")
     if not 0.0 <= cfg["occlusion"]["fwd_half_angle"] <= 180.0:
         bad("occlusion.fwd_half_angle must be in [0, 180] degrees")
     if cfg["scan"]["res_h"] <= 0.0 or cfg["scan"]["res_v"] <= 0.0:

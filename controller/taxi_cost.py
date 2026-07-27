@@ -20,14 +20,17 @@ The static and occlusion terms share ONE keep-out radius (D_SAFE_HARD) and ONE w
 (W_HARD, large enough to act as a hard constraint), so they cannot be traded off against
 each other or against the goal pull.
 
-NO DYNAMIC-OBSTACLE TERM. It used to sit here with a soft influence ring plus an exact
-penalty — the shape a moving agent needs, since it has to be negotiated with rather than
-simply avoided. It is gone because its input was an ORACLE: exact positions and velocities
-of other aircraft, handed to the controller by Unity rather than sensed. Moving agents now
-enter the cost only through the LiDAR static-circle term, with no velocity model. The MPC
-still carries the full dynamic terms (P_opos/P_ovel), so this module is NO LONGER at parity
-with it on that one term — restoring parity means giving BOTH a sensed, tracked estimate of
-the moving agents, not re-adding the oracle.
+NO DYNAMIC-OBSTACLE TERM *HERE*. It used to sit in this module with a soft influence ring
+plus an exact penalty, fed by an ORACLE: exact positions and velocities of other aircraft,
+handed to the controller by Unity rather than sensed. That is gone for good.
+
+Moving agents are now handled OUTSIDE this function, in the MPPI rollout loop, as sensed
+LiDAR clusters (dynamic_clusters.py) carrying the SAME expanding keep-out as an occlusion
+boundary — occlusion_capsules.occlusion_stage_cost with a per-cluster base radius. They are
+not re-added here because there is nothing MPC-reference about them: the MPC still carries
+the old oracle terms (P_opos/P_ovel) and is unrunnable, so parity on this term is defined by
+whichever controller gets the sensed model first, which is the MPPI. Porting the MPC means
+giving it DYN_NOW too — never re-adding the oracle.
 
 Terminal:  W_GOAL_TERM · sqrt(d_goal² + 1)
 

@@ -730,7 +730,7 @@ PrefabInstance:
       objectReference: {fileID: 0}
     - target: {fileID: 100000, guid: 8b3eca4c34b9e1148a3c4d42a48dd5b8, type: 3}
       propertyPath: m_IsActive
-      value: 1
+      value: 0
       objectReference: {fileID: 0}
     - target: {fileID: 400000, guid: 8b3eca4c34b9e1148a3c4d42a48dd5b8, type: 3}
       propertyPath: m_LocalScale.x
@@ -2003,6 +2003,7 @@ GameObject:
   - component: {fileID: 1156722711}
   - component: {fileID: 1156722710}
   - component: {fileID: 1156722713}
+  - component: {fileID: 1156722714}
   m_Layer: 0
   m_Name: ROS Publishers
   m_TagString: Untagged
@@ -2055,7 +2056,7 @@ MonoBehaviour:
   debugRayStride: 8
   drawHitPoints: 0
   hitPointSize: 0.15
-  drawOcclusionEdges: 1
+  drawOcclusionEdges: 0
   grazingDeg: 10
   minJumpMeters: 2
   cornerMergeRadius: 1.5
@@ -2085,7 +2086,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1156722709}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: f1c34d89c525583bbb024072a2ac13ed, type: 3}
   m_Name: 
@@ -2105,6 +2106,31 @@ MonoBehaviour:
   groundOffset: 0.05
   projectToGroundPlane: 1
   sensorHeight: 2
+--- !u!114 &1156722714
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1156722709}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 24fd5a955c2953bdda4203ce7d04c75d, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::DynamicAgentVisualizer
+  topic: /dynamic_clusters
+  messageTimeout: 1
+  dt: 0.1
+  ringCount: 5
+  ringStride: 10
+  animate: 1
+  playbackSpeed: 1
+  loopPause: 0.5
+  showClusterExtent: 1
+  circleSegments: 48
+  groundY: 0.05
+  keepOutColor: {r: 0.1, g: 0.85, b: 1, a: 1}
+  extentColor: {r: 1, g: 1, b: 1, a: 0.8}
 --- !u!1 &1179805699 stripped
 GameObject:
   m_CorrespondingSourceObject: {fileID: 5745026347857897730, guid: 2ff8c8d06f9ed614c9f3b44837944535, type: 3}

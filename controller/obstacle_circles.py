@@ -102,6 +102,13 @@ class ObstacleCircles:
         self._ready = False
         self._node = self._thread = None
 
+        # Height/range-filtered world points from the LAST build, kept for the dynamic
+        # -obstacle clusterer (dynamic_clusters.py). Deliberately the RAW filtered points,
+        # not the voxel centres: clustering the voxel representatives would throw away the
+        # point counts that separate a real object from a handful of stray returns.
+        self._pts_world = None      # (N,2) world [a0, a1]
+        self._cluster_cache = None  # (key, result) memo — see clusters()
+
     @property
     def ready(self) -> bool:
         return self._ready
@@ -219,6 +226,10 @@ class ObstacleCircles:
         w0 = a0[keep] + ego0
         w1 = a1[keep] + ego1
 
+        # Hand the same filtered points to the dynamic clusterer; invalidate its memo.
+        self._pts_world = np.column_stack([w0, w1])
+        self._cluster_cache = None
+
         # Voxel down-sample: one representative point per occupied voxel, placed at
         # the voxel CENTRE so the fixed cover_r radius provably encloses every raw
         # point that fell in the cell (max centre-to-corner distance = voxel·√2/2).
@@ -238,6 +249,26 @@ class ObstacleCircles:
         if not self._ready or self._circles is None or not len(self._circles):
             return None
         return self._circles
+
+    def clusters(self, cell: float = 2.0, min_points: int = 4,
+                 max_radius: float = 25.0) -> Optional[np.ndarray]:
+        """(M,4) world [c0, c1, r_cluster, n_points] connected-component clusters of the
+        current scan's obstacle points, or None. Input to DynamicClusterTracker.
+
+        MEMOISED on the scan stamp and the parameters: the control loop runs at
+        1/vehicle.dt (~20 Hz) while the cloud arrives at ~1 Hz, so without this the same
+        points would be re-clustered ~20 times per scan for identical output.
+        """
+        if not self._ready or self._pts_world is None or not len(self._pts_world):
+            return None
+        key = (self._stamp, float(cell), int(min_points), float(max_radius))
+        if self._cluster_cache is not None and self._cluster_cache[0] == key:
+            return self._cluster_cache[1]
+        from dynamic_clusters import cluster_points
+        res = cluster_points(self._pts_world[:, 0], self._pts_world[:, 1],
+                             cell=cell, min_points=min_points, max_radius=max_radius)
+        self._cluster_cache = (key, res)
+        return res
 
     def distance(self, w0: np.ndarray, w1: np.ndarray) -> np.ndarray:
         """(N,) ABSOLUTE world (a0,a1) → clearance to the nearest circle SURFACE [m]:

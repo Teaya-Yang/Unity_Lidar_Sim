@@ -186,61 +186,11 @@ public class PhantomAgentVisualizer : MonoBehaviour
         DrawCapsule(a, b, dSafeHard + vTarget * t, new Color(1f, 0.35f, 0f, fade));
     }
 
-    /// <summary>
-    /// Outline of every point within `radius` of segment AB, on the ground plane: two
-    /// straight flanks joined by a semicircular cap at each end. A degenerate segment
-    /// (a == b) falls back to a full circle, which is exactly what the controllers plan
-    /// against in circle mode — same code path, same geometry.
-    /// </summary>
     void DrawCapsule(Vector3 a, Vector3 b, float radius, Color color)
     {
-        var axis = b - a;
-        axis.y = 0f;
-        float len = axis.magnitude;
-
-        int capSegments = Mathf.Max(4, circleSegments / 2);
-
-        if (len < 1e-4f)
-        {
-            // Degenerate: full circle about a. Two back-to-back semicircles rather than a
-            // separate routine, so the circle and capsule cases cannot drift apart.
-            DrawSemicircle(a, radius, Vector3.right, Vector3.forward, capSegments, color);
-            DrawSemicircle(a, radius, -Vector3.right, -Vector3.forward, capSegments, color);
-            return;
-        }
-
-        var u = axis / len;                              // along the axis
-        var n = new Vector3(-u.z, 0f, u.x);              // left normal, ground plane
-
-        // The two flanks of the rectangle.
-        Debug.DrawLine(a + n * radius, b + n * radius, color, 0f, false);
-        Debug.DrawLine(a - n * radius, b - n * radius, color, 0f, false);
-
-        // End caps: at b the arc sweeps from the left flank round the far end to the right
-        // flank; at a it sweeps the other way. Together they close the outline.
-        DrawSemicircle(b, radius, n, u, capSegments, color);
-        DrawSemicircle(a, radius, -n, -u, capSegments, color);
-    }
-
-    /// <summary>
-    /// Half-circle of `radius` about `centre`, starting along `from`, bulging toward
-    /// `through`, ending along -`from`. Both directions must be unit and perpendicular.
-    /// </summary>
-    void DrawSemicircle(Vector3 centre, float radius, Vector3 from, Vector3 through,
-                        int segments, Color color)
-    {
-        var prev = centre + from * radius;
-        for (int s = 1; s <= segments; s++)
-        {
-            float ang = Mathf.PI * s / segments;
-            var dir = from * Mathf.Cos(ang) + through * Mathf.Sin(ang);
-            var next = centre + dir * radius;
-            // Zero duration = this frame only. Update() redraws every frame, so any
-            // lingering duration would stack stale outlines on top of the live ones.
-            // depthTest:false — otherwise the ground plane occludes an outline lying on it
-            // and nothing is visible.
-            Debug.DrawLine(prev, next, color, 0f, false);
-            prev = next;
-        }
+        // Geometry lives in KeepOutGizmos, shared with DynamicAgentVisualizer: the two
+        // keep-outs are the same shape by construction on the Python side, so they must be
+        // the same shape here too.
+        KeepOutGizmos.DrawCapsule(a, b, radius, color, circleSegments);
     }
 }

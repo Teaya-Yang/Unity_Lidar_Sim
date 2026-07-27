@@ -159,6 +159,91 @@ occlusion:
                             #   (deliberately gentle => the ego slows early)
   v_sight_floor: 2.5        # [m/s] never cap the sightline speed below this
 
+# ── Sensed dynamic obstacles (LiDAR clusters) ────────────────────── SHARED ───
+# The replacement for the removed oracle obstacle slots. Obstacle returns are
+# clustered, tracked, and the MOVING ones seed an EXPANDING keep-out identical in
+# form to the occlusion one — same occlusion.v_target, same keepout.w_hard — so a
+# visible taxiing aircraft and a hypothetical one behind a corner are treated by
+# one mechanism. See dynamic_clusters.py.
+dynamic_clusters:
+  cell: 2.0                 # [m] clustering grid side. Doubles as the merge distance:
+                            #   returns within ~cell*sqrt(2) are one object. Matches the
+                            #   obstacle-circle voxel, so cluster and circle resolution agree.
+  min_points: 4             # drop components thinner than this (stray single returns)
+  max_radius: 25.0          # [m] REJECT components wider than this — that is a hangar or an
+                            #   apron edge, not a vehicle. This is the static/scenery filter
+                            #   that keeps the association problem small; a value below the
+                            #   largest aircraft you simulate silently blinds the tracker to it.
+  assoc_radius: 8.0         # [m] association gate. MUST exceed v_target * scan_period
+                            #   (~5 m at 1 Hz), or a moving cluster is re-created as a new
+                            #   track every scan and never reaches min_hits.
+  alpha: 0.6                # EMA weight on each new POSITION measurement. Higher than the
+                            #   occlusion tracker's 0.35 on purpose: lag on a moving target
+                            #   puts the keep-out behind where the agent actually is.
+  vel_beta: 0.5             # EMA weight on each new VELOCITY measurement
+  ttl: 3.0                  # [s] drop a track unseen this long. Like the occlusion tracker's,
+                            #   MUST exceed the ~1 s scan period with margin.
+  min_hits: 2               # confirmations before a track is usable at all
+  # The static/dynamic test is NET DISPLACEMENT over dyn_window, against two thresholds
+  # (both must be cleared). Instantaneous speed alone does NOT work: a parked vehicle's
+  # centroid is the centroid of its VISIBLE FACE, and that face slides along the body as
+  # the ego drives past, so the finite-difference speed of a stationary ambulance reads
+  # well above v_min for the whole pass. What a static body cannot do is leave its own
+  # footprint — hence the extent term, which is the one actually doing the work.
+  dyn_window: 2.0           # [s] window the NET displacement is measured over. Net, not a
+                            #   sum of steps: jitter cancels over a window, real translation
+                            #   accumulates. Also the promotion LATENCY, so raising it makes
+                            #   the ego react later to a genuine mover — at v_target that is
+                            #   5 m of travel per second added here.
+  v_min: 1.0                # [m/s] absolute floor on the net-displacement rate
+  extent_frac: 1.2          # net displacement must ALSO exceed this fraction of the
+                            #   cluster's own radius. Above 1.0 because the wander of a
+                            #   static body's visible-face centroid reaches its full radius
+                            #   and a little past it once the extent estimate itself is
+                            #   noisy; measured on a parked 3.5 m body, 0.6 false-positived
+                            #   on 22/30 scans, 1.0 on 4/30, and 1.2 on none.
+                            #   THE COST IS A DETECTION FLOOR: the slowest reliably detected
+                            #   speed is ~extent_frac*r/dyn_window, i.e. ~2.1 m/s for a
+                            #   3.5 m body and ~3 m/s for a 5 m one. Slower movers read as
+                            #   static. This is a genuine limit of centroid-only tracking,
+                            #   not a tuning failure — a slow mover and a drifting visible
+                            #   face produce the SAME centroid signal. Removing the
+                            #   trade-off needs free-space reasoning (flag a cluster as
+                            #   dynamic when its previous position is now seen THROUGH),
+                            #   which needs the ordered cloud, not just the centroids.
+  resegment_ratio: 1.5      # if the measured extent changes by more than this factor across
+                            #   a window, the clusterer MERGED or SPLIT the object (e.g. the
+                            #   vehicle's returns joined a wall). The centroid then jumped
+                            #   because the point set changed, not because the body moved, so
+                            #   that window is re-anchored and judged as neither.
+  min_dyn_hits: 2           # STILL windows before a moving track is demoted back to static.
+                            #   Asymmetric on purpose: ONE moving window promotes immediately
+                            #   (a mover must not wait to be believed) while demotion costs
+                            #   min_dyn_hits windows, so a vehicle pausing at a hold-short
+                            #   line is not dropped and instantly re-acquired. Bounded in
+                            #   both directions — an earlier version tallied hits per scan
+                            #   with no cap, so a vehicle that drove for 20 s then parked
+                            #   stayed flagged dynamic for a further 21 s while the tally
+                            #   drained.
+  require_motion: true      # false ⇒ EVERY compact cluster gets the expanding keep-out,
+                            #   moving or not. Far more conservative and much slower going;
+                            #   useful to isolate whether a failure is in the motion test.
+  grow_horizon: 3.0         # [s] CAP on the expansion time: the radius grows as
+                            #   v_target * min(t_k, grow_horizon), not v_target * t_k.
+                            #   Unlike the occlusion term (where the cap is only applied to
+                            #   the PLOT), this one is enforced in the cost, because a
+                            #   visible mover is present at EVERY step of EVERY solve while
+                            #   a blind corner is occasional. Uncapped over the MPPI horizon
+                            #   (mppi.horizon * vehicle.dt = 6 s) the radius reaches
+                            #   d_safe_hard + extent + 30 m and one taxiing aircraft pushes
+                            #   the ego ~30 m off course. 0 => uncapped.
+  query_r: 60.0             # [m] only clusters within this of the ego are constrained (== the
+                            #   occlusion gate)
+  k_dyn: 5                  # nearest dynamic clusters evaluated per step (0 => off)
+  include_age: true         # inflate the keep-out by v_target * (age of the measurement).
+                            #   At ~1 Hz publishing a centroid is up to a second stale, which
+                            #   at v_target = 5 m/s is 5 m of unmodelled travel.
+
 # ── Occlusion corner tracking ────────────────────────────────────── SHARED ───
 # Corners are re-derived from scratch every scan, so the SAME physical corner
 # lands on a different beam each time and returns displaced by up to the beam

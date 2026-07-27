@@ -19,7 +19,10 @@ Observation contract (must match TaxiAgent.cs CollectObservations, OBS_SIZE=7):
   NO DYNAMIC-OBSTACLE SLOTS. Other aircraft used to arrive here as exact positions
   and velocities lifted straight from Unity's scenario manager — an oracle. They are
   now perceived ONLY through the LiDAR point cloud, like every other obstacle, so the
-  planner cannot use knowledge the sensor model does not provide.
+  planner cannot use knowledge the sensor model does not provide. --dynamic-obstacles
+  turns those returns back into moving agents by SENSING them: cluster, track, classify
+  by displacement, then apply the same expanding keep-out the occlusion phantoms get
+  (see dynamic_clusters.py).
 
 Action contract:
   act[0]  a_cmd     — acceleration [m/s^2], clipped to [A_MIN, A_MAX]
@@ -37,6 +40,7 @@ from mlagents_envs.exception import UnityCommunicatorStoppedException
 
 from occlusion_capsules import (occlusion_stage_cost, point_segments_min_distance,
                                 point_segment_distance_np)
+import dynamic_clusters as dyn_clusters
 import taxi_cost as tcost
 # MPC-reference weights — single definition in taxi_cost, imported by both controllers.
 from taxi_cost import (W_GOAL_RUN, W_GOAL_TERM, W_HEAD, W_V, W_OBS,
@@ -171,6 +175,9 @@ OCC_RANGE_DBG   = None   # (min_ego_dist, corner_x, corner_y, ego_x, ego_y) for 
                          # is right to reject it.
 OCC_GATE_DBG    = None   # (n_in, n_after_goal_drop, r_goal, min_goal_dist) from the LAST
                          # solve — lets the [DEBUG occ] trace name the gate that emptied the set.
+OCC_PLAN        = None   # (H,2) the PLANNED future path from the last solve, in world
+                         # (a0,a1). Stage k of this array is the pose the occlusion cost
+                         # checked against radius r(t_k) — the pairing the plan figure draws.
 OCC_SEGS_USED   = None   # (M,2,2) the segments the LAST solve actually constrained against —
                          # post-gating, so it is what the cost saw, not what perception found.
                          # The trajectory plot replays these per timestamp.
@@ -181,6 +188,49 @@ OCC_USED_N      = 0      # boundaries that actually entered the LAST solve's cos
 
 OCCLUSION_AWARE = False   # set True by --occlusion-aware (needs --lidar-costmap): enables the
                           # FRS keep-out + sightline speed cap above (mirrors the MPC controller).
+
+# ── Sensed dynamic obstacles (LiDAR clusters) ────────────────────────────────
+# The same expanding keep-out as the occlusion one, but seeded by an agent the LiDAR can
+# actually SEE rather than by a hypothetical one behind a corner: obstacle returns are
+# clustered (dynamic_clusters.cluster_points), tracked across scans, and the tracks whose
+# estimated speed clears DYN_V_MIN get r_keep(t_k) = D_SAFE_HARD + r_cluster +
+# V_TARGET·(t_k + age). Same V_TARGET, same W_HARD, same one-sided quadratic
+# (occlusion_stage_cost) — one avoidance mechanism, two sources of hazard.
+#
+# NOT a replacement for the static circle term: a dynamic cluster's points stay in the
+# obstacle circles too. The expanding disc strictly contains the static keep-out, so the
+# overlap changes nothing, whereas removing a MIS-classified aircraft from the static set
+# would delete the only constraint protecting the ego from it.
+DYN_CELL       = CFG["dynamic_clusters"]["cell"]
+DYN_MIN_POINTS = CFG["dynamic_clusters"]["min_points"]
+DYN_MAX_RADIUS = CFG["dynamic_clusters"]["max_radius"]
+DYN_ASSOC      = CFG["dynamic_clusters"]["assoc_radius"]
+DYN_ALPHA      = CFG["dynamic_clusters"]["alpha"]
+DYN_VEL_BETA   = CFG["dynamic_clusters"]["vel_beta"]
+DYN_TTL        = CFG["dynamic_clusters"]["ttl"]
+DYN_MIN_HITS   = CFG["dynamic_clusters"]["min_hits"]
+DYN_V_MIN      = CFG["dynamic_clusters"]["v_min"]
+DYN_MIN_DYN_HITS = CFG["dynamic_clusters"]["min_dyn_hits"]
+DYN_REQUIRE_MOTION = CFG["dynamic_clusters"]["require_motion"]
+DYN_WINDOW     = CFG["dynamic_clusters"]["dyn_window"]
+DYN_EXTENT_FRAC = CFG["dynamic_clusters"]["extent_frac"]
+DYN_RESEG_RATIO = CFG["dynamic_clusters"]["resegment_ratio"]
+DYN_GROW_HORIZON = CFG["dynamic_clusters"]["grow_horizon"]
+DYN_QUERY_R    = CFG["dynamic_clusters"]["query_r"]
+K_DYN          = CFG["dynamic_clusters"]["k_dyn"]
+DYN_INCLUDE_AGE = CFG["dynamic_clusters"]["include_age"]
+
+DYNAMIC_AVOID  = False   # set True by --dynamic-obstacles (needs --lidar-costmap)
+DYN_TRACKER    = None    # DynamicClusterTracker, created in run()
+DYN_NOW        = None    # (K,4) [c0, c1, r_cluster, age] confirmed movers for THIS control
+                         # step, written once per step by run() and consumed by mppi() —
+                         # exactly the OCC_SEGS_NOW pattern, and for the same reason: the
+                         # tracker must be advanced once per step, not once per consumer.
+DYN_USED       = None    # (K,4) the movers the LAST solve actually constrained against,
+                         # post-gating. Recorded for the trajectory plot.
+DYN_DBG        = None    # (n_clusters, n_tracks, n_dynamic, max_speed) from the last step
+DYN_PUB        = None    # DynamicClusterPublisher — feeds DynamicAgentVisualizer.cs so the
+                         # Unity Scene view shows the SAME expanding circles the cost used
 VISIBILITY_COST = False   # vestigial: --visibility-cost is a documented no-op
 
 DETECTION_RANGE = float("inf")   # vestigial: it masked ORACLE obstacle slots beyond a radius,
@@ -271,11 +321,12 @@ def mppi(s0, mean, goal_xy, u_prev=None):
 
     Obstacles are NOT an argument: dynamic agents no longer arrive as an oracle feed.
     Everything the rollouts avoid comes from the LiDAR — static circles via
-    LIDAR_COSTMAP.distance() and occlusion boundaries via occ_segs below.
+    LIDAR_COSTMAP.distance(), occlusion boundaries via occ_segs below, and SENSED
+    movers via DYN_NOW (clustered + tracked in run(), consumed here).
 
     Returns (u_nom, new_mean).
     """
-    global OCC_USED_N, OCC_GATE_DBG, OCC_RANGE_DBG, OCC_SEGS_USED
+    global OCC_USED_N, OCC_GATE_DBG, OCC_RANGE_DBG, OCC_SEGS_USED, OCC_PLAN, DYN_USED
     # Nominal MPPI weights / limits. The frontal-threat "go-around" gate (in_corridor / aimed_at_us)
     # has been removed to keep the planner simple: plain lane-following + obstacle rings, and the
     # LiDAR visibility term is what drives any deliberate off-lane motion.
@@ -374,6 +425,17 @@ def mppi(s0, mean, goal_xy, u_prev=None):
                     OCC_USED_N = len(occ_segs)
                     OCC_SEGS_USED = occ_segs
 
+    # Sensed dynamic obstacles for this solve. Gated exactly like the occlusion set —
+    # nearest K within query_r — and then held FIXED over the horizon: the circle grows
+    # with t_k rather than the centre translating, because a two-scan centroid difference
+    # at ~1 Hz cannot support a trajectory prediction (see dynamic_clusters' docstring).
+    dyn_set = None
+    DYN_USED = None
+    if DYNAMIC_AVOID and DYN_NOW is not None and len(DYN_NOW) and K_DYN > 0:
+        dyn_set = dyn_clusters.select_nearest(DYN_NOW, (s0_fwd, s0_lat),
+                                              DYN_QUERY_R, K_DYN)
+        DYN_USED = dyn_set
+
     def _dist_to_occ(px, py):
         """(K,) distance from each rollout pose to the nearest occlusion CAPSULE axis [m].
 
@@ -415,7 +477,29 @@ def mppi(s0, mean, goal_xy, u_prev=None):
             cost += occlusion_stage_cost(
                 _dist_to_occ(fwd, lat), vv, (k + 1) * DT,
                 V_TARGET, D_SAFE_HARD, W_HARD)
-                
+
+        # ── Sensed dynamic obstacles: the SAME expanding keep-out, visible source ──
+        # occlusion_stage_cost with a per-cluster base radius. Looping over clusters (at
+        # most K_DYN, typically <5) keeps the shared cost function untouched while letting
+        # each mover carry its own extent; the inner call is still vectorised over the
+        # K_MPPI rollouts, which is where the cost actually lives.
+        if dyn_set is not None:
+            # Expansion time, CAPPED (unlike the occlusion term, which grows over the whole
+            # horizon): a visible mover is in every solve, so an uncapped 6 s bubble is a
+            # permanent ~45 m no-go disc that shoves the ego off course for a single taxiing
+            # aircraft. See dynamic_clusters.grow_horizon in the config.
+            t_dyn = (k + 1) * DT
+            if DYN_GROW_HORIZON > 0.0:
+                t_dyn = min(t_dyn, DYN_GROW_HORIZON)
+            for c0, c1, r_c, age in dyn_set:
+                d_dyn = np.hypot(fwd - c0, lat - c1)
+                # Base radius at t_k = 0: ego margin + the cluster's own extent + the
+                # travel the agent could already have made since the centroid was measured.
+                d_base = D_SAFE_HARD + r_c + (V_TARGET * age if DYN_INCLUDE_AGE else 0.0)
+                cost += occlusion_stage_cost(
+                    d_dyn, vv, t_dyn, V_TARGET, d_base, W_HARD)
+
+
     # Terminal goal cost ℓgoal,H-1 = -C_GOAL_TERM * max(0, d0 - d_{H-1}): a heavier copy of the
     # goal reward evaluated at the FINAL rollout state, so a rollout that ENDS closer to the goal
     # wins even if it detoured en route (lets the planner go around obstacles instead of stopping
@@ -431,6 +515,18 @@ def mppi(s0, mean, goal_xy, u_prev=None):
 
     u_nom    = opt[0].copy()
     new_mean = np.vstack([opt[1:], opt[-1]])
+
+    # Replay the OPTIMAL sequence deterministically to get the PLANNED future path.
+    # `opt` is the MPPI-weighted mean over samples — the sequence the ego actually
+    # follows — not the single argmin-cost sample, which is one noisy draw and is not
+    # what gets executed. Recorded so the plot can show one solve: the future
+    # trajectory, and how large the keep-out is at each of its stages.
+    _st = np.tile(np.asarray(s0, float)[None, :], (1, 1))
+    _plan = np.empty((H_MPPI, 2))
+    for _k in range(H_MPPI):
+        _st = _rollout_step(_st, opt[_k:_k + 1, 0], opt[_k:_k + 1, 1])
+        _plan[_k] = _st[0, :2]
+    OCC_PLAN = _plan
     return u_nom, new_mean
 
 # ── System identification ─────────────────────────────────────────────────────
@@ -593,7 +689,7 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
             # apart — so re-sightings merge and real boundaries do not.
             return tuple(np.round(np.asarray(seg).ravel() / 2.0).astype(int))
 
-        for fi, (t_ep, ex, ey, segs) in enumerate(frames):
+        for fi, (t_ep, ex, ey, segs, _plan) in enumerate(frames):
             col = frame_colors[fi % len(frame_colors)]
             segs = np.asarray(segs, float).reshape(-1, 2, 2)
 
@@ -653,16 +749,91 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     plt.close(fig)
     print(f"[traj] saved {stem}.csv and {stem}.png")
 
+    # ── Second figure: ONE solve, its planned future, and the keep-out per stage ──
+    # The overview above is an episode summary and cannot show the actual constraint,
+    # because the radius is rebuilt every solve (see occ_frames in the docstring). This
+    # one shows the pairing the cost really evaluates: stage k of the PLANNED path
+    # against radius r(t_k) = D_SAFE_HARD + V_TARGET*t_k, both at the same instant.
+    plan_frames = [f for f in (occ_frames or []) if f[4] is not None and len(f[4])]
+    if show_occlusion and plan_frames:
+        from occlusion_capsules import capsule_polygon, point_segments_min_distance
+
+        # Pick the TIGHTEST solve — the one whose plan came closest to violating the
+        # keep-out, max_k (r_keep(t_k) - d_k). That is the step where the constraint was
+        # actually doing something; an arbitrary or first step usually shows a plan far
+        # from every boundary, which demonstrates nothing.
+        def _slack(fr):
+            segs, plan = fr[3], fr[4]
+            tk = (np.arange(len(plan)) + 1) * DT
+            d = point_segments_min_distance(plan[:, 0], plan[:, 1], segs)
+            return float(np.max((D_SAFE_HARD + V_TARGET * tk) - d))
+
+        t_sel, ex, ey, segs, plan = max(plan_frames, key=_slack)
+        segs = np.asarray(segs, float).reshape(-1, 2, 2)
+        tk_all = (np.arange(len(plan)) + 1) * DT
+        d_all = point_segments_min_distance(plan[:, 0], plan[:, 1], segs)
+        viol = (D_SAFE_HARD + V_TARGET * tk_all) - d_all
+
+        f2, a2 = plt.subplots(figsize=(13, 13))
+        if occ_pts is not None and len(occ_pts):
+            a2.scatter(occ_pts[:, 0], occ_pts[:, 1], c="0.35", s=8, marker="s",
+                       alpha=0.5, label="static occluders", zorder=1)
+        # Executed path for context, so the plan can be compared against what happened.
+        a2.plot(x, y, "-", color="0.75", lw=1.0, zorder=2, label="executed trajectory")
+
+        # Sample stages across the horizon: each gets a colour, a dot on the PLANNED
+        # path, and the keep-out at that stage's radius in the same colour.
+        n_show = min(max_frames, len(plan))
+        stages = np.linspace(0, len(plan) - 1, n_show).round().astype(int)
+        a2.plot(plan[:, 0], plan[:, 1], "-", color="0.4", lw=1.2, zorder=3,
+                label="planned future trajectory")
+        for si, k in enumerate(dict.fromkeys(stages.tolist())):
+            col = frame_colors[si % len(frame_colors)]
+            t_k = float(tk_all[k])
+            r_k = D_SAFE_HARD + V_TARGET * t_k
+            for seg in segs:
+                poly = capsule_polygon(seg[0], seg[1], r_k)
+                a2.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.6, alpha=0.95,
+                        zorder=0)
+            a2.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=11, mew=1.4,
+                    zorder=6,
+                    label=f"$t_k$ = {t_k:.1f} s   r = {r_k:.0f} m   "
+                          f"d = {d_all[k]:.0f} m" +
+                          ("  VIOLATED" if viol[k] > 0 else ""))
+        for seg in segs:
+            a2.plot(seg[0, 0], seg[0, 1], ".", color="k", ms=6, zorder=4)
+        a2.plot(ex, ey, "s", color="tab:red", ms=11, mec="k", zorder=7,
+                label=f"ego now (t = {float(t_sel):.1f} s)")
+
+        px_, py_ = plan[:, 0], plan[:, 1]
+        allx = np.concatenate([px_, segs[:, :, 0].ravel(), [ex]])
+        ally = np.concatenate([py_, segs[:, :, 1].ravel(), [ey]])
+        cx2, cy2 = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
+        half2 = 0.5 * max(allx.max() - allx.min(), ally.max() - ally.min()) + 15.0
+        a2.set_xlim(cx2 - half2, cx2 + half2); a2.set_ylim(cy2 - half2, cy2 + half2)
+        a2.set_aspect("equal", adjustable="box")
+        a2.set_xlabel("x  (Unity Z) [m]"); a2.set_ylabel("y  (Unity X) [m]")
+        a2.set_title(f"planned horizon at t = {float(t_sel):.1f} s — "
+                     f"keep-out per stage (max violation {viol.max():+.1f} m)")
+        a2.legend(loc="best", fontsize=9); a2.grid(True, alpha=0.3)
+        f2.tight_layout()
+        f2.savefig(f"{stem}_plan.png", dpi=120)
+        plt.close(f2)
+        print(f"[traj] saved {stem}_plan.png "
+              f"(solve at t={float(t_sel):.1f}s, max violation {viol.max():+.2f} m)")
+
 
 def run(unity_exec_path=None, port=5004, run_sysid=True,
         noise_std=0.0, detect_range=float("inf"),
         uncertainty=False, n_scenarios=N_SCEN, w_info=W_INFO,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
-        occlusion_aware=False, save_traj=None, show_occlusion_plot=True):
+        occlusion_aware=False, dynamic_obstacles=False, dynamic_viz=False,
+        save_traj=None, show_occlusion_plot=True):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW
+    global DYNAMIC_AVOID, DYN_TRACKER, DYN_NOW, DYN_DBG, DYN_PUB
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     N_SCEN          = n_scenarios
@@ -691,8 +862,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     if lidar_costmap:
         STATIC_AVOID    = lidar_costmap
         OCCLUSION_AWARE = occlusion_aware and lidar_costmap   # occlusion terms need the map
+        DYNAMIC_AVOID   = dynamic_obstacles and lidar_costmap  # clusters come from the same cloud
         from obstacle_circles import ObstacleCircles
         from occlusion_capsules import OcclusionCornerTracker, point_segment_distance_np
+        from dynamic_clusters import DynamicClusterTracker, DynamicClusterPublisher
         # max_age raised from the 0.5s default: Unity's PointCloudPublisher is configured well
         # below 10Hz (measured ~1Hz cloud_age via [DEBUG lidar]), so 0.5s made `ready` permanently
         # False and the static-avoidance/collision cost never activated. 1.5s covers ~1Hz publish
@@ -707,9 +880,25 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 OCC_TRACKER = OcclusionCornerTracker(
                     assoc_radius=OCC_TRACK_ASSOC, alpha=OCC_TRACK_ALPHA,
                     ttl=OCC_TRACK_TTL, min_hits=OCC_TRACK_HITS)
+            if DYNAMIC_AVOID:
+                DYN_TRACKER = DynamicClusterTracker(
+                    assoc_radius=DYN_ASSOC, alpha=DYN_ALPHA, vel_beta=DYN_VEL_BETA,
+                    ttl=DYN_TTL, min_hits=DYN_MIN_HITS, v_min=DYN_V_MIN,
+                    min_dyn_hits=DYN_MIN_DYN_HITS, require_motion=DYN_REQUIRE_MOTION,
+                    dyn_window=DYN_WINDOW, extent_frac=DYN_EXTENT_FRAC,
+                    resegment_ratio=DYN_RESEG_RATIO)
+                if dynamic_viz:
+                    DYN_PUB = DynamicClusterPublisher()
+                    if not DYN_PUB.start():
+                        DYN_PUB = None
             feats = [f"static(D_SAFE={D_SAFE_HARD:.1f}m, circle-cover)"]
             if OCCLUSION_AWARE:  feats.append(f"occlusion(D_SAFE={D_SAFE_HARD:.1f}m, "
                                              f"v_target={V_TARGET:.1f}m/s, sightline)")
+            if DYNAMIC_AVOID:    feats.append(
+                f"dynamic(clustered, v_min={DYN_V_MIN:.1f}m/s, "
+                f"v_target={V_TARGET:.1f}m/s, k={K_DYN})"
+                + ("" if DYN_REQUIRE_MOTION else " [require_motion=OFF: every compact "
+                                                 "cluster gets the expanding keep-out]"))
             print(f"[Controller] LiDAR map     : ON  (topic={lidar_topic}) — {' + '.join(feats)} "
                   f"in the MPPI cost; per-scan obstacle circles")
         else:
@@ -717,8 +906,15 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
             OCCLUSION_AWARE = False
             print("[Controller] LiDAR map     : requested but unavailable (no rclpy) — "
                   "running WITHOUT LiDAR-based costs")
-    elif occlusion_aware:
-        print("[Controller] Occlusion-aware : requested but needs --lidar-costmap — DISABLED")
+    elif occlusion_aware or dynamic_obstacles:
+        if occlusion_aware:
+            print("[Controller] Occlusion-aware : requested but needs --lidar-costmap — DISABLED")
+        if dynamic_obstacles:
+            print("[Controller] Dynamic obstacles: requested but needs --lidar-costmap "
+                  "(the clusters come from the same cloud) — DISABLED")
+    if dynamic_viz and not DYNAMIC_AVOID:
+        print("[Controller] --dynamic-viz needs --dynamic-obstacles (there is nothing to "
+              "draw without the detector) — DISABLED")
     env = UnityEnvironment(
         file_name=unity_exec_path,
         base_port=port,
@@ -767,6 +963,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     # ACTUALLY constrained by at that instant. The plot samples these, so each drawn
     # keep-out belongs to one timestamp rather than to an episode-wide union.
     occ_frames = []
+    # Per-step centres of the dynamic clusters the planner was constrained by. Fills the
+    # obs_track slot of _save_trajectory, which used to carry the oracle obstacle feed —
+    # so the plot's "dynamic obstacles" markers are now SENSED positions, not ground truth.
+    dyn_track = []
 
     env.reset()
     decision_steps, terminal_steps = env.get_steps(behavior_name)
@@ -812,9 +1012,15 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 _raw = LIDAR_COSTMAP.occlusion_segments(
                     ego_fwd=ego_fwd, fwd_half_angle_deg=OCC_FWD_HALF_ANGLE)
                 _s = OCC_TRACKER.update(_raw, time.monotonic())
-                if _s is not None and len(_s):
+                if _s is not None and len(_s) and not OCC_USE_CAPSULES:
                     # Circle keep-out ⇒ collapse each boundary onto its corner (as the
                     # MPC does), so cost and plot use identical geometry.
+                    # The OCC_USE_CAPSULES guard was missing here, so this collapsed
+                    # EVERY boundary regardless of the setting — occlusion.use_capsules
+                    # was dead, the keep-out was always a disc on the corner, and the
+                    # capsules the plot and PhantomAgentVisualizer advertise never
+                    # existed. mppi() has the same collapse, correctly gated, at the
+                    # point where it builds occ_segs.
                     _s = _s.copy()
                     _s[:, 1, :] = _s[:, 0, :]
                 OCC_SEGS_NOW = _s
@@ -840,6 +1046,38 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                              "ego=({:.1f},{:.1f})".format(*OCC_RANGE_DBG)))
             else:
                 OCC_SEGS_NOW = None
+
+            # Cluster + track the moving obstacles ONCE per control step, same discipline
+            # as the occlusion tracker above: advance the filter here, hand the confirmed
+            # movers to mppi() through DYN_NOW. clusters() is memoised on the scan stamp,
+            # so re-calling it at control rate against a ~1 Hz cloud is free.
+            if DYNAMIC_AVOID and DYN_TRACKER is not None and LIDAR_COSTMAP.ready:
+                _now = time.monotonic()
+                _cl = LIDAR_COSTMAP.clusters(cell=DYN_CELL, min_points=DYN_MIN_POINTS,
+                                             max_radius=DYN_MAX_RADIUS)
+                DYN_TRACKER.update(_cl, _now)
+                DYN_NOW = DYN_TRACKER.dynamic(_now)
+                _sp = DYN_TRACKER.speeds()
+                DYN_DBG = (0 if _cl is None else len(_cl), DYN_TRACKER.n_tracks,
+                           0 if DYN_NOW is None else len(DYN_NOW),
+                           max(_sp) if _sp else 0.0)
+                # Where the dynamic pipeline is losing agents — every stage fails SILENTLY,
+                # and the ego then drives the dynamic-UNAWARE trajectory with the flag ON:
+                #   cl=0    clustering found nothing (min_points, or max_radius rejected the
+                #           blob as scenery — a large aircraft close up can exceed it)
+                #   trk     live tracks; if this climbs with cl steady, association is
+                #           failing (assoc_radius too small for the per-scan travel) and
+                #           every scan is minting new tracks that never confirm
+                #   dyn=0   tracks exist but none cleared v_min/min_dyn_hits — either
+                #           nothing is moving, or the centroid is too noisy to tell
+                #   used    what actually entered the cost (previous solve; gated by
+                #           query_r / k_dyn)
+                if ep_steps % 10 == 1:
+                    print(f"[DEBUG dyn] cl={DYN_DBG[0]} trk={DYN_DBG[1]} dyn={DYN_DBG[2]} "
+                          f"used={0 if DYN_USED is None else len(DYN_USED)} "
+                          f"v_max={DYN_DBG[3]:.1f}m/s (v_min={DYN_V_MIN:.1f})")
+            else:
+                DYN_NOW = None
             # Accumulate the per-scan obstacle-circle centres into the episode-wide
             # union (deduped by rounded world position) for the trajectory plot.
             if save_traj is not None and LIDAR_COSTMAP.ready:
@@ -852,9 +1090,28 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         # Snapshot what the solve just above was constrained by, tagged with this
         # timestamp and ego pose. Taken AFTER mppi() so it is the post-gating set that
         # entered the cost — the same geometry _dist_to_occ measured against.
+        # Feed the Unity Scene-view overlay with the POST-GATING set — what the cost above
+        # actually constrained against, not what perception merely found. Published every
+        # step including when empty, so the circles disappear the moment the planner stops
+        # constraining them rather than lingering as a stale overlay.
+        if DYN_PUB is not None:
+            _viz = DYN_USED
+            if _viz is not None and len(_viz) and not DYN_INCLUDE_AGE:
+                # The viewer always folds v_target*age into the base radius. When the cost
+                # is NOT doing that, send age = 0 so the drawn circle stays equal to the
+                # constrained one — the whole reason the parameters travel in the message.
+                _viz = np.asarray(_viz, float).copy()
+                _viz[:, 3] = 0.0
+            DYN_PUB.publish(_viz, V_TARGET, D_SAFE_HARD, DYN_GROW_HORIZON)
+
+        if save_traj is not None and DYN_USED is not None and len(DYN_USED):
+            for _c0, _c1, _r, _age in DYN_USED:
+                dyn_track.append((ep_steps * DT, float(_c0), float(_c1)))
+
         if save_traj is not None and OCC_SEGS_USED is not None and len(OCC_SEGS_USED):
             occ_frames.append((ep_steps * DT, float(s[0]), float(s[1]),
-                               np.array(OCC_SEGS_USED, dtype=float)))
+                               np.array(OCC_SEGS_USED, dtype=float),
+                               None if OCC_PLAN is None else OCC_PLAN.copy()))
 
         u_cmd      = u_nom
         cbf_engaged = False
@@ -920,6 +1177,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         env.close()
     except Exception:
         pass
+    if DYN_PUB is not None:
+        DYN_PUB.shutdown()
 
     verdict = "collision" if collided else ("reached" if reached else "timeout")
 
@@ -929,7 +1188,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         # every wall/blind corner the ego reacted to.
         occ_pts = np.array(list(occ_seen.keys())) if occ_seen else None
         _save_trajectory(save_traj, verdict, goal_xy, np.asarray(traj),
-                         None,   # dynamic-obstacle track: no oracle feed to record
+                         # SENSED dynamic-obstacle centres (clustered + tracked from the
+                         # LiDAR), not the removed oracle feed.
+                         np.asarray(dyn_track) if dyn_track else None,
                          occ_pts, occ_frames=occ_frames,
                          # OCC_HORIZON, not the PLANNING horizon: the keep-out is
                          # capped at OCC_HORIZON in the cost, so drawing H_MPPI*DT
@@ -992,6 +1253,20 @@ if __name__ == "__main__":
                         "hidden agent on each blind-corner frontier seeds an EXPANDING keep-out "
                         "(radius grows as v_target·t) and the ego is speed-capped so it can stop "
                         "before the nearest occlusion. Requires --lidar-costmap.")
+    p.add_argument("--dynamic-obstacles", action="store_true",
+                   help="Detect MOVING obstacles from the LiDAR: cluster the obstacle returns, "
+                        "track the clusters across scans, and give each one whose estimated "
+                        "speed clears dynamic_clusters.v_min an EXPANDING keep-out — radius "
+                        "D_SAFE_HARD + cluster extent + occlusion.v_target*t, the same forward-"
+                        "reachable-set circle the blind-corner phantoms get. Requires "
+                        "--lidar-costmap. Set dynamic_clusters.require_motion=false in the "
+                        "config to apply it to every compact cluster, moving or not.")
+    p.add_argument("--dynamic-viz", action="store_true",
+                   help="Publish the dynamic keep-outs on /dynamic_clusters "
+                        "(std_msgs/Float32MultiArray) so DynamicAgentVisualizer.cs can draw "
+                        "them in the Unity Scene view. The model parameters ride along in the "
+                        "message, so the drawn circle is the one the planner used — no Unity-"
+                        "side constants to keep in sync. Requires --dynamic-obstacles.")
     p.add_argument("--save-traj", default=None, metavar="DIR",
                    help="Save the run's ego trajectory as CSV + a top-down PNG plot into DIR.")
     args = p.parse_args()
@@ -1014,5 +1289,7 @@ if __name__ == "__main__":
         lidar_topic=args.lidar_topic,
         visibility_cost=args.visibility_cost,
         occlusion_aware=args.occlusion_aware,
+        dynamic_obstacles=args.dynamic_obstacles,
+        dynamic_viz=args.dynamic_viz,
         show_occlusion_plot=not args.no_occlusion_plot,
         save_traj=args.save_traj)
