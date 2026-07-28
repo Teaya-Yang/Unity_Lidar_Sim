@@ -65,7 +65,7 @@ from taxi_controller_mppi import (
     V_TARGET, K_OCC, OCC_QUERY_R, OCC_FWD_HALF_ANGLE,
     SCAN_FOV_H, SCAN_FOV_V, SCAN_RES_H, SCAN_RES_V, SCAN_MAX_RANGE,
     OCC_TRACK_ASSOC, OCC_TRACK_ALPHA, OCC_TRACK_TTL, OCC_TRACK_HITS,
-    W_SIGHT, A_BRAKE_SIGHT, V_SIGHT_FLOOR, OCC_HORIZON,
+    W_SIGHT, A_BRAKE_SIGHT, V_SIGHT_FLOOR, OCC_HORIZON, OCC_T_GROW_MAX,
     obs_to_state,
     identify_bicycle_model, _save_trajectory,
 )
@@ -347,9 +347,12 @@ class TaxiMPC:
                     px, py, oc[0], oc[1], oc[2], oc[3],
                     ca.fmin, ca.fmax, ca.sqrt)
                 d_vis = ca.fmin(d_vis, dc)
+                # t_grow_max caps the expansion (see occlusion_stage_cost): single-circle mode
+                # already fixes t_eff, so the cap only bites on the nested-set mode.
                 cost += occlusion_stage_cost(dc, v, t_eff, self.v_target,
                                              self.d_safe_hard, self.w_hard,
-                                             fmax=ca.fmax, sqrt=ca.sqrt)
+                                             fmax=ca.fmax, sqrt=ca.sqrt,
+                                             t_grow_max=OCC_T_GROW_MAX)
 
             # Sightline (RSS) speed cap: slow so the ego can brake to a stop before the
             # nearest occlusion boundary. Widening the arc alone would let it round a

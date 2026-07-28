@@ -487,8 +487,17 @@ class OcclusionCornerTracker:
 # the MPC calls the SAME function with CasADi primitives (it needs differentiable
 # fmax/sqrt for IPOPT), so there is no second transcription to keep in sync.
 #
-#   r_keep = d_safe + v_target · t_k        expanding hard keep-out
-#   cost   = w_obs · max(0, r_keep − d)²     single one-sided quadratic
+#   r_keep = d_safe + v_target · min(t_k, t_grow_max)   expanding hard keep-out
+#   cost   = w_obs · max(0, r_keep − d)²                 single one-sided quadratic
+#
+# THE GROWTH IS CAPPED. Uncapped, r_grow = v_target·t_k reaches v_target·T_horizon
+# (8 m/s × 6 s = 48 m) by the end of the horizon, so EVERY rollout starting within
+# ~51 m of a boundary violates at some late stage no matter what it does — the batch
+# is uniformly infeasible, the controller brakes, the state does not change, and the
+# next solve repeats it. Capping the expansion at t_grow_max seconds bounds the bubble
+# at d_safe + v_target·t_grow_max. Justification: the planner re-solves every DT with
+# a fresh scan, so a phantom extrapolated many seconds ahead on zero evidence is
+# fiction, and treating it as a hard constraint freezes the ego for nothing.
 #
 # w_obs is the HARD-CONSTRAINT weight (W_HARD): large enough that any breach of the
 # keep-out dominates every other term in the objective, so the penalty behaves as a
@@ -496,7 +505,8 @@ class OcclusionCornerTracker:
 # goal fade — one radius, one weight, shared with the static-surface keep-out.
 
 def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=None, clip=None,
-                         w_sight=None, a_brake=None, v_floor=None):
+                         w_sight=None, a_brake=None, v_floor=None, cost_current = None, dyn = False, action = None,
+                         t_grow_max=None):
     """Occlusion stage cost. Backend-agnostic: pass numpy or CasADi primitives.
 
     d        : distance from the (rollout/predicted) pose to the nearest occlusion boundary
@@ -506,15 +516,25 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
     d_safe   : base (t=0) keep-out radius [m]
     w_obs    : hard-constraint weight
     w_sight  : RSS sightline weight, or None to skip that term (a_brake/v_floor then unused)
+    t_grow_max : cap [s] on the expansion time, or None for the (freezing) uncapped growth
     Returns the scalar/array stage cost contribution.
     """
     import numpy as _np
     fmax = _np.maximum if fmax is None else fmax
     sqrt = _np.sqrt if sqrt is None else sqrt
 
-    r_grow = v_target * t_k          # t_k is a PYTHON float in both callers
+    # t_k is a PYTHON float in both callers, so the cap is a plain min() and stays
+    # CasADi-safe (no symbolic branch).
+    t_grow = t_k if t_grow_max is None else min(t_k, t_grow_max)
+    r_grow = v_target * t_grow
     r_keep = r_grow + d_safe
 
+
     cost = np.where(d < r_keep, w_obs, 0.0) 
+    
+    if not dyn:
+        print(f"TIMESTAMP_occlussion: {t_k} -> r_grow : {r_grow}, distance from occlussion : {d}, total distance to keep : {r_keep} , current min cost: {np.min(cost_current)}, current_actions: {action[np.argmin(cost_current)]}")
+    else:
+        print(f"TIMESTAMP_dynamic: {t_k} -> r_grow : {r_grow}, distance from dyn : {d}, total distance to keep : {r_keep} , current min cost: {np.min(cost_current)}")
 
     return cost

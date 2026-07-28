@@ -50,9 +50,11 @@ SCHEMA: Dict[str, Dict[str, str]] = {
         "headon_giveway": "float", "w_half": "float",
     },
     "keepout": {"d_safe_hard": "float", "w_hard": "float",
-                "infeasible_depth": "float", "infeasible_frac": "float"},
+                "infeasible_depth": "float", "infeasible_frac": "float",
+                "stall_v": "float"},
     "occlusion": {
-        "v_target": "float", "horizon": "float", "k_occ": "int", "query_r": "float",
+        "v_target": "float", "horizon": "float", "t_grow_max": "float",
+        "k_occ": "int", "query_r": "float",
         "fwd_half_angle": "float", "use_capsules": "bool", "single_circle": "bool",
         "w_sight": "float", "a_brake_sight": "float", "v_sight_floor": "float",
     },
@@ -181,8 +183,14 @@ def _check_consistency(cfg, path):
     if cfg["goal"]["min_speed"] <= 0.0:
         bad("goal.min_speed must be > 0: the steering authority rolls off toward zero "
             "speed, so a 0 floor stalls the ego mid-course")
+    if cfg["keepout"]["stall_v"] < 0.0:
+        bad("keepout.stall_v must be >= 0 (0 disables the standstill escape, restoring the "
+            "brake-forever behaviour)")
     if cfg["occlusion"]["v_target"] <= 0.0:
         bad("occlusion.v_target must be positive")
+    if cfg["occlusion"]["t_grow_max"] <= 0.0:
+        bad("occlusion.t_grow_max must be positive: 0 would freeze the keep-out at d_safe_hard "
+            "and drop the forward-reachable-set expansion entirely")
     if not 0.0 < cfg["occlusion_tracker"]["alpha"] <= 1.0:
         bad("occlusion_tracker.alpha must be in (0, 1]")
     if not 0.0 < cfg["dynamic_clusters"]["extent_alpha"] <= 1.0:

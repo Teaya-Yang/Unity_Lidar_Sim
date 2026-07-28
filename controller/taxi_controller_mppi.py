@@ -128,6 +128,7 @@ V_TARGET       = _occ["v_target"]
 OCC_USE_CAPSULES = _occ["use_capsules"]   # False ⇒ collapse each boundary to its corner
 OCC_QUERY_R    = _occ["query_r"]
 OCC_HORIZON    = _occ["horizon"]
+OCC_T_GROW_MAX = _occ["t_grow_max"]   # cap on the FRS expansion time inside the stage cost
 K_OCC          = _occ["k_occ"]
 W_SIGHT        = _occ["w_sight"]
 A_BRAKE_SIGHT  = _occ["a_brake_sight"]
@@ -158,6 +159,7 @@ W_HARD         = _keep["w_hard"]
 INFEAS_DEPTH   = _keep["infeasible_depth"]
 INFEAS_FRAC    = _keep["infeasible_frac"]
 C_INFEAS       = W_HARD * INFEAS_DEPTH
+STALL_V        = _keep["stall_v"]
 
 # Range-jump occlusion boundaries (shared with taxi_controller_mpc.py). The scan geometry
 # MUST match the Unity PointCloudPublisher Inspector fields; a mismatch is detected and the
@@ -499,7 +501,8 @@ def mppi(s0, mean, goal_xy, u_prev=None):
         if occ_segs is not None:
             cost += occlusion_stage_cost(
                 _dist_to_occ(fwd, lat), vv, (k + 1) * DT,
-                V_TARGET, D_SAFE_HARD, W_HARD)
+                V_TARGET, D_SAFE_HARD, W_HARD, t_grow_max=OCC_T_GROW_MAX,
+                cost_current = cost, action = np.column_stack((fwd, lat)))
 
         # ── Sensed dynamic obstacles: the SAME expanding keep-out, visible source ──
         # occlusion_stage_cost with a per-cluster base radius. Looping over clusters (at
@@ -524,7 +527,7 @@ def mppi(s0, mean, goal_xy, u_prev=None):
                 # that does not involve steering. Tune with occlusion.w_sight.
                 cost += occlusion_stage_cost(
                     d_dyn, vv, t_dyn, V_TARGET, d_base, W_HARD,
-                    w_sight=W_SIGHT, a_brake=A_BRAKE_SIGHT, v_floor=V_SIGHT_FLOOR)
+                    w_sight=W_SIGHT, a_brake=A_BRAKE_SIGHT, v_floor=V_SIGHT_FLOOR,  dyn = True, cost_current = cost)
 
 
     # Terminal goal cost ℓgoal,H-1 = -C_GOAL_TERM * max(0, d0 - d_{H-1}): a heavier copy of the

@@ -87,7 +87,7 @@ cost:
 dynamic_obstacles:
   k_obs: 3                  # obstacles in the observation vector (sets OBS_SIZE — see the
                             #   contract in taxi_controller_mppi.py's docstring)
-  d_safe: 14.0              # [m] keep-out radius
+  d_safe: 0.0              # [m] keep-out radius
   d_infl: 30.0              # [m] soft influence radius
   w_obs: 8.0                # soft influence ring weight
   rho_slack: 10.0           # linear exact-penalty weight on a keep-out violation. LINEAR is the
@@ -145,6 +145,14 @@ keepout:
                             #   a metre inside the keep-out, which at v_des = 8 m/s is far
                             #   later than the ~12 m the ego needs to stop (a_min = -4 plus
                             #   the accel_tau = 0.5 s lag). SMALLER = brakes EARLIER.
+  stall_v: 1.0              # [m/s] below this speed the reject-and-brake response is a NO-OP:
+                            #   commanding a_min at a standstill leaves the state unchanged, so
+                            #   the next solve rejects identically and the ego is frozen for
+                            #   good. This happens whenever the ego stops with a boundary
+                            #   already inside r_keep (e.g. an agent passes in front of a blind
+                            #   corner): stage 0 then violates for EVERY sampled action, so no
+                            #   rollout can be feasible. Under this speed the batch is kept and
+                            #   the least-violating rollout is followed to creep back out.
   infeasible_frac: 0     # brake once fewer than this FRACTION of the K rollouts are
                             #   feasible, not only when every last one has failed. Waiting for
                             #   the strict min means waiting until the single luckiest sample
@@ -161,7 +169,15 @@ keepout:
 # Keep v_target REALISTIC — too high and the bubble swallows the horizon and the
 # ego freezes.
 occlusion:
-  v_target: 8.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
+  v_target: 6.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
+  t_grow_max: 6.0           # [s] CAP on the expansion time inside occlusion_stage_cost, so the
+                            #   keep-out saturates at d_safe_hard + v_target * t_grow_max
+                            #   (15 + 8*3 = 39 m) instead of growing to 51 m by the end of the
+                            #   horizon. Uncapped, every rollout starting within ~51 m of a
+                            #   boundary violates at some late stage whatever it does: the whole
+                            #   batch is infeasible, the ego brakes, the state never changes and
+                            #   the freeze latches. Set >= the planning horizon to restore the
+                            #   old uncapped growth.
   horizon: 6.0              # [s] cap on the expansion time. Sizes the Algorithm-1 single circle
                             #   and the plotted capsules; NOT applied inside
                             #   occlusion_capsules.occlusion_stage_cost.
@@ -387,7 +403,7 @@ mppi:
   samples: 2000             # rollouts per control step
   lambda: 1.0               # temperature. See the scaling note under `cost`: this is the
                             #   correct knob for softmax discrimination.
-  sig_a: 1.0                # noise std for acceleration samples
+  sig_a: 1.5                # noise std for acceleration samples
   sig_d: 1.2               # noise std for steering samples
   # MPPI-local stage costs, layered on top of the shared `cost` section.
   w_lat: 0.05               # lane-centre lateral offset
