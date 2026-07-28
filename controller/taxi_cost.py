@@ -106,7 +106,10 @@ def stage_cost(px, py, th, v, uk, u_km1, *, goal_xy, v_des, t_k,
 
     # Static surfaces (LiDAR OCC), same shape as the obstacle terms.
     if d_static is not None:
-        cost = cost + w_static * np.maximum(0.0, d_safe_static - d_static) ** 2
+        # Flat (0/w_static) penalty, not a quadratic: every breach costs the same regardless of
+        # depth. Elementwise over the (K,) rollouts — a Python `if` on d_static is ambiguous
+        # because it is an array, and it would also apply one branch to ALL rollouts.
+        cost = cost + np.where(d_static < d_safe_static, w_static, 0.0)
     
     return cost
 

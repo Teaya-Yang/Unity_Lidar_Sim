@@ -515,6 +515,6 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
     r_grow = v_target * t_k          # t_k is a PYTHON float in both callers
     r_keep = r_grow + d_safe
 
-    cost = w_obs * fmax(0.0, r_keep - d) ** 2
+    cost = np.where(d < r_keep, w_obs, 0.0) 
 
     return cost

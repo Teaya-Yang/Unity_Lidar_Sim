@@ -157,7 +157,7 @@ W_HARD         = _keep["w_hard"]
 # the keep-out. Comparing against W_HARD directly is the depth = 1 m special case.
 INFEAS_DEPTH   = _keep["infeasible_depth"]
 INFEAS_FRAC    = _keep["infeasible_frac"]
-C_INFEAS       = W_HARD * INFEAS_DEPTH ** 2
+C_INFEAS       = W_HARD * INFEAS_DEPTH
 
 # Range-jump occlusion boundaries (shared with taxi_controller_mpc.py). The scan geometry
 # MUST match the Unity PointCloudPublisher Inspector fields; a mismatch is detected and the
@@ -533,7 +533,7 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     # short). st is the final rollout state here.
     # MPC-reference terminal cost: bounded (linear) pull on the FINAL state.
     print("MIN_cost_trajectory: ", cost.min())
-    #print("MAX_cost_trajectory: ", cost.max())
+    print("MAX_cost_trajectory: ", cost.max())
 
     cost += tcost.terminal_cost(st[:, 0], st[:, 1],
                                 goal_xy=(goal_fwd, goal_lat), w_goal_term=W_GOAL_TERM)

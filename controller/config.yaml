@@ -138,14 +138,14 @@ keepout:
   # return the "least bad" COLLIDING path. Instead the batch is rejected and the ego
   # emergency-brakes at limits.a_min. These two knobs set WHEN that fires — i.e. how
   # early the brake comes on.
-  infeasible_depth: 0.10    # [m] keep-out intrusion a rollout may carry and still count as
+  infeasible_depth: 1    # [m] keep-out intrusion a rollout may carry and still count as
                             #   feasible. The cost test is  cost > w_hard * depth^2, so this
                             #   is the physical meaning of the threshold. Testing against
                             #   w_hard itself is depth = 1.0 m: the cheapest rollout is already
                             #   a metre inside the keep-out, which at v_des = 8 m/s is far
                             #   later than the ~12 m the ego needs to stop (a_min = -4 plus
                             #   the accel_tau = 0.5 s lag). SMALLER = brakes EARLIER.
-  infeasible_frac: 0.08     # brake once fewer than this FRACTION of the K rollouts are
+  infeasible_frac: 0.01     # brake once fewer than this FRACTION of the K rollouts are
                             #   feasible, not only when every last one has failed. Waiting for
                             #   the strict min means waiting until the single luckiest sample
                             #   out of 1500 also fails — by then the escape corridor is one
@@ -161,8 +161,8 @@ keepout:
 # Keep v_target REALISTIC — too high and the bubble swallows the horizon and the
 # ego freezes.
 occlusion:
-  v_target: 6.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
-  horizon: 3.0              # [s] cap on the expansion time. Sizes the Algorithm-1 single circle
+  v_target: 12.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
+  horizon: 6.0              # [s] cap on the expansion time. Sizes the Algorithm-1 single circle
                             #   and the plotted capsules; NOT applied inside
                             #   occlusion_capsules.occlusion_stage_cost.
   k_occ: 10                 # nearest boundaries constrained/evaluated per step (0 => off)
@@ -221,7 +221,7 @@ dynamic_clusters:
                             #   detected (dyn=0 while something is plainly driving), this
                             #   is the first thing to raise — check the [DEBUG dyn] rows
                             #   for its r before changing anything else.
-  assoc_radius: 10.0        # [m] association gate. MUST exceed v_target * scan_period
+  assoc_radius: 20.0        # [m] association gate. MUST exceed v_target * scan_period
                             #   (~5 m at 1 Hz), or a moving cluster is re-created as a new
                             #   track every scan and never reaches min_hits.
   # Constant-velocity Kalman filter, state [p0, p1, v0, v1], measured by the centroid.
@@ -388,7 +388,7 @@ mppi:
   lambda: 1.0               # temperature. See the scaling note under `cost`: this is the
                             #   correct knob for softmax discrimination.
   sig_a: 1.0                # noise std for acceleration samples
-  sig_d: 0.70               # noise std for steering samples
+  sig_d: 0.80               # noise std for steering samples
   # MPPI-local stage costs, layered on top of the shared `cost` section.
   w_lat: 0.05               # lane-centre lateral offset
   w_head: 5.0               # MPPI-local heading weight (shadows cost.w_head in the MPPI rollout —
