@@ -152,6 +152,12 @@ STATIC_AVOID   = False   # set True by --lidar-costmap: adds the static keep-out
 # occlusion_capsules.occlusion_stage_cost, which now share the same one-sided quadratic.
 D_SAFE_HARD    = _keep["d_safe_hard"]
 W_HARD         = _keep["w_hard"]
+# Reject-all-and-stop trigger. C_INFEAS is a COST threshold derived from a physical
+# intrusion depth: cost > w_hard * depth^2 means the rollout is at least `depth` inside
+# the keep-out. Comparing against W_HARD directly is the depth = 1 m special case.
+INFEAS_DEPTH   = _keep["infeasible_depth"]
+INFEAS_FRAC    = _keep["infeasible_frac"]
+C_INFEAS       = W_HARD * INFEAS_DEPTH ** 2
 
 # Range-jump occlusion boundaries (shared with taxi_controller_mpc.py). The scan geometry
 # MUST match the Unity PointCloudPublisher Inspector fields; a mismatch is detected and the
@@ -192,7 +198,8 @@ OCCLUSION_AWARE = False   # set True by --occlusion-aware (needs --lidar-costmap
 # ── Sensed dynamic obstacles (LiDAR clusters) ────────────────────────────────
 # The same expanding keep-out as the occlusion one, but seeded by an agent the LiDAR can
 # actually SEE rather than by a hypothetical one behind a corner: obstacle returns are
-# clustered (dynamic_clusters.cluster_points), tracked across scans, and the tracks whose
+# clustered (dynamic_clusters.cluster_points), tracked across scans by a constant-velocity
+# Kalman filter (so a track missed for a scan is predicted through, not frozen), and those
 # estimated speed clears DYN_V_MIN get r_keep(t_k) = D_SAFE_HARD + r_cluster +
 # V_TARGET·(t_k + age). Same V_TARGET, same W_HARD, same one-sided quadratic
 # (occlusion_stage_cost) — one avoidance mechanism, two sources of hazard.
@@ -205,8 +212,19 @@ DYN_CELL       = CFG["dynamic_clusters"]["cell"]
 DYN_MIN_POINTS = CFG["dynamic_clusters"]["min_points"]
 DYN_MAX_RADIUS = CFG["dynamic_clusters"]["max_radius"]
 DYN_ASSOC      = CFG["dynamic_clusters"]["assoc_radius"]
-DYN_ALPHA      = CFG["dynamic_clusters"]["alpha"]
-DYN_VEL_BETA   = CFG["dynamic_clusters"]["vel_beta"]
+DYN_Q_ACCEL    = CFG["dynamic_clusters"]["q_accel"]
+DYN_R_FRAC     = CFG["dynamic_clusters"]["r_frac"]
+DYN_R_MIN      = CFG["dynamic_clusters"]["r_min"]
+DYN_SIGMA_V0   = CFG["dynamic_clusters"]["sigma_v0"]
+DYN_EXT_ALPHA  = CFG["dynamic_clusters"]["extent_alpha"]
+FS_ENABLED     = CFG["dynamic_clusters"]["fs_enabled"]
+FS_PROBE_AGE   = CFG["dynamic_clusters"]["fs_probe_age"]
+FS_HOLD        = CFG["dynamic_clusters"]["fs_hold"]
+FS_TRUST       = CFG["dynamic_clusters"]["fs_trust"]
+FS_SLACK       = CFG["dynamic_clusters"]["fs_slack"]
+FS_MIN_THROUGH = CFG["dynamic_clusters"]["fs_min_through"]
+FS_CORE_FRAC   = CFG["dynamic_clusters"]["fs_core_frac"]
+FS_ELEV_BAND   = CFG["dynamic_clusters"]["fs_elev_halfband"]
 DYN_TTL        = CFG["dynamic_clusters"]["ttl"]
 DYN_MIN_HITS   = CFG["dynamic_clusters"]["min_hits"]
 DYN_V_MIN      = CFG["dynamic_clusters"]["v_min"]
@@ -229,6 +247,11 @@ DYN_NOW        = None    # (K,4) [c0, c1, r_cluster, age] confirmed movers for T
 DYN_USED       = None    # (K,4) the movers the LAST solve actually constrained against,
                          # post-gating. Recorded for the trajectory plot.
 DYN_DBG        = None    # (n_clusters, n_tracks, n_dynamic, max_speed) from the last step
+DYN_LAST_STAMP = None    # ObstacleCircles.stamp of the scan last FUSED into the tracker.
+                         #   Gates the Kalman correction to once per scan; see the control loop.
+DYN_CL_N       = 0       # cluster count from that scan, carried across predict-only steps
+FS_CHECKER     = None    # free_space.FreeSpaceChecker, created in run()
+FS_DBG         = (0, 0, 0)   # (n_moved, n_occupied, n_inconclusive) from the last scan
 DYN_PUB        = None    # DynamicClusterPublisher — feeds DynamicAgentVisualizer.cs so the
                          # Unity Scene view shows the SAME expanding circles the cost used
 VISIBILITY_COST = False   # vestigial: --visibility-cost is a documented no-op
@@ -494,8 +517,14 @@ def mppi(s0, mean, goal_xy, u_prev=None):
                 # Base radius at t_k = 0: ego margin + the cluster's own extent + the
                 # travel the agent could already have made since the centroid was measured.
                 d_base = D_SAFE_HARD + r_c
+                # w_sight ON here (unlike the occlusion call above): a visible mover is the
+                # case where SLOWING is the feasible response and swerving is not. An aircraft
+                # cannot sidestep a taxiing aircraft the way the positional keep-out alone
+                # implies, so the RSS speed cap gives the rollout a way to pay down the cost
+                # that does not involve steering. Tune with occlusion.w_sight.
                 cost += occlusion_stage_cost(
-                    d_dyn, vv, t_dyn, V_TARGET, d_base, W_HARD)
+                    d_dyn, vv, t_dyn, V_TARGET, d_base, W_HARD,
+                    w_sight=W_SIGHT, a_brake=A_BRAKE_SIGHT, v_floor=V_SIGHT_FLOOR)
 
 
     # Terminal goal cost ℓgoal,H-1 = -C_GOAL_TERM * max(0, d0 - d_{H-1}): a heavier copy of the
@@ -503,8 +532,32 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     # wins even if it detoured en route (lets the planner go around obstacles instead of stopping
     # short). st is the final rollout state here.
     # MPC-reference terminal cost: bounded (linear) pull on the FINAL state.
+    print("MIN_cost_trajectory: ", cost.min())
+    #print("MAX_cost_trajectory: ", cost.max())
+
     cost += tcost.terminal_cost(st[:, 0], st[:, 1],
                                 goal_xy=(goal_fwd, goal_lat), w_goal_term=W_GOAL_TERM)
+
+    # ── Infeasibility: too few acceptable rollouts left → reject the batch, brake ──
+    # W_HARD (1e6) dwarfs the goal/heading/terminal terms (O(1e2)), so a cost above
+    # C_INFEAS = W_HARD * INFEAS_DEPTH^2 means that rollout is at least INFEAS_DEPTH inside
+    # a keep-out. Softmaxing a batch where they ALL are would return the "least bad"
+    # collision path.
+    #
+    # Two reasons this is not the strict `cost.min() > W_HARD` test, both of which made the
+    # brake come on too late to stop in time:
+    #   depth  — W_HARD as the threshold IS depth = 1 m, i.e. the best rollout is already a
+    #            metre inside before anything happens. INFEAS_DEPTH makes that explicit.
+    #   frac   — requiring EVERY rollout to fail means waiting for the single luckiest of
+    #            K_MPPI samples to fail too. That last survivor is a noise artefact, not a
+    #            plan the ego can track, and it is gone by the next solve.
+    n_feasible = int((cost <= C_INFEAS).sum())
+    if n_feasible <= INFEAS_FRAC * K_MPPI:
+        print(f"[MPPI] INFEASIBLE: {n_feasible}/{K_MPPI} rollouts under {C_INFEAS:.2e} "
+              f"(depth {INFEAS_DEPTH:.2f} m), min cost {cost.min():.3e} — braking")
+        u_stop = np.array([A_MIN, 0.0])                 # max decel, hold wheel straight
+        OCC_PLAN = None                                 # no plan to draw; don't leave a stale one
+        return u_stop, np.zeros((H_MPPI, 2))
 
     # Leave -cost.min() to avoid underflow, softmax to compute the weights
     w   = np.exp(-(cost - cost.min()) / LAMBDA)
@@ -514,11 +567,6 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     u_nom    = opt[0].copy()
     new_mean = np.vstack([opt[1:], opt[-1]])
 
-    # Replay the OPTIMAL sequence deterministically to get the PLANNED future path.
-    # `opt` is the MPPI-weighted mean over samples — the sequence the ego actually
-    # follows — not the single argmin-cost sample, which is one noisy draw and is not
-    # what gets executed. Recorded so the plot can show one solve: the future
-    # trajectory, and how large the keep-out is at each of its stages.
     _st = np.tile(np.asarray(s0, float)[None, :], (1, 1))
     _plan = np.empty((H_MPPI, 2))
     for _k in range(H_MPPI):
@@ -831,7 +879,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW
-    global DYNAMIC_AVOID, DYN_TRACKER, DYN_NOW, DYN_DBG, DYN_PUB
+    global DYNAMIC_AVOID, DYN_TRACKER, DYN_NOW, DYN_DBG, DYN_PUB, DYN_LAST_STAMP, DYN_CL_N
+    global FS_CHECKER, FS_DBG
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     N_SCEN          = n_scenarios
@@ -880,11 +929,28 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                     ttl=OCC_TRACK_TTL, min_hits=OCC_TRACK_HITS)
             if DYNAMIC_AVOID:
                 DYN_TRACKER = DynamicClusterTracker(
-                    assoc_radius=DYN_ASSOC, alpha=DYN_ALPHA, vel_beta=DYN_VEL_BETA,
+                    assoc_radius=DYN_ASSOC, q_accel=DYN_Q_ACCEL, r_frac=DYN_R_FRAC,
+                    r_min=DYN_R_MIN, sigma_v0=DYN_SIGMA_V0, extent_alpha=DYN_EXT_ALPHA,
                     ttl=DYN_TTL, min_hits=DYN_MIN_HITS, v_min=DYN_V_MIN,
                     min_dyn_hits=DYN_MIN_DYN_HITS, require_motion=DYN_REQUIRE_MOTION,
                     dyn_window=DYN_WINDOW, extent_frac=DYN_EXTENT_FRAC,
-                    resegment_ratio=DYN_RESEG_RATIO)
+                    resegment_ratio=DYN_RESEG_RATIO,
+                    fs_probe_age=FS_PROBE_AGE, fs_hold=FS_HOLD, fs_trust=FS_TRUST)
+                if FS_ENABLED:
+                    # Free-space detection reads the ORDERED cloud, which only exists once
+                    # configure_scan() has been called — that happens on the occlusion path
+                    # above, so without --occlusion-aware there is no range image to query
+                    # and the detector must stay off rather than silently pass everything.
+                    if OCCLUSION_AWARE:
+                        from free_space import FreeSpaceChecker
+                        FS_CHECKER = FreeSpaceChecker(
+                            max_range=SCAN_MAX_RANGE, slack=FS_SLACK,
+                            min_through=FS_MIN_THROUGH, core_frac=FS_CORE_FRAC,
+                            elev_halfband=FS_ELEV_BAND)
+                    else:
+                        print("[Controller] free-space detection: needs --occlusion-aware "
+                              "(it reads the same ordered cloud) — DISABLED, falling back "
+                              "to the centroid displacement test")
                 if dynamic_viz:
                     DYN_PUB = DynamicClusterPublisher()
                     if not DYN_PUB.start():
@@ -1045,18 +1111,39 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
             else:
                 OCC_SEGS_NOW = None
 
-            # Cluster + track the moving obstacles ONCE per control step, same discipline
-            # as the occlusion tracker above: advance the filter here, hand the confirmed
-            # movers to mppi() through DYN_NOW. clusters() is memoised on the scan stamp,
-            # so re-calling it at control rate against a ~1 Hz cloud is free.
+            # Cluster + track the moving obstacles, then hand the confirmed movers to
+            # mppi() through DYN_NOW.
+            #
+            # THE FILTER'S TWO HALVES RUN AT DIFFERENT RATES, and that split is load-
+            # bearing. Prediction is pure model propagation, so it runs every control step
+            # (~20 Hz) and keeps the keep-out centres moving smoothly between scans.
+            # CORRECTION runs only when the scan stamp CHANGES (~1 Hz): clusters() is
+            # memoised on that stamp, so fusing it per step would feed the Kalman filter
+            # the same centroid ~20 times as if they were independent looks — collapsing P
+            # and dragging the velocity toward zero. See DynamicClusterTracker.update().
             if DYNAMIC_AVOID and DYN_TRACKER is not None and LIDAR_COSTMAP.ready:
                 _now = time.monotonic()
-                _cl = LIDAR_COSTMAP.clusters(cell=DYN_CELL, min_points=DYN_MIN_POINTS,
-                                             max_radius=DYN_MAX_RADIUS)
-                DYN_TRACKER.update(_cl, _now)
+                _stamp = LIDAR_COSTMAP.stamp
+                if _stamp != DYN_LAST_STAMP:
+                    DYN_LAST_STAMP = _stamp
+                    _cl = LIDAR_COSTMAP.clusters(cell=DYN_CELL, min_points=DYN_MIN_POINTS,
+                                                 max_radius=DYN_MAX_RADIUS)
+                    # Load THIS scan's range image before fusing it, so the free-space
+                    # test runs against the same scan the clusters came from.
+                    if FS_CHECKER is not None:
+                        _oxyz, _opose = LIDAR_COSTMAP.ordered_cloud()
+                        FS_CHECKER.set_scan(_oxyz, _opose if _opose is not None else (0., 0.))
+                    DYN_TRACKER.update(_cl, _now, checker=FS_CHECKER)
+                    DYN_CL_N = 0 if _cl is None else len(_cl)
+                    FS_DBG = DYN_TRACKER.fs_counts()
+                else:
+                    DYN_TRACKER.predict_to(_now)
                 DYN_NOW = DYN_TRACKER.dynamic(_now)
                 _sp = DYN_TRACKER.speeds()
-                DYN_DBG = (0 if _cl is None else len(_cl), DYN_TRACKER.n_tracks,
+                # cl is the count from the LAST FRESH SCAN, not from this step — on a
+                # predict-only step there is no new cluster set to count, and printing 0
+                # there would read as "clustering found nothing".
+                DYN_DBG = (DYN_CL_N, DYN_TRACKER.n_tracks,
                            0 if DYN_NOW is None else len(DYN_NOW),
                            max(_sp) if _sp else 0.0)
                 # Where the dynamic pipeline is losing agents — every stage fails SILENTLY,
@@ -1073,7 +1160,32 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 if ep_steps % 10 == 1:
                     print(f"[DEBUG dyn] cl={DYN_DBG[0]} trk={DYN_DBG[1]} dyn={DYN_DBG[2]} "
                           f"used={0 if DYN_USED is None else len(DYN_USED)} "
-                          f"v_max={DYN_DBG[3]:.1f}m/s (v_min={DYN_V_MIN:.1f})")
+                          f"v_max={DYN_DBG[3]:.1f}m/s (v_min={DYN_V_MIN:.1f})"
+                          + ("" if FS_CHECKER is None else
+                             f" | freespace moved={FS_DBG[0]} occupied={FS_DBG[1]} "
+                             f"inconclusive={FS_DBG[2]}"))
+                    # WHERE the movers are, not just how many. Aggregate counts cannot
+                    # distinguish "tracking the wrong thing" from "tracking nothing", and
+                    # that is the question whenever a keep-out appears somewhere empty.
+                    # Read r and vdir together: a scenery fragment has a velocity whose
+                    # direction is unstable scan to scan and roughly tracks the EGO's own
+                    # speed, while a genuine mover holds a consistent heading.
+                    if DYN_NOW is not None and len(DYN_NOW):
+                        _vv = DYN_TRACKER.velocities()
+                        _sg = DYN_TRACKER.vel_sigma()
+                        _fs = DYN_TRACKER.fs_labels()
+                        _order = np.argsort(np.hypot(DYN_NOW[:, 0] - s[0],
+                                                     DYN_NOW[:, 1] - s[1]))
+                        for _rank, _i in enumerate(_order[:5]):
+                            _c0, _c1, _r, _age = DYN_NOW[_i]
+                            _d = float(np.hypot(_c0 - s[0], _c1 - s[1]))
+                            _mark = "<-USED" if _rank < (0 if DYN_USED is None
+                                                         else len(DYN_USED)) else ""
+                            print(f"           #{_rank} @({_c0:7.1f},{_c1:7.1f}) "
+                                  f"r={_r:5.1f} d_ego={_d:6.1f} "
+                                  f"v=({_vv[_i][0]:5.1f},{_vv[_i][1]:5.1f}) "
+                                  f"|v|={np.hypot(*_vv[_i]):4.1f}+-{_sg[_i]:4.1f} "
+                                  f"age={_age:4.1f} fs={_fs[_i]:>4} {_mark}")
             else:
                 DYN_NOW = None
             # Accumulate the per-scan obstacle-circle centres into the episode-wide

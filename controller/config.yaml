@@ -125,7 +125,7 @@ dynamic_obstacles:
 # returning Restoration_Failed, drop this to 1e4 — still overwhelmingly dominant.
 keepout:
   d_safe_hard: 10.0         # [m] ~1 aircraft width
-  w_hard: 100            # "infinite" hard-constraint weight. See the CAVEAT above: the
+  w_hard: 1.0e+6            # "infinite" hard-constraint weight. See the CAVEAT above: the
                             #   residual violation is |grad(other terms)| / (2*w_hard), so this
                             #   is the knob that decides whether the keep-out EXISTS, not how
                             #   wide the ego swerves. At 50 the residual was ~10 m — i.e. the
@@ -133,6 +133,23 @@ keepout:
                             #   obstacle. Use r_act/r_dact to tighten swerves, never this.
                             #   1e5 (not 1e9) because MPPI weights rollouts by exp(-cost/lambda)
                             #   and a 1e9-scale spread collapses the effective sample size to 1.
+  # ── Reject-all-and-stop trigger (MPPI only) ────────────────────────────────
+  # When the sampled batch has no acceptable rollout left, the MPPI softmax would
+  # return the "least bad" COLLIDING path. Instead the batch is rejected and the ego
+  # emergency-brakes at limits.a_min. These two knobs set WHEN that fires — i.e. how
+  # early the brake comes on.
+  infeasible_depth: 0.10    # [m] keep-out intrusion a rollout may carry and still count as
+                            #   feasible. The cost test is  cost > w_hard * depth^2, so this
+                            #   is the physical meaning of the threshold. Testing against
+                            #   w_hard itself is depth = 1.0 m: the cheapest rollout is already
+                            #   a metre inside the keep-out, which at v_des = 8 m/s is far
+                            #   later than the ~12 m the ego needs to stop (a_min = -4 plus
+                            #   the accel_tau = 0.5 s lag). SMALLER = brakes EARLIER.
+  infeasible_frac: 0.08     # brake once fewer than this FRACTION of the K rollouts are
+                            #   feasible, not only when every last one has failed. Waiting for
+                            #   the strict min means waiting until the single luckiest sample
+                            #   out of 1500 also fails — by then the escape corridor is one
+                            #   noise draw wide and is gone next solve. 0.0 = strict min.
 
 # ── Occlusion-aware safety (Firoozi et al., forward reachable sets) ─ SHARED ──
 # Each detected occlusion boundary (a LiDAR range-jump blind corner) seeds an
@@ -144,7 +161,7 @@ keepout:
 # Keep v_target REALISTIC — too high and the bubble swallows the horizon and the
 # ego freezes.
 occlusion:
-  v_target: 5.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
+  v_target: 6.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
   horizon: 3.0              # [s] cap on the expansion time. Sizes the Algorithm-1 single circle
                             #   and the plotted capsules; NOT applied inside
                             #   occlusion_capsules.occlusion_stage_cost.
@@ -182,17 +199,91 @@ dynamic_clusters:
                             #   returns within ~cell*sqrt(2) are one object. Matches the
                             #   obstacle-circle voxel, so cluster and circle resolution agree.
   min_points: 4             # drop components thinner than this (stray single returns)
-  max_radius: 100.0          # [m] REJECT components wider than this — that is a hangar or an
+  max_radius: 30.0          # [m] REJECT components wider than this — that is a hangar or an
                             #   apron edge, not a vehicle. This is the static/scenery filter
                             #   that keeps the association problem small; a value below the
                             #   largest aircraft you simulate silently blinds the tracker to it.
-  assoc_radius: 8.0         # [m] association gate. MUST exceed v_target * scan_period
+                            #   SET TOO HIGH AND THE EXTENT TEST STOPS PROTECTING YOU, which is
+                            #   not obvious: a long wall does not come back as one stable
+                            #   cluster, it RE-SEGMENTS into a different set of fragments every
+                            #   scan as the visible span changes. Each fragment is small, so its
+                            #   extent_frac*r threshold is small, while its centroid slides
+                            #   metres along the wall — and resegment_ratio cannot catch it,
+                            #   because that guard compares a track against ITS OWN history and
+                            #   these fragments are born new each scan. Measured at 100.0: the
+                            #   ego reaching a terminal face took cl 3 -> 21, trk -> 35 and
+                            #   dyn -> 19, i.e. keep-out circles all over static scenery, with
+                            #   the reported speeds tracking the EGO's own speed.
+                            #   REMEMBER IT IS A RADIUS, NOT A LENGTH: 25.0 admits a 50 m
+                            #   object and was still passing wall fragments. A taxiing
+                            #   aircraft clusters at r ~ 5-10 m, so 10.0 is the tightest
+                            #   value that still admits one. If a REAL mover stops being
+                            #   detected (dyn=0 while something is plainly driving), this
+                            #   is the first thing to raise — check the [DEBUG dyn] rows
+                            #   for its r before changing anything else.
+  assoc_radius: 10.0        # [m] association gate. MUST exceed v_target * scan_period
                             #   (~5 m at 1 Hz), or a moving cluster is re-created as a new
                             #   track every scan and never reaches min_hits.
-  alpha: 0.6                # EMA weight on each new POSITION measurement. Higher than the
-                            #   occlusion tracker's 0.35 on purpose: lag on a moving target
-                            #   puts the keep-out behind where the agent actually is.
-  vel_beta: 0.5             # EMA weight on each new VELOCITY measurement
+  # Constant-velocity Kalman filter, state [p0, p1, v0, v1], measured by the centroid.
+  # The centroid's error is face-drift, not zero-mean noise, so read these as a tuned
+  # GAIN SCHEDULE rather than as true uncertainties — q_accel/r_frac is what sets the
+  # position/velocity response, and their absolute values only matter to the gate.
+  q_accel: 2.0              # [m/s^2] process-noise accel, 1-sigma. How hard the filter
+                            #   believes an agent can manoeuvre between scans. Too low: the
+                            #   keep-out lags a turning/accelerating vehicle and the gate
+                            #   gets tight enough to drop it. Too high: the filter chases
+                            #   the visible-face drift of parked bodies as if it were motion.
+  r_frac: 0.5               # measurement sigma as a FRACTION of the cluster radius. This is
+                            #   the whole reason a KF helps here: the centroid of a big blob
+                            #   can wander proportionally further, so it earns a smaller
+                            #   gain, where the old EMA gave every cluster alpha = 0.6.
+  r_min: 0.5                # [m] floor on that sigma. Without it a tiny cluster gets R -> 0,
+                            #   K -> 1, and the filter degenerates to raw measurements.
+  sigma_v0: 5.0             # [m/s] initial velocity sigma on a new track. Near the top speed
+                            #   you expect: it is what lets the first genuine motion move the
+                            #   estimate instead of being damped toward the zero it was born
+                            #   with. Too small and every track takes several scans to admit
+                            #   it is moving, which is added promotion latency.
+  extent_alpha: 0.5         # EMA on the cluster RADIUS (not part of the KF state — it is a
+                            #   shape statistic with no dynamics to propagate).
+
+  # ── Free-space ("seen through") detection — THE PRIMARY MOTION TEST ──────────
+  # Projects a track's PAST position into the current scan's beam grid and asks whether
+  # the beams now reach past it. A body that vacated a space is detected in ONE scan; a
+  # static body never vacates, so it can never trigger this however much its visible-face
+  # centroid drifts. See free_space.py. The centroid/displacement settings above are now
+  # only consulted where this test is INCONCLUSIVE (occluded, outside FOV, track too new).
+  # (flattened with an fs_ prefix — the config schema is one level deep)
+  fs_enabled: true           # false ⇒ fall back to the centroid displacement test alone,
+                            #   i.e. the old behaviour. Useful to A/B the two detectors.
+  fs_probe_age: 2.5          # [s] the OLDEST trail position inside this window is the one
+                            #   probed — the further back it is, the further the body has
+                            #   moved off it and the cleaner the verdict. This sets the SLOW
+                            #   end of detection (~r_cluster / probe_age, so ~2 m/s for a
+                            #   5 m body). Raising it costs NO false positives, unlike
+                            #   lowering extent_frac, because a static body never vacates.
+                            #   It does cost memory of a manoeuvre: a body that moved and
+                            #   came back within the window reads as still there.
+  fs_hold: 3.0               # [s] a MOVED verdict keeps the track dynamic this long without
+                            #   fresh confirmation — covers the object being briefly
+                            #   occluded mid-manoeuvre. MUST exceed the ~1 s scan period.
+  fs_trust: 3.0              # [s] a CONCLUSIVE verdict overrides the centroid test for this
+                            #   long. This is what lets an OCCUPIED reading actively VETO a
+                            #   bogus centroid displacement, which is the mechanism that
+                            #   kills the re-segmenting-wall false positives. Drop it to 0
+                            #   and the two tests OR together, and the false positives come
+                            #   straight back.
+  fs_slack: 2.0              # [m] range tolerance on "the beam terminated at the body". Must
+                            #   cover voxel/cluster quantisation (cell=2.0), or a body's own
+                            #   far face reads as through and everything looks like it moved.
+  fs_min_through: 3          # beams that must see past before MOVED is declared, so a single
+                            #   stray long return is not a verdict.
+  fs_core_frac: 0.6          # sample this fraction of the body's radius — its CORE, not its
+                            #   silhouette edge. Edge beams graze and their range is unstable,
+                            #   so they manufacture "through" votes on static bodies.
+  fs_elev_halfband: 3        # beam rows either side of horizontal to test. Safe to widen
+                            #   because OCCUPIED vetoes: a row angled over a low vehicle's
+                            #   roof reads through, but any row still hitting the body wins.
   ttl: 3.0                  # [s] drop a track unseen this long. Like the occlusion tracker's,
                             #   MUST exceed the ~1 s scan period with margin.
   min_hits: 2               # confirmations before a track is usable at all
@@ -249,8 +340,10 @@ dynamic_clusters:
                             #   (mppi.horizon * vehicle.dt = 6 s) the radius reaches
                             #   d_safe_hard + extent + 30 m and one taxiing aircraft pushes
                             #   the ego ~30 m off course. 0 => uncapped.
-  query_r: 6000             # [m] only clusters within this of the ego are constrained (== the
-                            #   occlusion gate)
+  query_r: 60               # [m] only clusters within this of the ego are constrained (== the
+                            #   occlusion gate). NOT effectively-infinite: every cluster on the
+                            #   map otherwise competes for the k_dyn slots, so the five nearest
+                            #   the ego can be crowded out by distant ones.
   k_dyn: 5                  # nearest dynamic clusters evaluated per step (0 => off)
   include_age: true         # inflate the keep-out by v_target * (age of the measurement).
                             #   At ~1 Hz publishing a centroid is up to a second stale, which

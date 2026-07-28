@@ -495,15 +495,17 @@ class OcclusionCornerTracker:
 # constraint rather than a trade-off. There is no separate soft influence ring and no
 # goal fade — one radius, one weight, shared with the static-surface keep-out.
 
-def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=None, clip=None):
+def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=None, clip=None,
+                         w_sight=None, a_brake=None, v_floor=None):
     """Occlusion stage cost. Backend-agnostic: pass numpy or CasADi primitives.
 
     d        : distance from the (rollout/predicted) pose to the nearest occlusion boundary
-    v        : speed at this stage (unused until the sightline term lands — see TODO)
+    v        : speed at this stage [m/s] — used only by the RSS sightline term below
     t_k      : horizon time of this stage [s]
     v_target : assumed max speed of the hidden agent [m/s]
     d_safe   : base (t=0) keep-out radius [m]
     w_obs    : hard-constraint weight
+    w_sight  : RSS sightline weight, or None to skip that term (a_brake/v_floor then unused)
     Returns the scalar/array stage cost contribution.
     """
     import numpy as _np
@@ -515,6 +517,4 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
 
     cost = w_obs * fmax(0.0, r_keep - d) ** 2
 
-    # TODO add v_safe (RSS sightline) cost
-    # v_safe = fmax(sqrt(2.0 * a_brake_sight * d + 1e-6), v_sight_floor)
     return cost

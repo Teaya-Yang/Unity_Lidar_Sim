@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -242,6 +242,25 @@ class ObstacleCircles:
         return np.column_stack([c0, c1, r])
 
     # ── Planner-side lookups ──────────────────────────────────────────────────
+
+    def ordered_cloud(self) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]]]:
+        """((n_h, n_v, 3) sensor-frame ordered cloud with NaN preserved, sensor world
+        (a0, a1)) — the raw range image, for free_space.FreeSpaceChecker.
+
+        Returns (None, None) unless configure_scan() was called and a cloud has arrived.
+        Non-returns MUST stay NaN here: to the free-space test they are the strongest
+        evidence there is (the beam was cast and nothing stopped it), so dropping them
+        the way the clustering path does would throw away most of its sensitivity."""
+        with self._lock:
+            return self._pts_ordered, self._pose
+
+    @property
+    def stamp(self) -> float:
+        """time.monotonic() at which the CURRENT cloud arrived. The identity of the scan:
+        consumers that must act once per SCAN rather than once per control step (the
+        Kalman tracker's correction — fusing one measurement 20 times is not the same as
+        fusing it once) compare this against the last value they processed."""
+        return self._stamp
 
     def circles(self) -> Optional[np.ndarray]:
         """(M,3) ABSOLUTE world [a0, a1, radius] covering circles, or None. The MPC

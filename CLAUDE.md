@@ -59,3 +59,4 @@ Two coordinate caveats live here:
 - The ego vehicle in the sample scene is "Airplane"; the sensor origin is the "laser_link" GameObject assigned to `PointCloudPublisher.laser_sensor_link`.
 - Every `.cs` has a paired `.cs.meta` — let Unity manage these; don't hand-edit or delete meta files.
 - `unity_ros_lidar/Library/` and `unity_ros_lidar/Logs/` are Unity-generated and gitignored — never commit them.
+- Dont write too many comments just the essential documentation for the code

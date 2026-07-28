@@ -49,7 +49,8 @@ SCHEMA: Dict[str, Dict[str, str]] = {
         "unc_growth": "float", "unc_growth_max": "float",
         "headon_giveway": "float", "w_half": "float",
     },
-    "keepout": {"d_safe_hard": "float", "w_hard": "float"},
+    "keepout": {"d_safe_hard": "float", "w_hard": "float",
+                "infeasible_depth": "float", "infeasible_frac": "float"},
     "occlusion": {
         "v_target": "float", "horizon": "float", "k_occ": "int", "query_r": "float",
         "fwd_half_angle": "float", "use_capsules": "bool", "single_circle": "bool",
@@ -60,10 +61,14 @@ SCHEMA: Dict[str, Dict[str, str]] = {
     },
     "dynamic_clusters": {
         "cell": "float", "min_points": "int", "max_radius": "float",
-        "assoc_radius": "float", "alpha": "float", "vel_beta": "float",
+        "assoc_radius": "float", "q_accel": "float", "r_frac": "float",
+        "r_min": "float", "sigma_v0": "float", "extent_alpha": "float",
         "ttl": "float", "min_hits": "int", "v_min": "float", "min_dyn_hits": "int",
         "dyn_window": "float", "extent_frac": "float", "resegment_ratio": "float",
         "require_motion": "bool", "grow_horizon": "float",
+        "fs_enabled": "bool", "fs_probe_age": "float", "fs_hold": "float",
+        "fs_trust": "float", "fs_slack": "float", "fs_min_through": "int",
+        "fs_core_frac": "float", "fs_elev_halfband": "int",
         "query_r": "float", "k_dyn": "int",
         "include_age": "bool",
     },
@@ -180,10 +185,19 @@ def _check_consistency(cfg, path):
         bad("occlusion.v_target must be positive")
     if not 0.0 < cfg["occlusion_tracker"]["alpha"] <= 1.0:
         bad("occlusion_tracker.alpha must be in (0, 1]")
-    if not 0.0 < cfg["dynamic_clusters"]["alpha"] <= 1.0:
-        bad("dynamic_clusters.alpha must be in (0, 1]")
-    if not 0.0 < cfg["dynamic_clusters"]["vel_beta"] <= 1.0:
-        bad("dynamic_clusters.vel_beta must be in (0, 1]")
+    if not 0.0 < cfg["dynamic_clusters"]["extent_alpha"] <= 1.0:
+        bad("dynamic_clusters.extent_alpha must be in (0, 1]")
+    # The Kalman filter degenerates rather than errors when these are zero: q_accel = 0
+    # freezes the velocity at its initial value, r_frac = r_min = 0 makes R singular and
+    # the gain unbounded, sigma_v0 = 0 means a track can never admit that it is moving.
+    if cfg["dynamic_clusters"]["q_accel"] <= 0.0:
+        bad("dynamic_clusters.q_accel must be positive")
+    if cfg["dynamic_clusters"]["r_min"] <= 0.0:
+        bad("dynamic_clusters.r_min must be positive (it is the floor that keeps R non-singular)")
+    if cfg["dynamic_clusters"]["r_frac"] < 0.0:
+        bad("dynamic_clusters.r_frac must be >= 0")
+    if cfg["dynamic_clusters"]["sigma_v0"] <= 0.0:
+        bad("dynamic_clusters.sigma_v0 must be positive")
     if cfg["dynamic_clusters"]["cell"] <= 0.0:
         bad("dynamic_clusters.cell must be positive")
     if cfg["dynamic_clusters"]["dyn_window"] <= 0.0:
