@@ -9,6 +9,7 @@
     "com.unity.ml-agents": "https://github.com/Unity-Technologies/ml-agents.git?path=/com.unity.ml-agents",
     "com.unity.multiplayer.center": "1.0.1",
     "com.unity.nuget.newtonsoft-json": "3.2.1",
+    "com.unity.recorder": "5.1.6",
     "com.unity.render-pipelines.high-definition": "17.3.0",
     "com.unity.robotics.ros-tcp-connector": "https://github.com/Unity-Technologies/ROS-TCP-Connector.git?path=/com.unity.robotics.ros-tcp-connector",
     "com.unity.robotics.urdf-importer": "https://github.com/Unity-Technologies/URDF-Importer.git?path=/com.unity.robotics.urdf-importer",

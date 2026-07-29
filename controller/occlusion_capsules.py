@@ -1,33 +1,3 @@
-"""
-Occlusion boundary SEGMENTS from LiDAR range jumps, and the forward-reachable-set
-capsules they seed (Firoozi et al.).
-
-The pipeline the paper describes, and what lives where:
-
-  1. DETECTION (here, `segments_from_ordered_cloud`) — at the current timestep, find
-     occlusion boundaries by looking for large jumps between consecutive LiDAR range
-     values. Where one ray grazes an obstacle corner and the adjacent ray shoots far
-     past it, the segment joining those two endpoints is a boundary line.
-
-  2. EXPANSION (here, `capsule_radius`; consumed by the MPC) — a hidden agent is
-     assumed to lurk anywhere ON that boundary line and move outward at up to
-     v_target. Its forward reachable set at horizon time t is the boundary segment
-     dilated by v_target*t: a CAPSULE (rectangle + two end circles), which is exactly
-     the set of points within that radius of the segment.
-
-  3. MPC (taxi_controller_mpc.py) — the growing capsules become stage constraints, so
-     the ego keeps d_safe from each expanding danger zone at the matching timestep.
-
-NOTE ON THE GROWTH TERM. The paper writes d_target = v_target/Δt, which is
-dimensionally acceleration, not distance (m/s ÷ s = m/s²); at V_TARGET=3, DT=0.1 it
-would be 30 m per step and the capsules would swallow the map immediately. The
-intended quantity is distance = speed · time, so the radius used here (and already
-used by the circle formulation in both controllers) is v_target · t_k.
-
-Detection needs the ORDERED cloud — beam adjacency IS the method — so non-returns are
-kept as max-range rather than dropped the way ObstacleCircles._parse_cloud drops them.
-"""
-
 import math
 from typing import Optional, Tuple
 
@@ -523,10 +493,7 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
     fmax = _np.maximum if fmax is None else fmax
     sqrt = _np.sqrt if sqrt is None else sqrt
 
-    # t_k is a PYTHON float in both callers, so the cap is a plain min() and stays
-    # CasADi-safe (no symbolic branch).
-    t_grow = t_k if t_grow_max is None else min(t_k, t_grow_max)
-    r_grow = v_target * t_grow
+    r_grow = v_target * t_k
     r_keep = r_grow + d_safe
 
 
