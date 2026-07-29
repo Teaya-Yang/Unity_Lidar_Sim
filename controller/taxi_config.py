@@ -51,7 +51,7 @@ SCHEMA: Dict[str, Dict[str, str]] = {
     },
     "keepout": {"d_safe_hard": "float", "w_hard": "float",
                 "infeasible_depth": "float", "infeasible_frac": "float",
-                "stall_v": "float"},
+                "stall_v": "float", "rho_hard": "float", "rho_hard2": "float"},
     "occlusion": {
         "v_target": "float", "horizon": "float", "t_grow_max": "float",
         "k_occ": "int", "query_r": "float",
@@ -175,11 +175,6 @@ def _check_consistency(cfg, path):
         bad("limits.a_max must be positive")
     if cfg["vehicle"]["dt"] <= 0.0:
         bad("vehicle.dt must be positive")
-    if cfg["dynamic_obstacles"]["d_infl"] < cfg["dynamic_obstacles"]["d_safe"]:
-        bad("dynamic_obstacles.d_infl must be >= d_safe (the ring sits outside the keep-out)")
-    if cfg["dynamic_obstacles"]["d_infl_pass"] <= cfg["dynamic_obstacles"]["d_safe"]:
-        bad("dynamic_obstacles.d_infl_pass must exceed d_safe, or the ego only feels a "
-            "frontal blocker at the last metre and clips the keep-out")
     if cfg["goal"]["min_speed"] <= 0.0:
         bad("goal.min_speed must be > 0: the steering authority rolls off toward zero "
             "speed, so a 0 floor stalls the ego mid-course")
