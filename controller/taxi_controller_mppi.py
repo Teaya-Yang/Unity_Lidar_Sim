@@ -293,12 +293,7 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     OCC_RANGE_DBG = None
     OCC_SEGS_USED = None
     if OCCLUSION_AWARE and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-        # Range-jump boundary SEGMENTS, tracked across scans (same source as the MPC).
-        # The keep-out is the segment dilated by r_keep — a CAPSULE (a disc at each
-        # endpoint plus the rectangle between them), so the hidden agent is assumed to
-        # lurk anywhere along the sightline, not only at the corner. Selection and
-        # ordering still key on the CORNER (segs[:, 0]): that is the point the phantom
-        # is anchored to, and it is what the MPC's _pack_params filters on too.
+
         _seg = OCC_SEGS_NOW
         _seg = np.asarray(_seg, float).reshape(-1, 2, 2) if (
             _seg is not None and len(_seg)) else None
@@ -310,29 +305,18 @@ def mppi(s0, mean, goal_xy, u_prev=None):
                 _seg = _seg.copy()
                 _seg[:, 1, :] = _seg[:, 0, :]
             _op = _seg[:, 0, :]
-            # Same selection the MPC's _pack_params does: drop boundaries sitting within
-            # the fully-expanded keep-out of the GOAL (the goal is known-safe, so a phantom
-            # must not be assumed to hide on it), then take the K_OCC nearest in range.
             if goal_xy is not None:
                 _rgc = D_SAFE_HARD + V_TARGET * H_MPPI * DT
                 _gd = np.hypot(_op[:, 0] - goal_xy[0], _op[:, 1] - goal_xy[1])
                 _seg = _seg[_gd > _rgc]
-                # Which gate emptied the set — the goal drop or the range gate below.
-                # r_goal is D_SAFE_HARD + V_TARGET*H_MPPI*DT, so a long MPPI horizon makes
-                # this exclusion zone large enough to swallow every boundary near the goal.
+
                 OCC_GATE_DBG = (len(_op), int((_gd > _rgc).sum()), _rgc, float(_gd.min()))
             if len(_seg):
-                # Range-gate on true point-to-CAPSULE-axis distance, not on the corner:
-                # a long boundary whose corner sits beyond OCC_QUERY_R can still have its
-                # far end sweeping past the ego, and dropping it would silently un-see it.
                 _ego = np.array([[s0_fwd, s0_lat]])
                 _d = np.array([point_segment_distance_np(_ego, s[0], s[1])[0]
                                for s in _seg])
                 _in = _d < OCC_QUERY_R
-                # Where the surviving boundaries actually ARE relative to the ego. If the
-                # nearest is far beyond query_r while the ego is metres from a real corner,
-                # the fault is upstream in detection/framing, not in this gate.
-                # Index into the POST-goal-drop set, so use its own corners, not _op.
+
                 _j = int(np.argmin(_d))
                 _opf = _seg[:, 0, :]
                 OCC_RANGE_DBG = (float(_d.min()), float(_opf[_j, 0]), float(_opf[_j, 1]),
@@ -343,10 +327,6 @@ def mppi(s0, mean, goal_xy, u_prev=None):
                     OCC_USED_N = len(occ_segs)
                     OCC_SEGS_USED = occ_segs
 
-    # Sensed dynamic obstacles for this solve. Gated exactly like the occlusion set —
-    # nearest K within query_r — and then held FIXED over the horizon: the circle grows
-    # with t_k rather than the centre translating, because a two-scan centroid difference
-    # at ~1 Hz cannot support a trajectory prediction (see dynamic_clusters' docstring).
     dyn_set = None
     DYN_USED = None
     if DYNAMIC_AVOID and DYN_NOW is not None and len(DYN_NOW) and K_DYN > 0:

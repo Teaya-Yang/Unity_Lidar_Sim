@@ -1,25 +1,3 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Taxiing controller configuration — SINGLE SOURCE OF TRUTH for both planners.
-#
-# taxi_controller_mppi.py (sampling), taxi_controller_mpc.py (CasADi/IPOPT) and
-# taxi_cost.py (the shared stage cost) all read their tunables from this file via
-# taxi_config.py. Anything that is a NUMBER YOU MIGHT TUNE lives here; anything
-# derived (OBS_SIZE), contractual (the observation layout) or runtime state (the
-# LiDAR costmap handle, CLI flags) stays in code.
-#
-# Sections marked SHARED are read by both controllers — that is the point. Before
-# this file existed, scan geometry, occlusion-tracker gains, K_OCC and OCC_QUERY_R
-# were declared TWICE (once per controller) and had already drifted apart.
-#
-# Load an alternative tuning with  --config path/to/other.yaml  on either
-# controller. Values are validated on load: unknown keys and missing keys are
-# both errors, so a typo fails loudly at startup rather than silently keeping a
-# default.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ── Vehicle model — MUST match TaxiAgent.cs inspector fields ─────── SHARED ───
-# The MPC's smooth prediction model and the MPPI rollout both use these. They are
-# also what identify_bicycle_model() checks against when the sys-id probe runs.
 vehicle:
   dt: 0.1                   # [s] Unity Fixed Timestep (Project Settings -> Time)
   wheelbase: 6.0            # [m]
@@ -30,17 +8,12 @@ vehicle:
   steer_rolloff_spd: 15.0   # [m/s] speed at which steering authority starts rolling off
   steer_rolloff_min: 0.25   # minimum steering authority fraction at high speed
 
-# ── Control limits ───────────────────────────────────────────────── SHARED ───
+
 limits:
   a_min: -4.0               # [m/s^2]
   a_max: 1.5                # [m/s^2]
   delta_lim: 0.5            # [rad]
 
-# ── Goal approach ────────────────────────────────────────────────── SHARED ───
-# At v_des the aircraft's minimum turn radius can exceed the remaining distance
-# once it is close in, so it geometrically cannot curve tightly enough to hit the
-# 2 m arrival threshold — it sweeps past and loops back, which reads as circling.
-# Tapering the speed TARGET shrinks the turn radius enough for a precise approach.
 goal:
   slowdown_dist: 15.0       # [m] remaining distance at which the speed target starts tapering
   min_speed: 1.5            # [m/s] target floor away from the goal. NOT 0: the bicycle model's
@@ -50,21 +23,6 @@ goal:
                             #   halt ON the goal instead of overshooting the capture radius.
                             #   Continuous with the outer taper (factor = 1 beyond this).
 
-# ── Shared stage-cost weights — THE MPC IS THE REFERENCE ─────────── SHARED ───
-# taxi_cost.stage_cost re-expresses the MPC's NLP objective in NumPy so the MPPI
-# rollout evaluates the same function. Changing anything here changes BOTH.
-#
-# WHY THE GOAL PULL IS DELIBERATELY WEAK: a linear distance term has a BOUNDED
-# gradient, unlike ||p - p_goal||^2 whose gradient grows without limit far from the
-# goal and would dwarf the keep-out penalties. That is what lets the obstacle and
-# occlusion terms reliably win near a surface.
-#
-# NOTE FOR MPPI: rollouts are weighted by exp(-cost / lambda). With these
-# (intentionally small) weights, cost differences between rollouts can fall far
-# below lambda, leaving the softmax nearly uniform and the planner unable to
-# discriminate. Scale the WHOLE cost — equivalently, divide mppi.lambda — which
-# leaves the argmin and every relative trade-off untouched. Re-weighting
-# individual terms instead would change the optimum and break MPC parity.
 cost:
   w_goal_run: 0.05          # running goal pull (LINEAR distance -> bounded gradient)
   w_goal_term: 20.0          # terminal pull on the FINAL state (LINEAR)
@@ -78,16 +36,10 @@ cost:
                             # can never make standing still cheaper than driving, and never
                             # outrank the keep-out. Raise r_act[1]/r_dact[1] to tighten further.
 
-# ── Dynamic obstacles (other aircraft) ───────────────────────────── SHARED ───
-# These are NEGOTIATED with rather than simply avoided, so unlike the static and
-# occlusion keep-outs they retain the soft influence ring + exact-penalty shape:
-# on a head-on pass the ego cannot keep d_safe either way (the oncoming agent
-# comes to it), and a pure hard keep-out would make "stop and wait" the cheapest
-# option.
 dynamic_obstacles:
   k_obs: 3                  # obstacles in the observation vector (sets OBS_SIZE — see the
                             #   contract in taxi_controller_mppi.py's docstring)
-  d_safe: 0.0              # [m] keep-out radius
+  d_safe: 15.0              # [m] keep-out radius
   d_infl: 30.0              # [m] soft influence radius
   w_obs: 8.0                # soft influence ring weight
   rho_slack: 10.0           # linear exact-penalty weight on a keep-out violation. LINEAR is the
@@ -111,18 +63,6 @@ dynamic_obstacles:
                             #   eases off-centre EARLY and holds that side through the pass.
   w_half: 10.0              # [m] taxiway half-width
 
-# ── The ONE hard keep-out: static surfaces AND occlusion boundaries ─ SHARED ──
-# Both are hazards the ego must simply not enter, so they share a radius and a
-# weight. The only difference is that the occlusion radius EXPANDS along the
-# horizon by occlusion.v_target * t_k (the hidden agent's forward reachable set)
-# while the static one is fixed.
-#
-# CAVEAT — w_hard is a PENALTY, not a constraint. A quadratic penalty is inexact
-# at any finite weight: the residual violation is about |grad(other terms)| /
-# (2*w_hard), so ~5e-7 m here. Hard in practice, not in theory. Raising it further
-# buys nothing and costs IPOPT conditioning (this weight against w_goal_run = 0.05
-# is already ~7 orders of magnitude of spread in the Hessian). If IPOPT starts
-# returning Restoration_Failed, drop this to 1e4 — still overwhelmingly dominant.
 keepout:
   d_safe_hard: 15.0         # [m] ~1 aircraft width
   w_hard: 1.0e+6            # "infinite" hard-constraint weight. See the CAVEAT above: the
@@ -133,11 +73,9 @@ keepout:
                             #   obstacle. Use r_act/r_dact to tighten swerves, never this.
                             #   1e5 (not 1e9) because MPPI weights rollouts by exp(-cost/lambda)
                             #   and a 1e9-scale spread collapses the effective sample size to 1.
-  # ── Reject-all-and-stop trigger (MPPI only) ────────────────────────────────
-  # When the sampled batch has no acceptable rollout left, the MPPI softmax would
-  # return the "least bad" COLLIDING path. Instead the batch is rejected and the ego
-  # emergency-brakes at limits.a_min. These two knobs set WHEN that fires — i.e. how
-  # early the brake comes on.
+  rho_hard: 1.0e+3          # linear (exact) weight on the keep-out slack
+  rho_hard2: 5.0e+2         # quadratic companion, smooths the kink at slack = 0
+
   infeasible_depth: 1    # [m] keep-out intrusion a rollout may carry and still count as
                             #   feasible. The cost test is  cost > w_hard * depth^2, so this
                             #   is the physical meaning of the threshold. Testing against
@@ -159,15 +97,7 @@ keepout:
                             #   out of 1500 also fails — by then the escape corridor is one
                             #   noise draw wide and is gone next solve. 0.0 = strict min.
 
-# ── Occlusion-aware safety (Firoozi et al., forward reachable sets) ─ SHARED ──
-# Each detected occlusion boundary (a LiDAR range-jump blind corner) seeds an
-# EXPANDING keep-out: a worst-case hidden agent starts on the boundary and
-# advances at up to v_target, so the forbidden radius grows as v_target * t_k and
-# the ego gives blind corners a wider berth the further ahead it plans. The base
-# radius and weight come from the `keepout` section above.
-#
-# Keep v_target REALISTIC — too high and the bubble swallows the horizon and the
-# ego freezes.
+
 occlusion:
   v_target: 6.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
   t_grow_max: 6.0           # [s] CAP on the expansion time inside occlusion_stage_cost, so the
@@ -237,7 +167,7 @@ dynamic_clusters:
                             #   detected (dyn=0 while something is plainly driving), this
                             #   is the first thing to raise — check the [DEBUG dyn] rows
                             #   for its r before changing anything else.
-  assoc_radius: 20.0        # [m] association gate. MUST exceed v_target * scan_period
+  assoc_radius: 10.0        # [m] association gate. MUST exceed v_target * scan_period
                             #   (~5 m at 1 Hz), or a moving cluster is re-created as a new
                             #   track every scan and never reaches min_hits.
   # Constant-velocity Kalman filter, state [p0, p1, v0, v1], measured by the centroid.
@@ -365,13 +295,6 @@ dynamic_clusters:
                             #   At ~1 Hz publishing a centroid is up to a second stale, which
                             #   at v_target = 5 m/s is 5 m of unmodelled travel.
 
-# ── Occlusion corner tracking ────────────────────────────────────── SHARED ───
-# Corners are re-derived from scratch every scan, so the SAME physical corner
-# lands on a different beam each time and returns displaced by up to the beam
-# spacing (~r*dtheta, e.g. 0.5 m at 30 m with 1 deg resolution). Untracked, that
-# reads downstream as a stream of brand-new boundaries: the plot smears with
-# near-duplicates and the constraint centre jitters every step, which shows up as
-# steering chatter.
 occlusion_tracker:
   assoc_radius: 3.0         # [m] association gate — above beam-quantisation jitter, below
                             #   typical corner spacing
@@ -386,10 +309,6 @@ occlusion_tracker:
                             #   the Unity publish rate.
   min_hits: 2               # confirmations before a track is used (kills one-off flickers)
 
-# ── LiDAR scan geometry ──────────────────────────────────────────── SHARED ───
-# MUST match the Unity PointCloudPublisher Inspector fields. The flat PointCloud2
-# is reshaped back into its beam grid using exactly these numbers, so a mismatch
-# is detected and the scan ignored — the range-jump detector needs beam adjacency.
 scan:
   fov_h: 360.0              # [deg]
   fov_v: 45.0               # [deg]
@@ -397,9 +316,8 @@ scan:
   res_v: 1.0                # [deg]
   max_range: 1000.0         # [m]
 
-# ── MPPI (sampling planner) ──────────────────────────────────────────────────
 mppi:
-  horizon: 60               # planning steps (x vehicle.dt seconds)
+  horizon: 40               # planning steps (x vehicle.dt seconds)
   samples: 2000             # rollouts per control step
   lambda: 1.0               # temperature. See the scaling note under `cost`: this is the
                             #   correct knob for softmax discrimination.
@@ -437,7 +355,7 @@ mppi:
 mpc:
   horizon: 30               # planning steps. IPOPT solves a real NLP each step, so this trades
                             #   look-ahead against the per-step solve budget.
-  k_static: 12              # nearest static obstacle-circles constrained per step — coverage of
+  k_static: 4              # nearest static obstacle-circles constrained per step — coverage of
                             #   nearby walls vs solve time
   static_query_r: 35.0      # [m] only consider static circles within this radius of the ego
   # Dead-ahead symmetry breaking (warm-start only — constraints untouched, so the
