@@ -1901,7 +1901,7 @@ MonoBehaviour:
   debugRayStride: 8
   drawHitPoints: 0
   hitPointSize: 0.15
-  drawOcclusionEdges: 0
+  drawOcclusionEdges: 1
   grazingDeg: 10
   minJumpMeters: 2
   cornerMergeRadius: 1.5
