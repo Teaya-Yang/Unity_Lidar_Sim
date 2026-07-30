@@ -447,13 +447,22 @@ def identify_bicycle_model(env, behavior_name, n_steps=200):
 # ── Main control loop ─────────────────────────────────────────────────────────
 
 def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=None,
-                     occ_frames=None, capsule_horizon=None,
-                     max_frames=6, single_radius=False, show_expansion=False,
-                     show_occlusion=True):
- 
+                     occ_frames=None, capsule_horizon=None, max_frames=6,
+                     show_occlusion=True, static_boxes=None, **_ignored):
+    """CSV of the executed run + ONE figure: the executed trajectory and the predicted
+    rollout of a SINGLE solve with a handful of sampled horizon timestamps on it — each
+    timestamp drawn together with the expanding occlusion keep-out that applied at it.
+
+    The solve drawn is the one whose plan came closest to (or inside) its expanding
+    occlusion set; with no occlusion boundaries anywhere it falls back to the solve whose
+    plan bent hardest.
+    """
     import os
     os.makedirs(out_dir, exist_ok=True)
-    stem = os.path.join(out_dir, f"traj_{verdict}")
+    # One fixed name, verdict-independent: a collision run must OVERWRITE the previous
+    # figure, not add a second traj_collision.png next to a stale traj_reached.png. The
+    # verdict is still in the title and in the CSV's contents.
+    stem = os.path.join(out_dir, "traj")
 
     header = "t,x,y,theta,v,a_cmd,delta_cmd"
     np.savetxt(f"{stem}.csv", traj, delimiter=",", header=header, comments="")
@@ -466,146 +475,112 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
         print(f"[traj] saved {stem}.csv (matplotlib missing — no plot)")
         return
 
-    x, y, v = traj[:, 1], traj[:, 2], traj[:, 4]
-    fig, ax = plt.subplots(figsize=(14, 14))
-    if occ_pts is not None and len(occ_pts):
-        ax.scatter(occ_pts[:, 0], occ_pts[:, 1], c="0.35", s=8, marker="s",
-                   alpha=0.5, label="static occluders", zorder=1)
-    frames = []
-    if show_occlusion and occ_frames is not None and len(occ_frames):
-        from occlusion_capsules import capsule_polygon
-    
-        frame_colors = ["#e6194b", "#f58231", "#b8860b", "#3cb44b",
-                        "#4363d8", "#911eb4", "#008080", "#f032e6"]
+    from occlusion_capsules import capsule_polygon
+    from static_obstacles import box_polygon
 
-        idx = (np.linspace(0, len(occ_frames) - 1, min(max_frames, len(occ_frames)))
-               .round().astype(int))
-        frames = [occ_frames[i] for i in dict.fromkeys(idx.tolist())]
+    TRAJ_MARGIN = 100.0   # [m] padding around the ego extent — the plot's zoom level
 
-        T = float(capsule_horizon) if capsule_horizon else 3.0
+    x, y = traj[:, 1], traj[:, 2]
 
- 
-        t_first = {}          # rounded geometry key -> episode time first constrained
-        corner_labelled = False
+    frames = [f for f in (occ_frames or []) if f.get("plan") is not None and len(f["plan"]) > 1]
+    if not frames:
+        print(f"[traj] saved {stem}.csv (no recorded solve with a plan — no plot)")
+        return
 
-        def _key(seg):
-    
-            return tuple(np.round(np.asarray(seg).ravel() / 2.0).astype(int))
+    def _curvature(fr):
+        d = np.diff(fr["plan"], axis=0)
+        th = np.arctan2(d[:, 1], d[:, 0])
+        return float(np.abs(np.unwrap(th)[-1] - np.unwrap(th)[0]))
 
-        for fi, (t_ep, ex, ey, segs, _plan) in enumerate(frames):
-            col = frame_colors[fi % len(frame_colors)]
-            segs = np.asarray(segs, float).reshape(-1, 2, 2)
+    def _tightest(fr):
+        """max over the horizon of (keep-out radius − distance to the boundary): how
+        close this plan came to the expanding occlusion set. Positive ⇒ inside it."""
+        segs, plan = fr["segs"], fr["plan"]
+        t = (np.arange(len(plan)) + 1) * DT
+        d = point_segments_min_distance(plan[:, 0], plan[:, 1], segs)
+        return float(np.max((D_SAFE_HARD + V_TARGET * t) - d))
 
-            for seg in segs:
-                k = _key(seg)
-                t0 = t_first.setdefault(k, float(t_ep))
-                tau = min(float(t_ep) - t0, T)
+    # Prefer a solve that actually had occlusion boundaries — a frame without them has
+    # no expanding keep-out to show. Among those, the tightest one.
+    occ_ok = [f for f in frames if f.get("segs") is not None and len(f["segs"])]
+    fr = max(occ_ok, key=_tightest) if occ_ok else max(frames, key=_curvature)
+    plan = fr["plan"]
+    tk = (np.arange(len(plan)) + 1) * DT
+    segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
+            if fr.get("segs") is not None and len(fr["segs"]) else np.empty((0, 2, 2)))
 
-                poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD + V_TARGET * tau)
-                ax.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.6, alpha=0.95,
-                        zorder=0)
+    fig, ax = plt.subplots(figsize=(11, 11))
 
-                # The blind corner the phantom is anchored to. Labelled once for the
-                # legend: len(t_first)==1 stayed true across frames while a single
-                # boundary persisted, so it emitted a duplicate entry per frame.
-                ax.plot(seg[0, 0], seg[0, 1], ".", color="k", ms=5, zorder=2,
-                        label=None if corner_labelled else "occlusion corner (centre)")
-                corner_labelled = True
+    # Static obstacles as Unity reports them (StaticObstaclePublisher.cs).
+    sb = (np.asarray(static_boxes, float).reshape(-1, 5)
+          if static_boxes is not None and len(static_boxes) else np.empty((0, 5)))
+    for i, (bx, by, bsx, bsy, byaw) in enumerate(sb):
+        poly = box_polygon(bx, by, bsx, bsy, byaw)
+        ax.fill(poly[:, 0], poly[:, 1], color="0.80", ec="0.30", lw=1.0, zorder=0,
+                label="static obstacles (Unity)" if i == 0 else None)
 
-            # The ego ON the trajectory at this timestamp, in the SAME colour as the
-            # rings drawn for it above.
-            ax.plot(ex, ey, "o", mfc=col, mec="k", ms=11, mew=1.4, zorder=6,
-                    label=f"ego + keep-out @ t = {float(t_ep):.1f} s")
-
-    sc = ax.scatter(x, y, c=v, cmap="viridis", s=10, zorder=3)
-    ax.plot(x, y, "-", color="0.6", lw=0.8, zorder=2)
-    ax.plot(x[0], y[0], "o", color="tab:green", ms=10, label="start", zorder=4)
-    ax.plot(x[-1], y[-1], "s", color="tab:red", ms=10, label="end", zorder=4)
-    if obs_track is not None and len(obs_track):
-        ax.scatter(obs_track[:, 1], obs_track[:, 2], c="tab:orange", s=18, alpha=0.6,
-                   marker="x", linewidths=1.2, label="dynamic obstacles", zorder=6)
+    ax.plot(x, y, "-", color="0.65", lw=1.2, zorder=1, label="executed trajectory")
+    ax.plot(x[0], y[0], "o", color="tab:green", ms=9, zorder=3, label="start")
+    ax.plot(x[-1], y[-1], "s", color="tab:red", ms=9, zorder=3, label="end")
     if goal_xy is not None:
-        ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18,
-                markeredgecolor="k", label="goal", zorder=5)
-    fig.colorbar(sc, ax=ax, label="speed [m/s]")
+        ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18, mec="k", zorder=3,
+                label="goal")
 
-    TRAJ_MARGIN = 20.0                     # [m] padding around the ego path
-    cx, cy = 0.5 * (x.min() + x.max()), 0.5 * (y.min() + y.max())
-    half = 0.5 * max(x.max() - x.min(), y.max() - y.min()) + TRAJ_MARGIN
-    ax.set_xlim(cx - half, cx + half)
-    ax.set_ylim(cy - half, cy + half)
+    ax.plot(plan[:, 0], plan[:, 1], "-", color="k", lw=2.0, zorder=4,
+            label=f"predicted rollout (solve at t = {fr['t']:.1f} s)")
+
+    # Sampled predicted timestamps along that rollout.
+    stage_colors = ["#00e5ff", "#ff00a0", "#ffd400", "#00ff7f",
+                    "#7c4dff", "#ff6d00", "#00b0ff", "#c6ff00"]
+    stages = np.linspace(0, len(plan) - 1, min(max_frames, len(plan))).round().astype(int)
+    for si, k in enumerate(dict.fromkeys(stages.tolist())):
+        col = stage_colors[si % len(stage_colors)]
+        t_k = float(tk[k])
+        # The occlusion keep-out AT THIS STAGE: a worst-case hidden agent leaving the
+        # boundary at t=0 at V_TARGET can be anywhere within D_SAFE_HARD + V_TARGET·t_k,
+        # so each sampled timestamp gets its own, larger, capsule.
+        r_k = D_SAFE_HARD + V_TARGET * t_k
+        for seg in segs:
+            poly = capsule_polygon(seg[0], seg[1], r_k)
+            ax.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.8, alpha=0.95, zorder=1)
+        ax.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=11, mew=1.4, zorder=5,
+                label=f"$t_k$ = {t_k:.1f} s   r = {r_k:.0f} m")
+
+    for seg in segs:
+        ax.plot(seg[:, 0], seg[:, 1], "-", color="k", lw=2.5, zorder=6)
+        ax.plot(seg[0, 0], seg[0, 1], ".", color="k", ms=8, zorder=6)
+
+    # Zoom on the EGO's own extent (start → end) plus the plan it is executing. Static
+    # obstacles and the outer keep-out capsules are deliberately left out of the bounds:
+    # a 700 m-away wall or a 40 m radius ring would zoom the ego down to a few pixels.
+    # Anything outside the window simply gets clipped.
+    allx = np.concatenate([x, plan[:, 0]])
+    ally = np.concatenate([y, plan[:, 1]])
+    cx, cy = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
+    half_x = 0.5 * (allx.max() - allx.min()) + TRAJ_MARGIN
+    half_y = max(0.5 * (ally.max() - ally.min()) + TRAJ_MARGIN, 0.25 * half_x)
+    ax.set_xlim(cx - half_x, cx + half_x); ax.set_ylim(cy - half_y, cy + half_y)
+    # Equal aspect on a SQUARE canvas would force the y window out to the x window's
+    # size, undoing the zoom. Match the canvas to the data instead: metres stay square
+    # while the window stays tight around the ego.
     ax.set_aspect("equal", adjustable="box")
+    fig.set_size_inches(12.0, float(np.clip(12.0 * half_y / half_x, 4.0, 12.0)))
     ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
-    ax.set_title(f"trajectory — {verdict}")
-    ax.legend(loc="best"); ax.grid(True, alpha=0.3)
+    ax.set_title(f"{verdict} — predicted rollout at t = {fr['t']:.1f} s with the "
+                 f"expanding occlusion keep-out per sampled $t_k$"
+                 if len(segs) else
+                 f"{verdict} — executed trajectory + predicted rollout at "
+                 f"t = {fr['t']:.1f} s")
+    # Legend OUTSIDE the axes: the zoomed window is short, so "best" placement lands it
+    # on top of the rollout every time.
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8, borderaxespad=0.0)
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(f"{stem}.png", dpi=120)
     plt.close(fig)
-    print(f"[traj] saved {stem}.csv and {stem}.png")
-
-    plan_frames = [f for f in (occ_frames or []) if f[4] is not None and len(f[4])]
-    if show_occlusion and plan_frames:
-        from occlusion_capsules import capsule_polygon, point_segments_min_distance
-
-        def _slack(fr):
-            segs, plan = fr[3], fr[4]
-            tk = (np.arange(len(plan)) + 1) * DT
-            d = point_segments_min_distance(plan[:, 0], plan[:, 1], segs)
-            return float(np.max((D_SAFE_HARD + V_TARGET * tk) - d))
-
-        t_sel, ex, ey, segs, plan = max(plan_frames, key=_slack)
-        segs = np.asarray(segs, float).reshape(-1, 2, 2)
-        tk_all = (np.arange(len(plan)) + 1) * DT
-        d_all = point_segments_min_distance(plan[:, 0], plan[:, 1], segs)
-        viol = (D_SAFE_HARD + V_TARGET * tk_all) - d_all
-
-        f2, a2 = plt.subplots(figsize=(13, 13))
-        if occ_pts is not None and len(occ_pts):
-            a2.scatter(occ_pts[:, 0], occ_pts[:, 1], c="0.35", s=8, marker="s",
-                       alpha=0.5, label="static occluders", zorder=1)
-        # Executed path for context, so the plan can be compared against what happened.
-        a2.plot(x, y, "-", color="0.75", lw=1.0, zorder=2, label="executed trajectory")
-
-        # Sample stages across the horizon: each gets a colour, a dot on the PLANNED
-        # path, and the keep-out at that stage's radius in the same colour.
-        n_show = min(max_frames, len(plan))
-        stages = np.linspace(0, len(plan) - 1, n_show).round().astype(int)
-        a2.plot(plan[:, 0], plan[:, 1], "-", color="0.4", lw=1.2, zorder=3,
-                label="planned future trajectory")
-        for si, k in enumerate(dict.fromkeys(stages.tolist())):
-            col = frame_colors[si % len(frame_colors)]
-            t_k = float(tk_all[k])
-            r_k = D_SAFE_HARD + V_TARGET * t_k
-            for seg in segs:
-                poly = capsule_polygon(seg[0], seg[1], r_k)
-                a2.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.6, alpha=0.95,
-                        zorder=0)
-            a2.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=11, mew=1.4,
-                    zorder=6,
-                    label=f"$t_k$ = {t_k:.1f} s   r = {r_k:.0f} m   "
-                          f"d = {d_all[k]:.0f} m" +
-                          ("  VIOLATED" if viol[k] > 0 else ""))
-        for seg in segs:
-            a2.plot(seg[0, 0], seg[0, 1], ".", color="k", ms=6, zorder=4)
-        a2.plot(ex, ey, "s", color="tab:red", ms=11, mec="k", zorder=7,
-                label=f"ego now (t = {float(t_sel):.1f} s)")
-
-        px_, py_ = plan[:, 0], plan[:, 1]
-        allx = np.concatenate([px_, segs[:, :, 0].ravel(), [ex]])
-        ally = np.concatenate([py_, segs[:, :, 1].ravel(), [ey]])
-        cx2, cy2 = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
-        half2 = 0.5 * max(allx.max() - allx.min(), ally.max() - ally.min()) + 15.0
-        a2.set_xlim(cx2 - half2, cx2 + half2); a2.set_ylim(cy2 - half2, cy2 + half2)
-        a2.set_aspect("equal", adjustable="box")
-        a2.set_xlabel("x  (Unity Z) [m]"); a2.set_ylabel("y  (Unity X) [m]")
-        a2.set_title(f"planned horizon at t = {float(t_sel):.1f} s — "
-                     f"keep-out per stage (max violation {viol.max():+.1f} m)")
-        a2.legend(loc="best", fontsize=9); a2.grid(True, alpha=0.3)
-        f2.tight_layout()
-        f2.savefig(f"{stem}_plan.png", dpi=120)
-        plt.close(f2)
-        print(f"[traj] saved {stem}_plan.png "
-              f"(solve at t={float(t_sel):.1f}s, max violation {viol.max():+.2f} m)")
+    print(f"[traj] saved {stem}.csv and {stem}.png (rollout from the solve at "
+          f"t={fr['t']:.1f}s, {len(set(stages.tolist()))} sampled stages, "
+          f"{len(segs)} occlusion boundaries)")
 
 
 def run(unity_exec_path=None, port=5004, run_sysid=True,
@@ -712,6 +687,14 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     if dynamic_viz and not DYNAMIC_AVOID:
         print("[Controller] --dynamic-viz needs --dynamic-obstacles (there is nothing to "
               "draw without the detector) — DISABLED")
+    # Static-obstacle footprints from Unity. Plot-only, so it is started only when a
+    # trajectory is being saved and its absence never affects control.
+    static_obs = None
+    if save_traj is not None:
+        from static_obstacles import StaticObstacles
+        _so = StaticObstacles()
+        static_obs = _so if _so.start() else None
+
     env = UnityEnvironment(
         file_name=unity_exec_path,
         base_port=port,
@@ -748,8 +731,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     collided  = False
     reached   = False
     traj      = []   # per-step ego pose: (t, x, y, theta, v, a_cmd, delta_cmd)
-    occ_seen  = {}   # static occluder points  → plotted as "static occluders"
-    occ_frames = []
+    occ_frames = []   # one dict per solve: {t, ex, ey, plan}; see the loop
     dyn_track = []
 
     env.reset()
@@ -854,13 +836,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                                   f"age={_age:4.1f} fs={_fs[_i]:>4} {_mark}")
             else:
                 DYN_NOW = None
-            # Accumulate the per-scan obstacle-circle centres into the episode-wide
-            # union (deduped by rounded world position) for the trajectory plot.
-            if save_traj is not None and LIDAR_COSTMAP.ready:
-                _circ = LIDAR_COSTMAP.circles()
-                if _circ is not None:
-                    for wx, wy, _r in _circ:
-                        occ_seen[(round(float(wx), 1), round(float(wy), 1))] = None
         u_nom, mean = mppi(s, mean, goal_xy, u_prev)
 
         if DYN_PUB is not None:
@@ -875,10 +850,19 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
             for _c0, _c1, _r, _age in DYN_USED:
                 dyn_track.append((ep_steps * DT, float(_c0), float(_c1)))
 
-        if save_traj is not None and OCC_SEGS_USED is not None and len(OCC_SEGS_USED):
-            occ_frames.append((ep_steps * DT, float(s[0]), float(s[1]),
-                               np.array(OCC_SEGS_USED, dtype=float),
-                               None if OCC_PLAN is None else OCC_PLAN.copy()))
+        # One record per solve: the ego pose and the plan it committed to. The figure
+        # draws exactly one of these, so recording every step costs nothing but keeps
+        # the choice of WHICH solve to show a plotting decision.
+        if save_traj is not None and OCC_PLAN is not None:
+            _segs = OCC_SEGS_USED
+            occ_frames.append({"t": ep_steps * DT,
+                               "ex": float(s[0]), "ey": float(s[1]),
+                               "plan": OCC_PLAN.copy(),
+                               # The occlusion boundaries this solve actually constrained
+                               # against (post-gating) — what the cost saw, so the drawn
+                               # keep-outs are the enforced ones.
+                               "segs": (np.array(_segs, dtype=float)
+                                        if _segs is not None and len(_segs) else None)})
 
         u_cmd      = u_nom
         cbf_engaged = False
@@ -898,7 +882,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                       f",r={wr[k]:.1f}) d_field={d_field:.1f}")
 
 
-        # Advance Python-side kinematic state to match what Unity will compute
+        # Advance Pythos with the canvas sized to the data aspen-side kinematic state to match what Unity will compute
         v = s[3]
         speed_frac   = min(v / max(STEER_ROLLOFF_SPD, 1e-3), 1.0)
         eff_limit    = DELTA_LIM * (1.0 - speed_frac * (1.0 - STEER_ROLLOFF_MIN))
@@ -946,20 +930,17 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     verdict = "collision" if collided else ("reached" if reached else "timeout")
 
     if save_traj is not None and traj:
-        # Overlay the run-wide UNION of static occluders and occlusion boundaries the
-        # perception produced (not a single decaying end-of-run frame), so the plot shows
-        # every wall/blind corner the ego reacted to.
-        occ_pts = np.array(list(occ_seen.keys())) if occ_seen else None
         _save_trajectory(save_traj, verdict, goal_xy, np.asarray(traj),
                          # SENSED dynamic-obstacle centres (clustered + tracked from the
                          # LiDAR), not the removed oracle feed.
                          np.asarray(dyn_track) if dyn_track else None,
-                         occ_pts, occ_frames=occ_frames,
-                         # OCC_HORIZON, not the PLANNING horizon: the keep-out is
-                         # capped at OCC_HORIZON in the cost, so drawing H_MPPI*DT
-                         # would overstate the constraint by V_TARGET*(6.0-3.0)=9 m.
-                         capsule_horizon=OCC_HORIZON,
+                         None, occ_frames=occ_frames,
+                         static_boxes=(None if static_obs is None
+                                       else static_obs.boxes()),
                          show_occlusion=show_occlusion_plot)
+
+    if static_obs is not None:
+        static_obs.shutdown()
 
     print(f"\n[Controller] steps={ep_steps:4d}  min_clearance={min_clear:5.2f} m "
           f"(LiDAR circle surfaces, target >= {D_SAFE_HARD:.1f} m)  → {verdict.upper()}")

@@ -220,6 +220,10 @@ class ObstacleCircles:
         keep = ((rng > self.min_range) & (rng < self.max_query_range)
                 & (z > self.z_lo) & (z < self.z_hi))
         if not keep.any():
+            # Drop the previous scan's returns too: points() and clusters() must never
+            # hand out geometry from a scan this one has already replaced.
+            self._pts_world = None
+            self._cluster_cache = None
             return None
 
         # LOCAL → WORLD (pure translation; axes are world-aligned).
@@ -268,6 +272,17 @@ class ObstacleCircles:
         if not self._ready or self._circles is None or not len(self._circles):
             return None
         return self._circles
+
+    def points(self) -> Optional[np.ndarray]:
+        """(N,2) world [a0, a1] obstacle RETURNS of the current scan, or None.
+
+        The height/range-filtered raw returns that the covering circles were built
+        from — one scan only, never accumulated. Used for plotting what the sensor
+        actually saw at a given instant; the planner uses circles()/distance().
+        """
+        if not self._ready or self._pts_world is None or not len(self._pts_world):
+            return None
+        return self._pts_world
 
     def clusters(self, cell: float = 2.0, min_points: int = 4,
                  max_radius: float = 25.0) -> Optional[np.ndarray]:

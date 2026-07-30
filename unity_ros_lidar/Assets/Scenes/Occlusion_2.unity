@@ -1849,6 +1849,7 @@ GameObject:
   - component: {fileID: 1156722710}
   - component: {fileID: 1156722713}
   - component: {fileID: 1156722714}
+  - component: {fileID: 1156722715}
   m_Layer: 0
   m_Name: ROS Publishers
   m_TagString: Untagged
@@ -1976,6 +1977,22 @@ MonoBehaviour:
   groundY: 0.05
   keepOutColor: {r: 0.1, g: 0.85, b: 1, a: 1}
   extentColor: {r: 1, g: 1, b: 1, a: 0.8}
+--- !u!114 &1156722715
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1156722709}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: be80dac65b3e23cf5bda134647fe60ca, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::StaticObstaclePublisher
+  topic: /static_obstacles
+  republishPeriod: 1
+  obstacles:
+  - {fileID: 444686143}
 --- !u!1 &1179805699 stripped
 GameObject:
   m_CorrespondingSourceObject: {fileID: 5745026347857897730, guid: 2ff8c8d06f9ed614c9f3b44837944535, type: 3}
