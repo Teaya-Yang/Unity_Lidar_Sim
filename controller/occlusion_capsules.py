@@ -70,6 +70,45 @@ def _wall_line_deviation(win: np.ndarray, far: np.ndarray):
     return dev, wall_rms
 
 
+def _collapse_runs(mask: np.ndarray, valid: np.ndarray, score: np.ndarray,
+                   wraps: bool) -> np.ndarray:
+    """One representative index per contiguous run of mask==True.
+
+    mask  : which beams detected a jump — defines the RUNS.
+    valid : which of those are eligible to represent a run (near-sensor corners are not).
+    score : per-beam strength; the highest-scoring VALID beam in each run wins.
+    wraps : treat the array as circular, so a run across index 0 stays one run.
+
+    Runs with no valid beam yield nothing.
+    """
+    n = len(mask)
+    if n == 0 or not mask.any():
+        return np.empty(0, dtype=int)
+
+    idx = np.arange(n)
+    if wraps and mask.all():
+        # Fully circular run: no boundary to start from, so it is a single run.
+        v = np.where(valid)[0]
+        return np.array([v[np.argmax(score[v])]], dtype=int) if len(v) else np.empty(0, int)
+
+    # Rotate so index 0 begins a run — otherwise a wrapping run is split into two.
+    shift = 0
+    if wraps:
+        starts = np.where(mask & ~np.roll(mask, 1))[0]
+        shift = int(starts[0]) if len(starts) else 0
+    m, vv, sc = (np.roll(a, -shift) for a in (mask, valid, score))
+
+    out = []
+    edges = np.where(m[:-1] != m[1:])[0] + 1
+    for run in np.split(idx, edges):
+        if not m[run[0]]:
+            continue
+        cand = run[vv[run]]
+        if len(cand):
+            out.append(int(cand[np.argmax(sc[cand])]))
+    return (np.asarray(out, dtype=int) + shift) % n if out else np.empty(0, dtype=int)
+
+
 def segments_from_ordered_cloud(
     xyz: np.ndarray,
     res_h: float,
@@ -79,7 +118,7 @@ def segments_from_ordered_cloud(
     min_jump: float = 2.0,
     sigma: float = 0.0,
     wraps: bool = True,
-    merge_radius: float = 5,
+    merge_radius: float = 10,
     max_seg_len: float = 30.0,
     elev_row: Optional[int] = None,
     ego_fwd: Optional[Tuple[float, float]] = None,
@@ -178,7 +217,17 @@ def segments_from_ordered_cloud(
         detect = detect & persist
 
     # Drop degenerate near-sensor corners before the wedge test, for the reason above.
-    hit = np.where(detect & (near > min_corner_range))[0]
+    valid = detect & (near > min_corner_range)
+    if not valid.any():
+        return None
+
+    # One physical edge straddled by several beams fires a RUN of adjacent detections.
+    # Collapse each run to its strongest beam (max delta = the deepest depth break, i.e.
+    # the beam that most nearly grazes the true corner) so the edge seeds one candidate
+    # instead of a fan of them. merge_radius later dedupes corners that survive as
+    # separate runs; this handles the contiguous case, where the intermediate beams are
+    # not a second edge but the same one sampled off-peak.
+    hit = _collapse_runs(detect, valid, delta, wraps)
     if len(hit) == 0:
         return None
 
@@ -476,7 +525,7 @@ class OcclusionCornerTracker:
 
 def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=None, clip=None,
                          w_sight=None, a_brake=None, v_floor=None, cost_current = None, dyn = False, action = None,
-                         t_grow_max=None):
+                         t_grow_max=None, w_soft=None, d_infl=None):
     """Occlusion stage cost. Backend-agnostic: pass numpy or CasADi primitives.
 
     d        : distance from the (rollout/predicted) pose to the nearest occlusion boundary
@@ -487,18 +536,31 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
     w_obs    : hard-constraint weight
     w_sight  : RSS sightline weight, or None to skip that term (a_brake/v_floor then unused)
     t_grow_max : cap [s] on the expansion time, or None for the (freezing) uncapped growth
+    w_soft   : weight of the soft influence ring outside r_keep, or None/0 to skip it
+    d_infl   : width [m] of that ring. Cost is w_soft at d = r_keep, 0 at r_keep + d_infl
     Returns the scalar/array stage cost contribution.
     """
     import numpy as _np
     fmax = _np.maximum if fmax is None else fmax
     sqrt = _np.sqrt if sqrt is None else sqrt
 
-    r_grow = v_target * t_k
+    t_eff  = t_k if t_grow_max is None else min(t_k, t_grow_max)
+    r_grow = v_target * t_eff
     r_keep = r_grow + d_safe
 
+    # Hard term: binary, so every breach costs the same regardless of depth — a constraint,
+    cost = np.where(d < r_keep, w_obs, 0.0)
 
-    cost = np.where(d < r_keep, w_obs, 0.0) 
-    
+    # Soft term: the gradient the hard term cannot give. A one-sided quadratic over an
+    # influence ring of width d_infl OUTSIDE r_keep, normalised so w_soft is the cost of
+    # sitting exactly on the keep-out boundary and 0 at r_keep + d_infl and beyond.
+    #   - decreasing in d, so farther is genuinely cheaper (the opposite of `+ k*d`)
+    #   - bounded and local, so it cannot outvote the goal far from any boundary (which an
+    #     unbounded `-k*d` would, by paying the ego to run away forever)
+    if w_soft and d_infl:
+        margin = fmax(0.0, (r_keep + d_infl) - d)
+        cost = cost + w_soft * margin * margin
+
     if not dyn:
         print(f"TIMESTAMP_occlussion: {t_k} -> r_grow : {r_grow}, distance from occlussion : {d}, total distance to keep : {r_keep} , current min cost: {np.min(cost_current)}, current_actions: {action[np.argmin(cost_current)]}")
     else:

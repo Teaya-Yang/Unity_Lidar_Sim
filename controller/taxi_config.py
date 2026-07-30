@@ -55,6 +55,7 @@ SCHEMA: Dict[str, Dict[str, str]] = {
     "occlusion": {
         "v_target": "float", "horizon": "float", "t_grow_max": "float",
         "k_occ": "int", "query_r": "float",
+        "w_soft": "float", "d_infl": "float",
         "fwd_half_angle": "float", "use_capsules": "bool", "single_circle": "bool",
         "w_sight": "float", "a_brake_sight": "float", "v_sight_floor": "float",
     },
@@ -186,6 +187,13 @@ def _check_consistency(cfg, path):
     if cfg["occlusion"]["t_grow_max"] <= 0.0:
         bad("occlusion.t_grow_max must be positive: 0 would freeze the keep-out at d_safe_hard "
             "and drop the forward-reachable-set expansion entirely")
+    if cfg["occlusion"]["w_soft"] < 0.0 or cfg["occlusion"]["d_infl"] < 0.0:
+        bad("occlusion.w_soft and occlusion.d_infl must be >= 0 (either at 0 disables the "
+            "soft influence ring, leaving the binary hard keep-out)")
+    if cfg["occlusion"]["w_soft"] >= cfg["keepout"]["w_hard"]:
+        bad("occlusion.w_soft must be << keepout.w_hard: the soft ring exists to rank "
+            "rollouts that all CLEAR the keep-out. At this weight it can pay for a breach, "
+            "turning the hard constraint back into a trade-off")
     if not 0.0 < cfg["occlusion_tracker"]["alpha"] <= 1.0:
         bad("occlusion_tracker.alpha must be in (0, 1]")
     if not 0.0 < cfg["dynamic_clusters"]["extent_alpha"] <= 1.0:

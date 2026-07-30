@@ -61,6 +61,8 @@ OCC_USE_CAPSULES = _occ["use_capsules"]   # False ⇒ collapse each boundary to 
 OCC_QUERY_R    = _occ["query_r"]
 OCC_HORIZON    = _occ["horizon"]
 OCC_T_GROW_MAX = _occ["t_grow_max"]   # cap on the FRS expansion time inside the stage cost
+OCC_W_SOFT     = _occ.get("w_soft", 0.0)   # soft influence ring outside the hard keep-out
+OCC_D_INFL     = _occ.get("d_infl", 0.0)
 K_OCC          = _occ["k_occ"]
 W_SIGHT        = _occ["w_sight"]
 A_BRAKE_SIGHT  = _occ["a_brake_sight"]
@@ -100,6 +102,9 @@ OCC_GATE_DBG    = None   # (n_in, n_after_goal_drop, r_goal, min_goal_dist) from
 OCC_PLAN        = None   # (H,2) the PLANNED future path from the last solve, in world
                          # (a0,a1). Stage k of this array is the pose the occlusion cost
                          # checked against radius r(t_k) — the pairing the plan figure draws.
+OCC_INFEASIBLE  = False  # the LAST solve found no feasible rollout and braked. OCC_PLAN is
+                         # then the braking rollout — what the ego actually executes, and the
+                         # thing worth SEEING intersect the keep-outs, so it is still drawn.
 OCC_SEGS_USED   = None   # (M,2,2) the segments the LAST solve actually constrained against —
                          # post-gating, so it is what the cost saw, not what perception found.
                          # The trajectory plot replays these per timestamp.
@@ -245,6 +250,7 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     Returns (u_nom, new_mean).
     """
     global OCC_USED_N, OCC_GATE_DBG, OCC_RANGE_DBG, OCC_SEGS_USED, OCC_PLAN, DYN_USED
+    global OCC_INFEASIBLE
     # Nominal MPPI weights / limits. The frontal-threat "go-around" gate (in_corridor / aimed_at_us)
     # has been removed to keep the planner simple: plain lane-following + obstacle rings, and the
     # LiDAR visibility term is what drives any deliberate off-lane motion.
@@ -327,6 +333,7 @@ def mppi(s0, mean, goal_xy, u_prev=None):
                     OCC_USED_N = len(occ_segs)
                     OCC_SEGS_USED = occ_segs
 
+    OCC_INFEASIBLE = False
     dyn_set = None
     DYN_USED = None
     if DYNAMIC_AVOID and DYN_NOW is not None and len(DYN_NOW) and K_DYN > 0:
@@ -366,6 +373,7 @@ def mppi(s0, mean, goal_xy, u_prev=None):
             cost += occlusion_stage_cost(
                 _dist_to_occ(fwd, lat), vv, (k + 1) * DT,
                 V_TARGET, D_SAFE_HARD, W_HARD, t_grow_max=OCC_T_GROW_MAX,
+                w_soft=OCC_W_SOFT, d_infl=OCC_D_INFL,
                 cost_current = cost, action = np.column_stack((fwd, lat)))
 
         if dyn_set is not None:
@@ -392,7 +400,16 @@ def mppi(s0, mean, goal_xy, u_prev=None):
         print(f"[MPPI] INFEASIBLE: {n_feasible}/{K_MPPI} rollouts under {C_INFEAS:.2e} "
               f"(depth {INFEAS_DEPTH:.2f} m), min cost {cost.min():.3e} — braking")
         u_stop = np.array([A_MIN, 0.0])                 # max decel, hold wheel straight
-        OCC_PLAN = None                                 # no plan to draw; don't leave a stale one
+        # Roll the braking command out over the horizon so the figure can show WHERE the
+        # ego still ends up while stopping — the case where it clips the keep-outs is
+        # exactly the one worth looking at, so this must not be left as a stale plan.
+        _st = np.asarray(s0, float)[None, :]
+        _brake = np.empty((H_MPPI, 2))
+        for _k in range(H_MPPI):
+            _st = _rollout_step(_st, u_stop[0:1], u_stop[1:2])
+            _brake[_k] = _st[0, :2]
+        OCC_PLAN = _brake
+        OCC_INFEASIBLE = True
         return u_stop, np.zeros((H_MPPI, 2))
 
     # Leave -cost.min() to avoid underflow, softmax to compute the weights
@@ -448,14 +465,15 @@ def identify_bicycle_model(env, behavior_name, n_steps=200):
 
 def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=None,
                      occ_frames=None, capsule_horizon=None, max_frames=6,
-                     show_occlusion=True, static_boxes=None, **_ignored):
+                     show_occlusion=True, static_boxes=None, solve_t=None, **_ignored):
     """CSV of the executed run + ONE figure: the executed trajectory and the predicted
     rollout of a SINGLE solve with a handful of sampled horizon timestamps on it — each
     timestamp drawn together with the expanding occlusion keep-out that applied at it.
 
-    The solve drawn is the one whose plan came closest to (or inside) its expanding
-    occlusion set; with no occlusion boundaries anywhere it falls back to the solve whose
-    plan bent hardest.
+    `solve_t` [s] pins WHICH solve that is — the recorded solve closest in episode time
+    to it. Left None, the solve drawn is the one whose plan came closest to (or inside)
+    its expanding occlusion set; with no occlusion boundaries anywhere it falls back to
+    the solve whose plan bent hardest.
     """
     import os
     os.makedirs(out_dir, exist_ok=True)
@@ -503,7 +521,13 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     # Prefer a solve that actually had occlusion boundaries — a frame without them has
     # no expanding keep-out to show. Among those, the tightest one.
     occ_ok = [f for f in frames if f.get("segs") is not None and len(f["segs"])]
-    fr = max(occ_ok, key=_tightest) if occ_ok else max(frames, key=_curvature)
+    if solve_t is not None:
+        fr = min(frames, key=lambda f: abs(f["t"] - solve_t))
+        if abs(fr["t"] - solve_t) > DT:
+            print(f"[traj] no solve recorded at t={solve_t:.1f}s — using the nearest, "
+                  f"t={fr['t']:.1f}s (recorded {frames[0]['t']:.1f}..{frames[-1]['t']:.1f}s)")
+    else:
+        fr = max(occ_ok, key=_tightest) if occ_ok else max(frames, key=_curvature)
     plan = fr["plan"]
     tk = (np.arange(len(plan)) + 1) * DT
     segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
@@ -519,6 +543,15 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
         ax.fill(poly[:, 0], poly[:, 1], color="0.80", ec="0.30", lw=1.0, zorder=0,
                 label="static obstacles (Unity)" if i == 0 else None)
 
+    # Ground-truth movers where they were AT the drawn solve (t_k = 0), not at the end.
+    db = (np.asarray(fr["dyn_boxes"], float).reshape(-1, 5)
+          if fr.get("dyn_boxes") is not None and len(fr["dyn_boxes"]) else np.empty((0, 5)))
+    for i, (bx, by, bsx, bsy, byaw) in enumerate(db):
+        poly = box_polygon(bx, by, bsx, bsy, byaw)
+        ax.fill(poly[:, 0], poly[:, 1], color="tab:orange", alpha=0.45, ec="tab:orange",
+                lw=1.2, zorder=2,
+                label="dynamic objects at $t_k$ = 0 (Unity)" if i == 0 else None)
+
     ax.plot(x, y, "-", color="0.65", lw=1.2, zorder=1, label="executed trajectory")
     ax.plot(x[0], y[0], "o", color="tab:green", ms=9, zorder=3, label="start")
     ax.plot(x[-1], y[-1], "s", color="tab:red", ms=9, zorder=3, label="end")
@@ -527,11 +560,20 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
                 label="goal")
 
     ax.plot(plan[:, 0], plan[:, 1], "-", color="k", lw=2.0, zorder=4,
-            label=f"predicted rollout (solve at t = {fr['t']:.1f} s)")
+            label=("braking rollout — no feasible plan "
+                   f"(solve at t = {fr['t']:.1f} s)" if fr.get("infeasible") else
+                   f"predicted rollout (solve at t = {fr['t']:.1f} s)"))
 
     # Sampled predicted timestamps along that rollout.
     stage_colors = ["#00e5ff", "#ff00a0", "#ffd400", "#00ff7f",
                     "#7c4dff", "#ff6d00", "#00b0ff", "#c6ff00"]
+    # t_k = 0: the ego pose at this solve, with the un-expanded keep-out.
+    for seg in segs:
+        poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD)
+        ax.plot(poly[:, 0], poly[:, 1], "-", color="w", lw=1.8, alpha=0.95, zorder=1)
+    ax.plot(fr["ex"], fr["ey"], "o", mfc="w", mec="k", ms=6, mew=0.9, zorder=5,
+            label=f"$t_k$ = 0.0 s   r = {D_SAFE_HARD:.0f} m")
+
     stages = np.linspace(0, len(plan) - 1, min(max_frames, len(plan))).round().astype(int)
     for si, k in enumerate(dict.fromkeys(stages.tolist())):
         col = stage_colors[si % len(stage_colors)]
@@ -543,7 +585,7 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
         for seg in segs:
             poly = capsule_polygon(seg[0], seg[1], r_k)
             ax.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.8, alpha=0.95, zorder=1)
-        ax.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=11, mew=1.4, zorder=5,
+        ax.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=6, mew=0.9, zorder=5,
                 label=f"$t_k$ = {t_k:.1f} s   r = {r_k:.0f} m")
 
     for seg in segs:
@@ -589,7 +631,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
         occlusion_aware=False, dynamic_obstacles=False, dynamic_viz=False,
-        save_traj=None, show_occlusion_plot=True):
+        save_traj=None, show_occlusion_plot=True, plot_solve_t=None):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW
@@ -690,10 +732,16 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     # Static-obstacle footprints from Unity. Plot-only, so it is started only when a
     # trajectory is being saved and its absence never affects control.
     static_obs = None
+    dyn_obs = None
     if save_traj is not None:
         from static_obstacles import StaticObstacles
         _so = StaticObstacles()
         static_obs = _so if _so.start() else None
+        # Ground-truth movers, snapshotted per step so the plot can show them AT the
+        # solve it draws rather than at the end of the run.
+        from dynamic_obstacles import DynamicObstacles
+        _do = DynamicObstacles()
+        dyn_obs = _do if _do.start() else None
 
     env = UnityEnvironment(
         file_name=unity_exec_path,
@@ -850,9 +898,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
             for _c0, _c1, _r, _age in DYN_USED:
                 dyn_track.append((ep_steps * DT, float(_c0), float(_c1)))
 
-        # One record per solve: the ego pose and the plan it committed to. The figure
-        # draws exactly one of these, so recording every step costs nothing but keeps
-        # the choice of WHICH solve to show a plotting decision.
+        # One record per solve — EVERY step, feasible or not, so --plot-solve-t can name
+        # any moment of the run. An infeasible step records its braking rollout and is
+        # flagged; the figure draws it like any other plan.
         if save_traj is not None and OCC_PLAN is not None:
             _segs = OCC_SEGS_USED
             occ_frames.append({"t": ep_steps * DT,
@@ -862,7 +910,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                                # against (post-gating) — what the cost saw, so the drawn
                                # keep-outs are the enforced ones.
                                "segs": (np.array(_segs, dtype=float)
-                                        if _segs is not None and len(_segs) else None)})
+                                        if _segs is not None and len(_segs) else None),
+                               # Ground-truth movers as of THIS solve.
+                               "dyn_boxes": (None if dyn_obs is None else dyn_obs.boxes()),
+                               "infeasible": bool(OCC_INFEASIBLE)})
 
         u_cmd      = u_nom
         cbf_engaged = False
@@ -937,10 +988,12 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                          None, occ_frames=occ_frames,
                          static_boxes=(None if static_obs is None
                                        else static_obs.boxes()),
-                         show_occlusion=show_occlusion_plot)
+                         show_occlusion=show_occlusion_plot, solve_t=plot_solve_t)
 
     if static_obs is not None:
         static_obs.shutdown()
+    if dyn_obs is not None:
+        dyn_obs.shutdown()
 
     print(f"\n[Controller] steps={ep_steps:4d}  min_clearance={min_clear:5.2f} m "
           f"(LiDAR circle surfaces, target >= {D_SAFE_HARD:.1f} m)  → {verdict.upper()}")
@@ -1013,6 +1066,10 @@ if __name__ == "__main__":
                         "side constants to keep in sync. Requires --dynamic-obstacles.")
     p.add_argument("--save-traj", default=None, metavar="DIR",
                    help="Save the run's ego trajectory as CSV + a top-down PNG plot into DIR.")
+    p.add_argument("--plot-solve-t", type=float, default=None, metavar="SEC",
+                   help="Episode time [s] of the solve whose rollout the plot draws: the "
+                        "t_k = 0 point and the sampled future timestamps hang off it. "
+                        "Default: the solve that came closest to its occlusion keep-out.")
     args = p.parse_args()
 
     if args.d_infl < args.d_safe:
@@ -1036,4 +1093,5 @@ if __name__ == "__main__":
         dynamic_obstacles=args.dynamic_obstacles,
         dynamic_viz=args.dynamic_viz,
         show_occlusion_plot=not args.no_occlusion_plot,
-        save_traj=args.save_traj)
+        save_traj=args.save_traj,
+        plot_solve_t=args.plot_solve_t)

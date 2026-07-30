@@ -64,7 +64,7 @@ dynamic_obstacles:
   w_half: 10.0              # [m] taxiway half-width
 
 keepout:
-  d_safe_hard: 10.0         # [m] ~1 aircraft width
+  d_safe_hard: 15.0         # [m] ~1 aircraft width
   w_hard: 1.0e+6            # "infinite" hard-constraint weight. See the CAVEAT above: the
                             #   residual violation is |grad(other terms)| / (2*w_hard), so this
                             #   is the knob that decides whether the keep-out EXISTS, not how
@@ -99,7 +99,7 @@ keepout:
 
 
 occlusion:
-  v_target: 6.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
+  v_target: 10.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
   t_grow_max: 8.0           # [s] CAP on the expansion time inside occlusion_stage_cost, so the
                             #   keep-out saturates at d_safe_hard + v_target * t_grow_max
                             #   (15 + 8*3 = 39 m) instead of growing to 51 m by the end of the
@@ -111,6 +111,14 @@ occlusion:
   horizon: 6.0              # [s] cap on the expansion time. Sizes the Algorithm-1 single circle
                             #   and the plotted capsules; NOT applied inside
                             #   occlusion_capsules.occlusion_stage_cost.
+  w_soft: 50.0              # weight of the SOFT ring outside the hard keep-out. The hard term
+                            #   is binary, so it cannot tell two clearing rollouts apart; this
+                            #   is the gradient that makes MPPI prefer the one with margin.
+                            #   Keep << w_hard: it must shape choices among feasible paths,
+                            #   never buy a breach. 0 => off (pure binary constraint).
+  d_infl: 10.0              # [m] width of that ring. Cost is w_soft at d = r_keep and fades to
+                            #   0 at r_keep + d_infl, so it stays local and cannot outvote the
+                            #   goal far from any boundary.
   k_occ: 10                 # nearest boundaries constrained/evaluated per step (0 => off)
   query_r: 60           # [m] only consider boundaries within this radius of the ego
   fwd_half_angle: 120.0     # [deg] only boundaries AHEAD of the ego seed keep-outs — a phantom

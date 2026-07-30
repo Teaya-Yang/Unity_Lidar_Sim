@@ -1850,6 +1850,7 @@ GameObject:
   - component: {fileID: 1156722713}
   - component: {fileID: 1156722714}
   - component: {fileID: 1156722715}
+  - component: {fileID: 1156722716}
   m_Layer: 0
   m_Name: ROS Publishers
   m_TagString: Untagged
@@ -1993,6 +1994,24 @@ MonoBehaviour:
   republishPeriod: 1
   obstacles:
   - {fileID: 444686143}
+--- !u!114 &1156722716
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1156722709}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: deaaa0379efdb4bef97fdd2fe1d8b2b7, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::DynamicObstaclePublisher
+  topic: /dynamic_obstacles
+  rateHz: 20
+  obstacles:
+  - {fileID: 985866007}
+  agentRoots:
+  - {fileID: 1820338497}
 --- !u!1 &1179805699 stripped
 GameObject:
   m_CorrespondingSourceObject: {fileID: 5745026347857897730, guid: 2ff8c8d06f9ed614c9f3b44837944535, type: 3}
@@ -2308,7 +2327,7 @@ Transform:
   m_GameObject: {fileID: 1272930585}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 255.4, y: 0, z: 193}
+  m_LocalPosition: {x: 266, y: 0, z: 193}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
