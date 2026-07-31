@@ -92,6 +92,8 @@ OCC_TRACK_ALPHA = _trk["alpha"]
 OCC_TRACK_TTL   = _trk["ttl"]
 OCC_TRACK_HITS  = _trk["min_hits"]
 OCC_TRACKER     = None   # OcclusionCornerTracker, created in run()
+OCC_PUB         = None   # OcclusionSegmentPublisher — feeds OcclusionSegmentVisualizer.cs
+                         # so the Unity Scene view shows the boundaries THIS detector found
 OCC_SEGS_NOW    = None   
 
 OCC_RANGE_DBG   = None   # (min_ego_dist, corner_x, corner_y, ego_x, ego_y) for the nearest
@@ -660,10 +662,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
         occlusion_aware=False, dynamic_obstacles=False, dynamic_viz=False,
-        save_traj=None, show_occlusion_plot=True, plot_solve_t=None):
+        occlusion_viz=False, save_traj=None, show_occlusion_plot=True, plot_solve_t=None):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
-    global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW
+    global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW, OCC_PUB
     global DYNAMIC_AVOID, DYN_TRACKER, DYN_NOW, DYN_DBG, DYN_PUB, DYN_LAST_STAMP, DYN_CL_N
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
@@ -708,6 +710,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 OCC_TRACKER = OcclusionCornerTracker(
                     assoc_radius=OCC_TRACK_ASSOC, alpha=OCC_TRACK_ALPHA,
                     ttl=OCC_TRACK_TTL, min_hits=OCC_TRACK_HITS)
+                if occlusion_viz:
+                    from occlusion_capsules import OcclusionSegmentPublisher
+                    OCC_PUB = OcclusionSegmentPublisher()
+                    if not OCC_PUB.start():
+                        OCC_PUB = None
             if DYNAMIC_AVOID:
                 DYN_TRACKER = DynamicClusterTracker(
                     assoc_radius=DYN_ASSOC, q_accel=DYN_Q_ACCEL, r_frac=DYN_R_FRAC,
@@ -741,6 +748,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         if dynamic_obstacles:
             print("[Controller] Dynamic obstacles: requested but needs --lidar-costmap "
                   "(the clusters come from the same cloud) — DISABLED")
+    if occlusion_viz and not OCCLUSION_AWARE:
+        print("[Controller] --occlusion-viz needs --occlusion-aware (there is nothing to "
+              "draw without the detector) — DISABLED")
     if dynamic_viz and not DYNAMIC_AVOID:
         print("[Controller] --dynamic-viz needs --dynamic-obstacles (there is nothing to "
               "draw without the detector) — DISABLED")
@@ -836,6 +846,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                     _s = _s.copy()
                     _s[:, 1, :] = _s[:, 0, :]
                 OCC_SEGS_NOW = _s
+                if OCC_PUB is not None:
+                    # The RAW per-scan detections, not the tracked set: this overlay is
+                    # here to show what the jump test found on this scan.
+                    OCC_PUB.publish(_raw, V_TARGET, D_SAFE_HARD, OCC_T_GROW_MAX)
             else:
                 OCC_SEGS_NOW = None
 
@@ -856,27 +870,22 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 DYN_DBG = (DYN_CL_N, DYN_TRACKER.n_tracks,
                            0 if DYN_NOW is None else len(DYN_NOW),
                            max(_sp) if _sp else 0.0)
-
-                if ep_steps % 10 == 1:
-                    print(f"[DEBUG dyn] cl={DYN_DBG[0]} trk={DYN_DBG[1]} dyn={DYN_DBG[2]} "
-                          f"used={0 if DYN_USED is None else len(DYN_USED)} "
-                          f"v_max={DYN_DBG[3]:.1f}m/s (v_min={DYN_V_MIN:.1f})")
   
-                    if DYN_NOW is not None and len(DYN_NOW):
-                        _vv = DYN_TRACKER.velocities()
-                        _sg = DYN_TRACKER.vel_sigma()
-                        _order = np.argsort(np.hypot(DYN_NOW[:, 0] - s[0],
-                                                     DYN_NOW[:, 1] - s[1]))
-                        for _rank, _i in enumerate(_order[:5]):
-                            _c0, _c1, _r, _age = DYN_NOW[_i]
-                            _d = float(np.hypot(_c0 - s[0], _c1 - s[1]))
-                            _mark = "<-USED" if _rank < (0 if DYN_USED is None
-                                                         else len(DYN_USED)) else ""
-                            print(f"           #{_rank} @({_c0:7.1f},{_c1:7.1f}) "
-                                  f"r={_r:5.1f} d_ego={_d:6.1f} "
-                                  f"v=({_vv[_i][0]:5.1f},{_vv[_i][1]:5.1f}) "
-                                  f"|v|={np.hypot(*_vv[_i]):4.1f}+-{_sg[_i]:4.1f} "
-                                  f"age={_age:4.1f} {_mark}")
+                if DYN_NOW is not None and len(DYN_NOW):
+                    _vv = DYN_TRACKER.velocities()
+                    _sg = DYN_TRACKER.vel_sigma()
+                    _order = np.argsort(np.hypot(DYN_NOW[:, 0] - s[0],
+                                                    DYN_NOW[:, 1] - s[1]))
+                    for _rank, _i in enumerate(_order[:5]):
+                        _c0, _c1, _r, _age = DYN_NOW[_i]
+                        _d = float(np.hypot(_c0 - s[0], _c1 - s[1]))
+                        _mark = "<-USED" if _rank < (0 if DYN_USED is None
+                                                        else len(DYN_USED)) else ""
+                        print(f"           #{_rank} @({_c0:7.1f},{_c1:7.1f}) "
+                                f"r={_r:5.1f} d_ego={_d:6.1f} "
+                                f"v=({_vv[_i][0]:5.1f},{_vv[_i][1]:5.1f}) "
+                                f"|v|={np.hypot(*_vv[_i]):4.1f}+-{_sg[_i]:4.1f} "
+                                f"age={_age:4.1f} {_mark}")
             else:
                 DYN_NOW = None
         u_nom, mean = mppi(s, mean, goal_xy, u_prev)
@@ -924,9 +933,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 surf = np.hypot(w0 - s[0], w1 - s[1]) - wr          # clearance to surface
                 k = int(np.argmin(surf))
                 d_field = LIDAR_COSTMAP.distance(np.array([s[0]]), np.array([s[1]]))[0]
-                print(f"[CHK] ego=({s[0]:.1f},{s[1]:.1f})  nearest circle=({w0[k]:.1f},{w1[k]:.1f}"
-                      f",r={wr[k]:.1f}) d_field={d_field:.1f}")
-
 
         # Advance Pythos with the canvas sized to the data aspen-side kinematic state to match what Unity will compute
         v = s[3]
@@ -972,6 +978,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         pass
     if DYN_PUB is not None:
         DYN_PUB.shutdown()
+    if OCC_PUB is not None:
+        OCC_PUB.shutdown()
 
     verdict = "collision" if collided else ("reached" if reached else "timeout")
 
@@ -1059,6 +1067,13 @@ if __name__ == "__main__":
                         "them in the Unity Scene view. The model parameters ride along in the "
                         "message, so the drawn circle is the one the planner used — no Unity-"
                         "side constants to keep in sync. Requires --dynamic-obstacles.")
+    p.add_argument("--occlusion-viz", action="store_true",
+                   help="Publish the boundary segments this scan detected on "
+                        "/occlusion_segments (std_msgs/Float32MultiArray) so "
+                        "OcclusionSegmentVisualizer.cs can draw them in the Unity Scene "
+                        "view. Shows the PYTHON detector's output, unlike "
+                        "PhantomAgentVisualizer which draws Unity's own edge pass. "
+                        "Requires --occlusion-aware.")
     p.add_argument("--save-traj", default=None, metavar="DIR",
                    help="Save the run's ego trajectory as CSV + a top-down PNG plot into DIR.")
     p.add_argument("--plot-solve-t", type=float, default=None, metavar="SEC",
@@ -1087,6 +1102,7 @@ if __name__ == "__main__":
         occlusion_aware=args.occlusion_aware,
         dynamic_obstacles=args.dynamic_obstacles,
         dynamic_viz=args.dynamic_viz,
+        occlusion_viz=args.occlusion_viz,
         show_occlusion_plot=not args.no_occlusion_plot,
         save_traj=args.save_traj,
         plot_solve_t=args.plot_solve_t)

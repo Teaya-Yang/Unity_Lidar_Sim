@@ -3,6 +3,14 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+try:
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import Float32MultiArray, MultiArrayDimension
+    _HAS_RCLPY = True
+except ImportError:
+    _HAS_RCLPY = False
+
 
 def scan_shape(fov_h: float, fov_v: float, res_h: float, res_v: float) -> Tuple[int, int]:
     """Beam-grid dimensions, mirroring LaserSensor3D's constructor arithmetic
@@ -115,7 +123,7 @@ def segments_from_ordered_cloud(
     max_range: float,
     ego_xy: Tuple[float, float],
     grazing_deg: float = 1.0,
-    min_jump: float = 2.0,
+    min_jump: float = 30.0,
     sigma: float = 0.0,
     wraps: bool = True,
     merge_radius: float = 10,
@@ -170,9 +178,15 @@ def segments_from_ordered_cloud(
     n_h, n_v, _ = xyz.shape
     j = n_v // 2 if elev_row is None else int(np.clip(elev_row, 0, n_v - 1))
 
+    #print(xyz[0].shape) # (360, 46, 3) shape of the point cloud 46 are the number of beams (circles)
     # ROS (x, y) -> world-aligned (a0, a1), the same mapping ObstacleCircles._build_circles uses.
+    # Note: points are nan if no returned is got
+    
+    # Get the beam j and first point
     a0 = xyz[:, j, 0].astype(np.float64)
+    # Get the beam j and the second point
     a1 = -xyz[:, j, 1].astype(np.float64)
+    # Euclidean distance from the two points
     rng = np.hypot(a0, a1)
 
     # A non-return reached max range without hitting anything: a real edge when its
@@ -181,7 +195,12 @@ def segments_from_ordered_cloud(
     if miss.any():
         # Rebuild the missing beams' direction from their azimuth index so the endpoint
         # is still well defined at max range.
+        # n_h orizontal fov
         az = np.deg2rad(-0.5 * n_h * res_h + np.arange(n_h) * res_h)
+        if ego_fwd is not None:
+            _f = np.asarray(ego_fwd, float)
+            if float(np.linalg.norm(_f)) > 1e-9:
+                az = az + math.atan2(_f[1], _f[0])
         a0 = np.where(miss, np.cos(az) * max_range, a0)
         a1 = np.where(miss, np.sin(az) * max_range, a1)
         rng = np.where(miss, max_range, rng)
@@ -191,129 +210,146 @@ def segments_from_ordered_cloud(
     cur = idx if wraps else idx[:-1]
 
     rA, rB = rng[cur], rng[nxt]
-    near = np.minimum(rA, rB)
+    near = np.where(rA <= rB, rA, rB)
     delta = np.abs(rA - rB)
 
     # A continuous surface at range r spans r*dtheta/tan(grazing) between adjacent
     # beams; a larger step is a genuine depth discontinuity. Scaling with range keeps
     # the test valid at distance, where the same physical gap subtends fewer beams.
-    thresh = np.maximum(near * math.radians(res_h) / math.tan(math.radians(grazing_deg))
-                        + 3.0 * sigma, min_jump)
+    # thresh = np.maximum(near * math.radians(res_h) / math.tan(math.radians(grazing_deg))
+    #                     + 3.0 * sigma, min_jump)
 
+    thresh = min_jump
     # The absolute-step test flags every large Δr, INCLUDING a wall seen edge-on; the
     # Cartesian line-fit test below (in the per-candidate loop) then rejects the grazing
     # surfaces, which need the beam geometry that only survives to that loop.
-    detect = delta > thresh
-    
-    if min_far_run and min_far_run > 1:
-        # Past a genuine corner the escaping beams keep flying; past a dropout the surface
-        # comes straight back. Require the far side to hold for min_far_run beams.
-        persist = np.ones(len(cur), dtype=bool)
-        far_side = np.maximum(rA, rB)
-        for m in range(1, min_far_run):
-            # Beams beyond the jump, on whichever side is the far one.
-            ahead = np.where(rB >= rA, rng[(nxt + m) % n_h], rng[(cur - m) % n_h])
-            persist &= ahead > (near + 0.5 * (far_side - near))
-        detect = detect & persist
+    detect = delta > 100
+    # if min_far_run and min_far_run > 1:
+    #     # Past a genuine corner the escaping beams keep flying; past a dropout the surface
+    #     # comes straight back. Require the far side to hold for min_far_run beams.
+    #     persist = np.ones(len(cur), dtype=bool)
+    #     far_side = np.maximum(rA, rB)
+    #     for m in range(1, min_far_run):
+    #         # Beams beyond the jump, on whichever side is the far one.
+    #         ahead = np.where(rB >= rA, rng[(nxt + m) % n_h], rng[(cur - m) % n_h])
+    #         persist &= ahead > (near + 0.5 * (far_side - near))
+    #     detect = detect & persist
 
-    # Drop degenerate near-sensor corners before the wedge test, for the reason above.
-    valid = detect & (near > min_corner_range)
-    if not valid.any():
+    # # Drop degenerate near-sensor corners before the wedge test, for the reason above.
+    # valid = detect & (near > min_corner_range)
+    # if not valid.any():
+    #     return None
+
+    # hit = _collapse_runs(detect, valid, -far_side, wraps)
+    # if len(hit) == 0:
+    #     return None
+
+    # # Forward wedge, as cos of the half-angle so the test is a single dot product.
+    # fwd = None
+    # if ego_fwd is not None:
+    #     f = np.asarray(ego_fwd, float)
+    #     n = float(np.linalg.norm(f))
+    #     if n > 1e-9:
+    #         fwd = f / n
+    #         cos_lim = math.cos(math.radians(float(np.clip(fwd_half_angle_deg, 0.0, 180.0))))
+
+    # use_line = bool(trend_window) and trend_window >= 2
+    # w = int(trend_window)
+    # segs = []
+    # for h in hit:
+    #     i, k = cur[h], nxt[h]
+    #     # Near endpoint = the corner; far endpoint = where the escaping beam landed.
+    #     # `near_idx` is the corner beam; the wall extends AWAY from the gap from there,
+    #     # so we walk indices backward when the near side is the earlier beam and forward
+    #     # when it is the later one.
+    #     if rng[i] <= rng[k]:
+    #         p_near = np.array([a0[i], a1[i]])
+    #         p_far = np.array([a0[k], a1[k]])
+    #         near_idx, step = i, -1
+    #     else:
+    #         p_near = np.array([a0[k], a1[k]])
+    #         p_far = np.array([a0[i], a1[i]])
+    #         near_idx, step = k, +1
+
+    #     # Grazing-surface rejection. Fit a line to the near-side wall points and drop the
+    #     # candidate if the far endpoint continues that line (a wall seen edge-on) rather
+    #     # than flying off it (a real depth break). Only trust the rejection when the wall
+    #     # points are themselves a clean line — a window straddling background gives a
+    #     # large wall_rms, so a thin genuine occluder is never suppressed.
+    #     if use_line:
+    #         offs = near_idx + step * np.arange(w)
+    #         widx = offs % n_h if wraps else np.clip(offs, 0, n_h - 1)
+    #         win = np.column_stack([a0[widx], a1[widx]])
+    #         dev, wall_rms = _wall_line_deviation(win, p_far)
+    #         if dev is not None and wall_rms <= thresh[h] and dev <= thresh[h]:
+    #             continue
+
+    #     # Drop boundaries behind the ego. Tested on the CORNER (the phantom's anchor)
+    #     # in sensor-relative coords, which are already ego-centred.
+    #     if fwd is not None:
+    #         nrm = float(np.linalg.norm(p_near))
+    #         if nrm > 1e-9 and float(p_near @ fwd) / nrm < cos_lim:
+    #             continue
+
+    #     # A beam that escaped to max range gives an unboundedly long segment; clip it
+    #     # so one open sightline can't create a capsule spanning the whole map.
+    #     v = p_far - p_near
+    #     L = float(np.linalg.norm(v))
+    #     if L > max_seg_len:
+    #         p_far = p_near + v * (max_seg_len / L)
+    #     segs.append((p_near, p_far))
+
+    # # Every jump can be filtered out (all behind the forward wedge, say), leaving
+    # # nothing to translate — np.array([]) would be 1-D and break the indexing below.
+    # if not segs:
+    #     return None
+
+    # if not merge_radius:
+    #     out = np.array([[s[0], s[1]] for s in segs])
+    # else:
+    #     # Collapse segments whose corners coincide — a single physical edge fires on
+    #     # several adjacent beams and would otherwise seed a cluster of near-identical
+    #     # capsules, all constraining the same geometry.
+    #     # Of the duplicates the SHORTEST sightline wins, not the first in beam order:
+    #     # a corner that fires on several beams lands its far endpoint anywhere from the
+    #     # first surface behind the gap out to max_range, and the shortest one is where
+    #     # the returns actually say the gap ends. Keeping it is the conservative choice —
+    #     # a longer segment dilates into a capsule covering ground that is visibly free,
+    #     # and beam order is arbitrary with respect to which of the two is which.
+    #     kept = []
+    #     for p_near, p_far in segs:
+    #         L = float(np.hypot(*(p_far - p_near)))
+    #         for qi, (q_near, _q_far, q_L) in enumerate(kept):
+    #             if np.hypot(*(p_near - q_near)) < merge_radius:
+    #                 if L < q_L:
+    #                     kept[qi] = (p_near, p_far, L)
+    #                 break
+    #         else:
+    #             kept.append((p_near, p_far, L))
+    #     if not kept:
+    #         return None
+    #     out = np.array([[s[0], s[1]] for s in kept])
+
+    # list of 360 per one beam detect, 
+    h = np.where(detect)[0]
+    if not len(h):  
         return None
-
-    hit = _collapse_runs(detect, valid, -far_side, wraps)
-    if len(hit) == 0:
-        return None
-
-    # Forward wedge, as cos of the half-angle so the test is a single dot product.
-    fwd = None
-    if ego_fwd is not None:
-        f = np.asarray(ego_fwd, float)
-        n = float(np.linalg.norm(f))
-        if n > 1e-9:
-            fwd = f / n
-            cos_lim = math.cos(math.radians(float(np.clip(fwd_half_angle_deg, 0.0, 180.0))))
-
-    use_line = bool(trend_window) and trend_window >= 2
-    w = int(trend_window)
-    segs = []
-    for h in hit:
-        i, k = cur[h], nxt[h]
-        # Near endpoint = the corner; far endpoint = where the escaping beam landed.
-        # `near_idx` is the corner beam; the wall extends AWAY from the gap from there,
-        # so we walk indices backward when the near side is the earlier beam and forward
-        # when it is the later one.
-        if rng[i] <= rng[k]:
-            p_near = np.array([a0[i], a1[i]])
-            p_far = np.array([a0[k], a1[k]])
-            near_idx, step = i, -1
-        else:
-            p_near = np.array([a0[k], a1[k]])
-            p_far = np.array([a0[i], a1[i]])
-            near_idx, step = k, +1
-
-        # Grazing-surface rejection. Fit a line to the near-side wall points and drop the
-        # candidate if the far endpoint continues that line (a wall seen edge-on) rather
-        # than flying off it (a real depth break). Only trust the rejection when the wall
-        # points are themselves a clean line — a window straddling background gives a
-        # large wall_rms, so a thin genuine occluder is never suppressed.
-        if use_line:
-            offs = near_idx + step * np.arange(w)
-            widx = offs % n_h if wraps else np.clip(offs, 0, n_h - 1)
-            win = np.column_stack([a0[widx], a1[widx]])
-            dev, wall_rms = _wall_line_deviation(win, p_far)
-            if dev is not None and wall_rms <= thresh[h] and dev <= thresh[h]:
-                continue
-
-        # Drop boundaries behind the ego. Tested on the CORNER (the phantom's anchor)
-        # in sensor-relative coords, which are already ego-centred.
-        if fwd is not None:
-            nrm = float(np.linalg.norm(p_near))
-            if nrm > 1e-9 and float(p_near @ fwd) / nrm < cos_lim:
-                continue
-
-        # A beam that escaped to max range gives an unboundedly long segment; clip it
-        # so one open sightline can't create a capsule spanning the whole map.
-        v = p_far - p_near
-        L = float(np.linalg.norm(v))
-        if L > max_seg_len:
-            p_far = p_near + v * (max_seg_len / L)
-        segs.append((p_near, p_far))
-
-    # Every jump can be filtered out (all behind the forward wedge, say), leaving
-    # nothing to translate — np.array([]) would be 1-D and break the indexing below.
-    if not segs:
-        return None
-
-    if not merge_radius:
-        out = np.array([[s[0], s[1]] for s in segs])
-    else:
-        # Collapse segments whose corners coincide — a single physical edge fires on
-        # several adjacent beams and would otherwise seed a cluster of near-identical
-        # capsules, all constraining the same geometry.
-        # Of the duplicates the SHORTEST sightline wins, not the first in beam order:
-        # a corner that fires on several beams lands its far endpoint anywhere from the
-        # first surface behind the gap out to max_range, and the shortest one is where
-        # the returns actually say the gap ends. Keeping it is the conservative choice —
-        # a longer segment dilates into a capsule covering ground that is visibly free,
-        # and beam order is arbitrary with respect to which of the two is which.
-        kept = []
-        for p_near, p_far in segs:
-            L = float(np.hypot(*(p_far - p_near)))
-            for qi, (q_near, _q_far, q_L) in enumerate(kept):
-                if np.hypot(*(p_near - q_near)) < merge_radius:
-                    if L < q_L:
-                        kept[qi] = (p_near, p_far, L)
-                    break
-            else:
-                kept.append((p_near, p_far, L))
-        if not kept:
-            return None
-        out = np.array([[s[0], s[1]] for s in kept])
+    i, k = cur[h], nxt[h]
+    #print(True if np.all(i, h) else False)
+    #i contains the x,y in the current position; nxt[h] returns the x,y
+    # take the nearest of the points which is the boundary
+    # shape [len(i)]
+    near_is_i = rng[i] <= rng[k]
+    #near index
+    n_idx = np.where(near_is_i, i, k)
+    f_idx = np.where(near_is_i, k, i)
+    out = np.stack([np.column_stack([a0[n_idx], a1[n_idx]]),
+                    np.column_stack([a0[f_idx], a1[f_idx]])], axis=1)
 
     # Sensor-relative -> world (pure translation; axes are world-aligned).
     out[:, :, 0] += ego_xy[0]
     out[:, :, 1] += ego_xy[1]
+    print("DETECTED", out)
     return out
 
 
@@ -419,6 +455,69 @@ def point_segment_distance_np(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> np
     t = np.clip(((p - a) @ v) / L2, 0.0, 1.0)
     proj = a + t[:, None] * v
     return np.linalg.norm(p - proj, axis=1)
+
+
+class OcclusionSegmentPublisher:
+    """Publishes THIS SCAN'S detected boundary segments for the Unity Scene view.
+
+    Topic  : /occlusion_segments   (std_msgs/Float32MultiArray)
+    Payload: [v_target, d_safe_hard, t_grow_max] ++ [a0_near, a1_near, a0_far, a1_far] * M
+
+    Same contract as DynamicClusterPublisher, and for the same reason: the model
+    parameters ride in the message so the overlay cannot drift from what the planner
+    used, unlike PhantomAgentVisualizer which re-declares them in the Inspector. That
+    matters more here — PhantomAgentVisualizer draws boundaries UNITY detected in its own
+    edge pass, which is a different detector from segments_from_ordered_cloud; this feed
+    shows the Python one, corner first.
+
+    Coordinates are controller world (a0, a1). Unity converts: a0 -> Z, a1 -> X.
+
+    A no-op when rclpy is unavailable, matching how ObstacleCircles degrades.
+    """
+
+    TOPIC = "/occlusion_segments"
+    N_PARAMS = 3        # leading floats before the segment rows
+    ROW = 4             # floats per segment row: corner (a0,a1) then far end (a0,a1)
+
+    def __init__(self, topic: str = TOPIC):
+        self.topic = topic
+        self._node = None
+        self._pub = None
+
+    def start(self) -> bool:
+        if not _HAS_RCLPY:
+            print("[OcclusionSegmentPublisher] rclpy not importable — Unity viewer feed disabled.")
+            return False
+        if not rclpy.ok():
+            rclpy.init()
+        self._node = Node("occlusion_segments_viz")
+        self._pub = self._node.create_publisher(Float32MultiArray, self.topic, 10)
+        print(f"[OcclusionSegmentPublisher] publishing boundaries on '{self.topic}'")
+        return True
+
+    def publish(self, segs: Optional[np.ndarray], v_target: float, d_safe: float,
+                t_grow_max: float) -> None:
+        """Send the CURRENT boundary set, (M,2,2) as segments_from_ordered_cloud returns.
+
+        Call every control step, including with an empty set — an empty message is what
+        clears the overlay when the boundaries are gone."""
+        if self._pub is None:
+            return
+        s = (np.zeros((0, 2, 2)) if segs is None or not len(segs)
+             else np.asarray(segs, float).reshape(-1, 2, 2))
+        msg = Float32MultiArray()
+        d0 = MultiArrayDimension(label="params", size=self.N_PARAMS, stride=self.N_PARAMS)
+        d1 = MultiArrayDimension(label="segments", size=len(s),
+                                 stride=self.ROW * max(1, len(s)))
+        msg.layout.dim = [d0, d1]
+        msg.data = [float(v_target), float(d_safe), float(t_grow_max)] + \
+                   [float(x) for x in s.reshape(-1, self.ROW).ravel()]
+        self._pub.publish(msg)
+
+    def shutdown(self) -> None:
+        if self._node is not None:
+            self._node.destroy_node()
+            self._node = self._pub = None
 
 
 class OcclusionCornerTracker:

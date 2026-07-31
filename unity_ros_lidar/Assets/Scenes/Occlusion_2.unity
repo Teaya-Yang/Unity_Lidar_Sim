@@ -1851,6 +1851,7 @@ GameObject:
   - component: {fileID: 1156722714}
   - component: {fileID: 1156722715}
   - component: {fileID: 1156722716}
+  - component: {fileID: 1156722717}
   m_Layer: 0
   m_Name: ROS Publishers
   m_TagString: Untagged
@@ -1903,7 +1904,7 @@ MonoBehaviour:
   debugRayStride: 8
   drawHitPoints: 0
   hitPointSize: 0.15
-  drawOcclusionEdges: 1
+  drawOcclusionEdges: 0
   grazingDeg: 10
   minJumpMeters: 2
   cornerMergeRadius: 1.5
@@ -2012,6 +2013,34 @@ MonoBehaviour:
   agentRoots:
   - {fileID: 1820338497}
   mergeSubColliders: 1
+--- !u!114 &1156722717
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1156722709}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 73e8b9fdbd55f19718c5a7f0723b20e5, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::OcclusionSegmentVisualizer
+  topic: /occlusion_segments
+  messageTimeout: 1
+  dt: 0.1
+  ringCount: 5
+  ringStride: 10
+  animate: 1
+  playbackSpeed: 1
+  loopPause: 0.5
+  showSegments: 1
+  showKeepOut: 1
+  cornerMarkSize: 2
+  maxDrawLength: 30
+  circleSegments: 48
+  groundY: 0.05
+  keepOutColor: {r: 1, g: 0.55, b: 0.1, a: 1}
+  segmentColor: {r: 1, g: 1, b: 1, a: 0.9}
 --- !u!1 &1179805699 stripped
 GameObject:
   m_CorrespondingSourceObject: {fileID: 5745026347857897730, guid: 2ff8c8d06f9ed614c9f3b44837944535, type: 3}
