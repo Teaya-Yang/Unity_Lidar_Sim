@@ -204,12 +204,12 @@ def segments_from_ordered_cloud(
     # Cartesian line-fit test below (in the per-candidate loop) then rejects the grazing
     # surfaces, which need the beam geometry that only survives to that loop.
     detect = delta > thresh
-
+    
     if min_far_run and min_far_run > 1:
         # Past a genuine corner the escaping beams keep flying; past a dropout the surface
         # comes straight back. Require the far side to hold for min_far_run beams.
-        far_side = np.maximum(rA, rB)
         persist = np.ones(len(cur), dtype=bool)
+        far_side = np.maximum(rA, rB)
         for m in range(1, min_far_run):
             # Beams beyond the jump, on whichever side is the far one.
             ahead = np.where(rB >= rA, rng[(nxt + m) % n_h], rng[(cur - m) % n_h])
@@ -221,13 +221,7 @@ def segments_from_ordered_cloud(
     if not valid.any():
         return None
 
-    # One physical edge straddled by several beams fires a RUN of adjacent detections.
-    # Collapse each run to its strongest beam (max delta = the deepest depth break, i.e.
-    # the beam that most nearly grazes the true corner) so the edge seeds one candidate
-    # instead of a fan of them. merge_radius later dedupes corners that survive as
-    # separate runs; this handles the contiguous case, where the intermediate beams are
-    # not a second edge but the same one sampled off-peak.
-    hit = _collapse_runs(detect, valid, delta, wraps)
+    hit = _collapse_runs(detect, valid, -far_side, wraps)
     if len(hit) == 0:
         return None
 
@@ -297,11 +291,22 @@ def segments_from_ordered_cloud(
         # Collapse segments whose corners coincide — a single physical edge fires on
         # several adjacent beams and would otherwise seed a cluster of near-identical
         # capsules, all constraining the same geometry.
+        # Of the duplicates the SHORTEST sightline wins, not the first in beam order:
+        # a corner that fires on several beams lands its far endpoint anywhere from the
+        # first surface behind the gap out to max_range, and the shortest one is where
+        # the returns actually say the gap ends. Keeping it is the conservative choice —
+        # a longer segment dilates into a capsule covering ground that is visibly free,
+        # and beam order is arbitrary with respect to which of the two is which.
         kept = []
         for p_near, p_far in segs:
-            if any(np.hypot(*(p_near - q[0])) < merge_radius for q in kept):
-                continue
-            kept.append((p_near, p_far))
+            L = float(np.hypot(*(p_far - p_near)))
+            for qi, (q_near, _q_far, q_L) in enumerate(kept):
+                if np.hypot(*(p_near - q_near)) < merge_radius:
+                    if L < q_L:
+                        kept[qi] = (p_near, p_far, L)
+                    break
+            else:
+                kept.append((p_near, p_far, L))
         if not kept:
             return None
         out = np.array([[s[0], s[1]] for s in kept])
@@ -499,30 +504,6 @@ class OcclusionCornerTracker:
     def n_tracks(self) -> int:
         return len(self._tracks)
 
-
-# ── Canonical occlusion stage cost ────────────────────────────────────────────
-# ONE definition of the occlusion-aware stage cost, so the MPPI and MPC controllers
-# cannot drift apart. MPPI calls occlusion_stage_cost() directly on its rollout arrays;
-# the MPC calls the SAME function with CasADi primitives (it needs differentiable
-# fmax/sqrt for IPOPT), so there is no second transcription to keep in sync.
-#
-#   r_keep = d_safe + v_target · min(t_k, t_grow_max)   expanding hard keep-out
-#   cost   = w_obs · max(0, r_keep − d)²                 single one-sided quadratic
-#
-# THE GROWTH IS CAPPED. Uncapped, r_grow = v_target·t_k reaches v_target·T_horizon
-# (8 m/s × 6 s = 48 m) by the end of the horizon, so EVERY rollout starting within
-# ~51 m of a boundary violates at some late stage no matter what it does — the batch
-# is uniformly infeasible, the controller brakes, the state does not change, and the
-# next solve repeats it. Capping the expansion at t_grow_max seconds bounds the bubble
-# at d_safe + v_target·t_grow_max. Justification: the planner re-solves every DT with
-# a fresh scan, so a phantom extrapolated many seconds ahead on zero evidence is
-# fiction, and treating it as a hard constraint freezes the ego for nothing.
-#
-# w_obs is the HARD-CONSTRAINT weight (W_HARD): large enough that any breach of the
-# keep-out dominates every other term in the objective, so the penalty behaves as a
-# constraint rather than a trade-off. There is no separate soft influence ring and no
-# goal fade — one radius, one weight, shared with the static-surface keep-out.
-
 def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=None, clip=None,
                          w_sight=None, a_brake=None, v_floor=None, cost_current = None, dyn = False, action = None,
                          t_grow_max=None, w_soft=None, d_infl=None):
@@ -561,9 +542,9 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
         margin = fmax(0.0, (r_keep + d_infl) - d)
         cost = cost + w_soft * margin * margin
 
-    if not dyn:
-        print(f"TIMESTAMP_occlussion: {t_k} -> r_grow : {r_grow}, distance from occlussion : {d}, total distance to keep : {r_keep} , current min cost: {np.min(cost_current)}, current_actions: {action[np.argmin(cost_current)]}")
-    else:
-        print(f"TIMESTAMP_dynamic: {t_k} -> r_grow : {r_grow}, distance from dyn : {d}, total distance to keep : {r_keep} , current min cost: {np.min(cost_current)}")
+    # if not dyn:
+    #     print(f"TIMESTAMP_occlussion: {t_k} -> r_grow : {r_grow}, distance from occlussion : {d}, total distance to keep : {r_keep} , current min cost: {np.min(cost_current)}, current_actions: {action[np.argmin(cost_current)]}")
+    # else:
+    #     print(f"TIMESTAMP_dynamic: {t_k} -> r_grow : {r_grow}, distance from dyn : {d}, total distance to keep : {r_keep} , current min cost: {np.min(cost_current)}")
 
     return cost

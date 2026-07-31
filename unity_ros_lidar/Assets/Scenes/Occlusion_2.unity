@@ -2008,10 +2008,10 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::DynamicObstaclePublisher
   topic: /dynamic_obstacles
   rateHz: 20
-  obstacles:
-  - {fileID: 985866007}
+  obstacles: []
   agentRoots:
   - {fileID: 1820338497}
+  mergeSubColliders: 1
 --- !u!1 &1179805699 stripped
 GameObject:
   m_CorrespondingSourceObject: {fileID: 5745026347857897730, guid: 2ff8c8d06f9ed614c9f3b44837944535, type: 3}

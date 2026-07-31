@@ -39,30 +39,10 @@ Pipeline, per scan:
          so a track occluded for a second comes back where the object actually is;
        * the velocity comes out of the same recursion as the position rather than from
          a finite difference of two noisy centroids, so it is usable at all.
-  4. CLASSIFY — FREE SPACE FIRST, centroid displacement only as a fallback.
+  4. CLASSIFY — by the track's own NET DISPLACEMENT over a window.
 
-     THE PRIMARY TEST IS "IS THE PLACE IT USED TO BE NOW EMPTY?" (free_space.py). Each
-     track's past position is projected into the current scan's beam grid; if the beams
-     reach PAST it, the body vacated that space and the track is dynamic — one scan, no
-     window, no confirmation count. If a beam still terminates there, it is static, and
-     that verdict VETOES the displacement test below. Only when free space is
-     INCONCLUSIVE (the spot is occluded by something else, or outside the FOV, or the
-     track is too young to have a probe) does the displacement test decide.
-
-     That ordering is the fix for two failures that the displacement test cannot escape
-     by tuning, because they are the same trade-off seen from both ends:
-       * it FALSE-POSITIVES on scenery. A long wall re-segments into different fragments
-         every scan; each is small (small extent threshold) with a centroid that slides
-         metres along the wall. Measured: a terminal face took cl 3 -> 21, dyn -> 19,
-         with reported speeds shadowing the EGO's own speed.
-       * it DETECTS REAL MOVERS LATE — a closed 2 s window, scan-aligned, plus min_hits.
-     Lowering extent_frac trades the second against the first. Free space is not on that
-     curve at all: a static body's beams stop on it however far its visible-face centroid
-     wanders, so the test does not care about segmentation stability or centroids.
-
-     The fallback test: a track is DYNAMIC when its NET displacement over a window of
-     `dyn_window` seconds exceeds both `v_min * window` and a fraction of the cluster's
-     own extent.
+     A track is DYNAMIC when its NET displacement over a window of `dyn_window` seconds
+     exceeds both `v_min * window` and a fraction of the cluster's own extent.
 
      THE EXTENT TERM IS THE IMPORTANT ONE, and instantaneous speed alone is not enough.
      A parked vehicle's centroid is the centroid of its VISIBLE FACE, and that face
@@ -74,21 +54,18 @@ Pipeline, per scan:
      genuine mover translates its whole footprint and leaves it. So the test is net
      displacement against the body's own size, not speed against a speed.
 
-     The cost of that is a DETECTION FLOOR: the slowest reliably detectable speed is
-     about extent_frac * r_cluster / dyn_window (~2 m/s for a 3.5 m body, ~3 m/s for a
-     5 m one, at the defaults). Slower movers are classified static. This is a real
-     limit of centroid-only tracking rather than a tuning failure — over one window a
-     slow mover and a drifting visible face produce the same centroid signal, so no
-     threshold on this observable separates them. That is precisely why the free-space
-     test above was added and put FIRST; this floor now only applies where free space
-     could not resolve the track.
-
-     Free space has a slow-end limit of its own, but a milder and differently-shaped
-     one: the body must clear its own footprint before a beam can pass through where it
-     was, i.e. roughly r_cluster / fs_probe_age. Crucially, raising fs_probe_age to lower
-     that floor costs no false positives (a static body never vacates, however long you
-     watch), whereas lowering extent_frac to lower the centroid floor buys false
-     positives directly.
+     THE KNOWN LIMITS OF THIS TEST, since it is now the only one:
+       * a DETECTION FLOOR. The slowest reliably detectable speed is about
+         extent_frac * r_cluster / dyn_window (~2 m/s for a 3.5 m body, ~3 m/s for a
+         5 m one, at the defaults). Slower movers are classified static — over one
+         window a slow mover and a drifting visible face produce the same centroid
+         signal, so no threshold on this observable separates them.
+       * FALSE POSITIVES ON RE-SEGMENTING SCENERY. A long wall breaks into different
+         fragments every scan; each is small enough to pass the extent test with a
+         centroid that slides metres along the wall. resegment_ratio is the only guard,
+         and it compares a track against its own history rather than against the scan.
+     Lowering extent_frac trades the first against the second; there is no setting that
+     escapes both.
 
 The keep-out itself is NOT built here — the planner applies
 occlusion_capsules.occlusion_stage_cost() to the tracks this module returns, with
@@ -234,28 +211,7 @@ class DynamicClusterTracker:
                  require_motion: bool = True, dyn_window: float = 2.0,
                  extent_frac: float = 1.2, resegment_ratio: float = 1.5,
                  q_accel: float = 2.0, r_frac: float = 0.5, r_min: float = 0.5,
-                 sigma_v0: float = 5.0, extent_alpha: float = 0.5,
-                 fs_probe_age: float = 2.5, fs_hold: float = 3.0,
-                 fs_trust: float = 3.0):
-        # ── Free-space (ray-through) evidence — see free_space.py ─────────────
-        self.fs_probe_age = float(fs_probe_age)  # [s] how far back the probed position may be.
-                                                 #   The OLDEST position inside this window is
-                                                 #   probed, because the older it is the further
-                                                 #   the body has moved off it and the sooner the
-                                                 #   spot reads empty. This is what sets the SLOW
-                                                 #   end of detection: a body of radius r must
-                                                 #   clear its own footprint, i.e. ~r/fs_probe_age
-                                                 #   m/s. Unlike the centroid test's floor, though,
-                                                 #   raising this costs no false positives.
-        self.fs_hold = float(fs_hold)      # [s] how long a MOVED verdict keeps a track dynamic
-                                           #   without fresh confirmation. Covers the object
-                                           #   being briefly occluded mid-manoeuvre.
-        self.fs_trust = float(fs_trust)    # [s] how long a CONCLUSIVE verdict overrides the
-                                           #   centroid test. Inside this, free space decides and
-                                           #   displacement is ignored — that is the whole point:
-                                           #   the displacement test is what false-positives on
-                                           #   re-segmenting scenery, so an OCCUPIED verdict must
-                                           #   be able to veto it, not merely fail to agree.
+                 sigma_v0: float = 5.0, extent_alpha: float = 0.5):
         self.assoc_radius = float(assoc_radius)
         self.q_accel = float(q_accel)      # [m/s^2] 1-sigma process accel. Sets how fast the
                                            #   filter is allowed to change its mind: too low and
@@ -368,14 +324,7 @@ class DynamicClusterTracker:
                 "x": np.array([meas[0], meas[1], 0.0, 0.0]), "P": P, "t": now,
                 "r": float(r),
                 "anchor": meas.copy(), "anchor_t": now, "anchor_r": float(r),
-                "last_seen": now, "hits": 1, "dyn_hits": 0,
-                # Free-space state. `hist` is the trail of past positions the ray-through
-                # test probes; fs_t stamps the last CONCLUSIVE verdict (either way), which
-                # is what gates whether free space or the centroid test decides.
-                # Empty: the seed position has not been verified occupied yet. update()
-                # appends it at the end of this scan only if the range image agrees.
-                "hist": [],
-                "fs_state": 0, "fs_t": -1e9, "fs_moved_t": -1e9}
+                "last_seen": now, "hits": 1, "dyn_hits": 0}
 
     def predict_to(self, now: float) -> None:
         """Advance every track to `now` and expire the stale ones, WITHOUT fusing any
@@ -391,55 +340,7 @@ class DynamicClusterTracker:
             self._predict(tr, now)
         self._tracks = [t for t in self._tracks if (now - t["last_seen"]) <= self.ttl]
 
-    def _free_space_pass(self, checker, now: float) -> None:
-        """Ask the range image whether each track's PAST position is now empty.
-
-        PROBES THE TRAIL, NOT THE CURRENT ESTIMATE. Probing where the filter thinks the
-        object is now would be self-defeating — for a genuine mover that spot is occupied
-        by the mover itself, so it would answer OCCUPIED forever. The question is only
-        meaningful about a place the object has had TIME TO LEAVE, so the oldest position
-        within fs_probe_age is used: the further back it is, the further the body has
-        translated off it, and the cleaner the verdict.
-        """
-        if checker is None or not getattr(checker, "ready", False):
-            return
-        from free_space import MOVED, OCCUPIED, INCONCLUSIVE
-        for tr in self._tracks:
-            hist = tr["hist"]
-            # Oldest sample still inside the window; None if the track is too young to
-            # have a probe that means anything yet.
-            probe = next(((t, p, r) for (t, p, r) in hist
-                          if (now - t) >= 1e-3 and (now - t) <= self.fs_probe_age), None)
-            if probe is None:
-                continue
-            v = checker.verdict(probe[1], probe[2])
-            if v == INCONCLUSIVE:
-                continue                    # unobserved: keep whatever we believed
-
-            if v == OCCUPIED:
-                # AN "OCCUPIED" READING IS ONLY INFORMATIVE IF THE BODY SHOULD HAVE
-                # CLEARED THE PROBE BY NOW. Free space has a floor: an object must
-                # translate past its own footprint before any beam can pass through
-                # where it was, so a genuinely-moving but SLOW body still reads OCCUPIED.
-                # Letting that veto the displacement test made slow movers detected LATER
-                # than under the old detector (measured: a 3 m/s mover went from scan 2 to
-                # scan 8) — the veto was suppressing the one test that could still see it.
-                #
-                # So veto only on a CONTRADICTION: the filter claims the body travelled
-                # far enough to have vacated the probe, and the beams say it is still
-                # there. That is the scenery signature exactly — a re-segmenting wall
-                # fragment reports a large bogus displacement while never actually moving.
-                # Below that distance the two tests do not disagree, so free space stays
-                # silent and the displacement test decides on its own.
-                disp = float(np.hypot(*(tr["x"][:2] - probe[1])))
-                if disp <= probe[2] + getattr(checker, "slack", 2.0):
-                    continue
-            tr["fs_state"] = v
-            tr["fs_t"] = now
-            if v == MOVED:
-                tr["fs_moved_t"] = now
-
-    def update(self, clusters: Optional[np.ndarray], now: float, checker=None) -> None:
+    def update(self, clusters: Optional[np.ndarray], now: float) -> None:
         """Fold ONE SCAN's clusters into the tracks. clusters: (M,4) from cluster_points.
 
         CALL THIS ONCE PER SCAN, NOT ONCE PER CONTROL STEP. The cloud arrives at ~1 Hz
@@ -457,11 +358,6 @@ class DynamicClusterTracker:
         velocity with a growing P, so it is where the object is (not where it was last
         seen) and it is available for association again next scan.
         """
-        # Free space FIRST, against the trail — before this scan's measurement is fused,
-        # so the verdict is about the scan as it arrived rather than about a state the
-        # same scan has already moved.
-        self._free_space_pass(checker, now)
-
         self.predict_to(now)
 
         if clusters is not None and len(clusters):
@@ -500,29 +396,6 @@ class DynamicClusterTracker:
                 tr["last_seen"] = now
                 tr["hits"] += 1
                 self._classify(tr, now)
-
-        # Extend each track's trail with where it now believes it is, and forget samples
-        # older than the probe window (plus a scan of slack, so the oldest usable sample
-        # is never dropped by the same call that would have probed it).
-        #
-        # ONLY VERIFIED-OCCUPIED POSITIONS BECOME PROBES. A probe is only meaningful if
-        # the body was actually THERE when the sample was taken, and a centroid is not a
-        # guarantee of that: when the clusterer splits an object (or merges two), the
-        # centroid of the resulting component can land in the gap BETWEEN the faces —
-        # empty space. Probing that later reads "vacated" and manufactures a MOVED
-        # verdict on perfectly static scenery. Confirming the spot is occupied in the
-        # scan the sample comes from removes that class of false positive entirely,
-        # at the cost of one extra range-image query per track per scan.
-        fs_ok = checker is not None and getattr(checker, "ready", False)
-        for tr in self._tracks:
-            if not fs_ok:
-                tr["hist"].append((now, tr["x"][:2].copy(), tr["r"]))
-            else:
-                from free_space import OCCUPIED
-                if checker.verdict(tr["x"][:2], tr["r"]) == OCCUPIED:
-                    tr["hist"].append((now, tr["x"][:2].copy(), tr["r"]))
-            cutoff = now - (self.fs_probe_age + 1.5)
-            tr["hist"] = [h for h in tr["hist"] if h[0] >= cutoff]
 
         self._tracks = [t for t in self._tracks if (now - t["last_seen"]) <= self.ttl]
 
@@ -588,18 +461,7 @@ class DynamicClusterTracker:
         """Is this track usable as a dynamic obstacle? ONE definition, so dynamic(), ids()
         and speeds() cannot disagree about which rows they are describing.
 
-        A THREE-LEVEL DECISION, free space first:
-
-          1. A MOVED verdict within fs_hold  -> DYNAMIC. One ray through the space the
-             body used to fill is proof it left; no window, no confirmation count, so
-             this is the low-latency path.
-          2. Any CONCLUSIVE verdict within fs_trust -> that verdict DECIDES, which means
-             an OCCUPIED reading actively VETOES the centroid test. This is the direction
-             that matters for false positives: a re-segmenting wall fragment produces a
-             large bogus centroid displacement every scan, and the only thing that stops
-             it becoming a keep-out is free space being allowed to overrule it.
-          3. Otherwise (the object is unobserved, or too young to probe) fall back to the
-             displacement test, which is all the information there is in that case.
+        The decision is the displacement test's, via dyn_hits.
 
         dyn_hits is a COUNTDOWN, not a tally: _classify sets it to min_dyn_hits the moment
         a window shows motion and decrements it on each still window, so any value above
@@ -609,11 +471,6 @@ class DynamicClusterTracker:
             return False
         if not self.require_motion:
             return True
-        now = self._now
-        if (now - tr["fs_moved_t"]) <= self.fs_hold:
-            return True
-        if (now - tr["fs_t"]) <= self.fs_trust:
-            return False        # conclusive and NOT moved -> static, whatever the centroid did
         return tr["dyn_hits"] > 0
 
     def dynamic(self, now: float) -> Optional[np.ndarray]:
@@ -662,39 +519,6 @@ class DynamicClusterTracker:
         tracks carry sigma_v0 here by construction and mean nothing yet."""
         return [float(np.sqrt(max(t["P"][2, 2], t["P"][3, 3])))
                 for t in self._tracks if self._confirmed(t)]
-
-    def fs_counts(self) -> Tuple[int, int, int]:
-        """(moved, occupied, inconclusive) over ALL live tracks at the last scan — the
-        health check for the free-space detector. `moved + occupied` near zero means the
-        range image is not resolving anything (wrong scan geometry, or every track beyond
-        the beams' reach), and the classification has silently fallen back to the centroid
-        test everywhere."""
-        now = self._now
-        moved = occ = 0
-        for t in self._tracks:
-            if t["fs_t"] < 0 or (now - t["fs_t"]) > self.fs_trust:
-                continue
-            if t["fs_state"] > 0:
-                moved += 1
-            elif t["fs_state"] < 0:
-                occ += 1
-        return moved, occ, max(0, len(self._tracks) - moved - occ)
-
-    def fs_labels(self) -> List[str]:
-        """Per-track free-space label aligned with dynamic()'s rows: MOV / OCC / -- ,
-        where -- means no conclusive verdict is in force and the centroid test decided."""
-        now = self._now
-        out = []
-        for t in self._tracks:
-            if not self._confirmed(t):
-                continue
-            if (now - t["fs_moved_t"]) <= self.fs_hold:
-                out.append("MOV")
-            elif t["fs_t"] >= 0 and (now - t["fs_t"]) <= self.fs_trust:
-                out.append("OCC")
-            else:
-                out.append("--")
-        return out
 
     @property
     def n_tracks(self) -> int:

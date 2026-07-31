@@ -249,7 +249,7 @@ class ObstacleCircles:
 
     def ordered_cloud(self) -> Tuple[Optional[np.ndarray], Optional[Tuple[float, float]]]:
         """((n_h, n_v, 3) sensor-frame ordered cloud with NaN preserved, sensor world
-        (a0, a1)) — the raw range image, for free_space.FreeSpaceChecker.
+        (a0, a1)) — the raw range image.
 
         Returns (None, None) unless configure_scan() was called and a cloud has arrived.
         Non-returns MUST stay NaN here: to the free-space test they are the strongest

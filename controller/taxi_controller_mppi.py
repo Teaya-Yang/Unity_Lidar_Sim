@@ -123,14 +123,6 @@ DYN_R_FRAC     = CFG["dynamic_clusters"]["r_frac"]
 DYN_R_MIN      = CFG["dynamic_clusters"]["r_min"]
 DYN_SIGMA_V0   = CFG["dynamic_clusters"]["sigma_v0"]
 DYN_EXT_ALPHA  = CFG["dynamic_clusters"]["extent_alpha"]
-FS_ENABLED     = CFG["dynamic_clusters"]["fs_enabled"]
-FS_PROBE_AGE   = CFG["dynamic_clusters"]["fs_probe_age"]
-FS_HOLD        = CFG["dynamic_clusters"]["fs_hold"]
-FS_TRUST       = CFG["dynamic_clusters"]["fs_trust"]
-FS_SLACK       = CFG["dynamic_clusters"]["fs_slack"]
-FS_MIN_THROUGH = CFG["dynamic_clusters"]["fs_min_through"]
-FS_CORE_FRAC   = CFG["dynamic_clusters"]["fs_core_frac"]
-FS_ELEV_BAND   = CFG["dynamic_clusters"]["fs_elev_halfband"]
 DYN_TTL        = CFG["dynamic_clusters"]["ttl"]
 DYN_MIN_HITS   = CFG["dynamic_clusters"]["min_hits"]
 DYN_V_MIN      = CFG["dynamic_clusters"]["v_min"]
@@ -156,8 +148,6 @@ DYN_DBG        = None    # (n_clusters, n_tracks, n_dynamic, max_speed) from the
 DYN_LAST_STAMP = None    # ObstacleCircles.stamp of the scan last FUSED into the tracker.
                          #   Gates the Kalman correction to once per scan; see the control loop.
 DYN_CL_N       = 0       # cluster count from that scan, carried across predict-only steps
-FS_CHECKER     = None    # free_space.FreeSpaceChecker, created in run()
-FS_DBG         = (0, 0, 0)   # (n_moved, n_occupied, n_inconclusive) from the last scan
 DYN_PUB        = None    # DynamicClusterPublisher — feeds DynamicAgentVisualizer.cs so the
                          # Unity Scene view shows the SAME expanding circles the cost used
 VISIBILITY_COST = False   # vestigial: --visibility-cost is a documented no-op
@@ -389,8 +379,8 @@ def mppi(s0, mean, goal_xy, u_prev=None):
 
 
 
-    print("MIN_cost_trajectory: ", cost.min())
-    print("MAX_cost_trajectory: ", cost.max())
+    # print("MIN_cost_trajectory: ", cost.min())
+    # print("MAX_cost_trajectory: ", cost.max())
 
     cost += tcost.terminal_cost(st[:, 0], st[:, 1],
                                 goal_xy=(goal_fwd, goal_lat), w_goal_term=W_GOAL_TERM)
@@ -463,6 +453,18 @@ def identify_bicycle_model(env, behavior_name, n_steps=200):
 
 # ── Main control loop ─────────────────────────────────────────────────────────
 
+def _dyn_bubbles(boxes):
+    """(N,3) [c0, c1, r] keep-out seeds from the ground-truth mover boxes published on
+    /dynamic_obstacles: the box centre and the half-diagonal, so the disc encloses the
+    whole footprint whatever its yaw."""
+    b = (np.asarray(boxes, float).reshape(-1, 5)
+         if boxes is not None and len(boxes) else np.empty((0, 5)))
+    if not len(b):
+        return np.empty((0, 3))
+    r = 0.5 * np.hypot(b[:, 2], b[:, 3])
+    return np.column_stack([b[:, 0], b[:, 1], r])
+
+
 def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=None,
                      occ_frames=None, capsule_horizon=None, max_frames=6,
                      show_occlusion=True, static_boxes=None, solve_t=None, **_ignored):
@@ -512,15 +514,24 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
 
     def _tightest(fr):
         """max over the horizon of (keep-out radius − distance to the boundary): how
-        close this plan came to the expanding occlusion set. Positive ⇒ inside it."""
-        segs, plan = fr["segs"], fr["plan"]
+        close this plan came to the expanding keep-out set (occlusion capsules and/or
+        sensed movers). Positive ⇒ inside it."""
+        plan = fr["plan"]
         t = (np.arange(len(plan)) + 1) * DT
-        d = point_segments_min_distance(plan[:, 0], plan[:, 1], segs)
-        return float(np.max((D_SAFE_HARD + V_TARGET * t) - d))
+        best = -np.inf
+        if fr.get("segs") is not None and len(fr["segs"]):
+            d = point_segments_min_distance(plan[:, 0], plan[:, 1], fr["segs"])
+            best = max(best, float(np.max((D_SAFE_HARD + V_TARGET * t) - d)))
+        for c0, c1, r_c in _dyn_bubbles(fr.get("dyn_boxes")):
+            d = np.hypot(plan[:, 0] - c0, plan[:, 1] - c1)
+            best = max(best, float(np.max((D_SAFE_HARD + r_c + V_TARGET * t) - d)))
+        return best
 
-    # Prefer a solve that actually had occlusion boundaries — a frame without them has
-    # no expanding keep-out to show. Among those, the tightest one.
-    occ_ok = [f for f in frames if f.get("segs") is not None and len(f["segs"])]
+    # Prefer a solve that actually had a keep-out set — a frame without one has nothing
+    # expanding to show. Among those, the tightest one.
+    occ_ok = [f for f in frames
+              if (f.get("segs") is not None and len(f["segs"]))
+              or (f.get("dyn_boxes") is not None and len(f["dyn_boxes"]))]
     if solve_t is not None:
         fr = min(frames, key=lambda f: abs(f["t"] - solve_t))
         if abs(fr["t"] - solve_t) > DT:
@@ -532,6 +543,10 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     tk = (np.arange(len(plan)) + 1) * DT
     segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
             if fr.get("segs") is not None and len(fr["segs"]) else np.empty((0, 2, 2)))
+    # Movers as Unity publishes them on /dynamic_obstacles, at THIS solve. Each seeds an
+    # expanding CIRCLE of radius D_SAFE_HARD + r_obj + V_TARGET*t_k — the same growth law
+    # as the occlusion capsules, so they are drawn at the same sampled t_k, same colour.
+    dyn_set = _dyn_bubbles(fr.get("dyn_boxes"))
 
     fig, ax = plt.subplots(figsize=(11, 11))
 
@@ -571,6 +586,9 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     for seg in segs:
         poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD)
         ax.plot(poly[:, 0], poly[:, 1], "-", color="w", lw=1.8, alpha=0.95, zorder=1)
+    for c0, c1, r_c in dyn_set:
+        poly = capsule_polygon((c0, c1), (c0, c1), D_SAFE_HARD + r_c)
+        ax.plot(poly[:, 0], poly[:, 1], "--", color="w", lw=1.6, alpha=0.95, zorder=1)
     ax.plot(fr["ex"], fr["ey"], "o", mfc="w", mec="k", ms=6, mew=0.9, zorder=5,
             label=f"$t_k$ = 0.0 s   r = {D_SAFE_HARD:.0f} m")
 
@@ -585,12 +603,21 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
         for seg in segs:
             poly = capsule_polygon(seg[0], seg[1], r_k)
             ax.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.8, alpha=0.95, zorder=1)
+        # Same t_k, same colour, dashed: the mover keep-out grows from the object's own
+        # radius, so r = D_SAFE_HARD + r_obj + V_TARGET·t_k.
+        for c0, c1, r_c in dyn_set:
+            poly = capsule_polygon((c0, c1), (c0, c1), D_SAFE_HARD + r_c + V_TARGET * t_k)
+            ax.plot(poly[:, 0], poly[:, 1], "--", color=col, lw=1.6, alpha=0.95, zorder=1)
         ax.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=6, mew=0.9, zorder=5,
                 label=f"$t_k$ = {t_k:.1f} s   r = {r_k:.0f} m")
 
     for seg in segs:
         ax.plot(seg[:, 0], seg[:, 1], "-", color="k", lw=2.5, zorder=6)
         ax.plot(seg[0, 0], seg[0, 1], ".", color="k", ms=8, zorder=6)
+
+    for i, (c0, c1, _r) in enumerate(dyn_set):
+        ax.plot(c0, c1, "x", color="k", ms=7, mew=1.5, zorder=6,
+                label="dynamic object centre (bubble seed)" if i == 0 else None)
 
     # Zoom on the EGO's own extent (start → end) plus the plan it is executing. Static
     # obstacles and the outer keep-out capsules are deliberately left out of the bounds:
@@ -608,9 +635,11 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     ax.set_aspect("equal", adjustable="box")
     fig.set_size_inches(12.0, float(np.clip(12.0 * half_y / half_x, 4.0, 12.0)))
     ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
+    _what = " + ".join(([ "occlusion"] if len(segs) else []) +
+                       (["dynamic-obstacle"] if len(dyn_set) else []))
     ax.set_title(f"{verdict} — predicted rollout at t = {fr['t']:.1f} s with the "
-                 f"expanding occlusion keep-out per sampled $t_k$"
-                 if len(segs) else
+                 f"expanding {_what} keep-out per sampled $t_k$"
+                 if (len(segs) or len(dyn_set)) else
                  f"{verdict} — executed trajectory + predicted rollout at "
                  f"t = {fr['t']:.1f} s")
     # Legend OUTSIDE the axes: the zoomed window is short, so "best" placement lands it
@@ -622,7 +651,7 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     plt.close(fig)
     print(f"[traj] saved {stem}.csv and {stem}.png (rollout from the solve at "
           f"t={fr['t']:.1f}s, {len(set(stages.tolist()))} sampled stages, "
-          f"{len(segs)} occlusion boundaries)")
+          f"{len(segs)} occlusion boundaries, {len(dyn_set)} dynamic objects)")
 
 
 def run(unity_exec_path=None, port=5004, run_sysid=True,
@@ -636,7 +665,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW
     global DYNAMIC_AVOID, DYN_TRACKER, DYN_NOW, DYN_DBG, DYN_PUB, DYN_LAST_STAMP, DYN_CL_N
-    global FS_CHECKER, FS_DBG
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     N_SCEN          = n_scenarios
@@ -687,20 +715,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                     ttl=DYN_TTL, min_hits=DYN_MIN_HITS, v_min=DYN_V_MIN,
                     min_dyn_hits=DYN_MIN_DYN_HITS, require_motion=DYN_REQUIRE_MOTION,
                     dyn_window=DYN_WINDOW, extent_frac=DYN_EXTENT_FRAC,
-                    resegment_ratio=DYN_RESEG_RATIO,
-                    fs_probe_age=FS_PROBE_AGE, fs_hold=FS_HOLD, fs_trust=FS_TRUST)
-                if FS_ENABLED:
-                
-                    if OCCLUSION_AWARE:
-                        from free_space import FreeSpaceChecker
-                        FS_CHECKER = FreeSpaceChecker(
-                            max_range=SCAN_MAX_RANGE, slack=FS_SLACK,
-                            min_through=FS_MIN_THROUGH, core_frac=FS_CORE_FRAC,
-                            elev_halfband=FS_ELEV_BAND)
-                    else:
-                        print("[Controller] free-space detection: needs --occlusion-aware "
-                              "(it reads the same ordered cloud) — DISABLED, falling back "
-                              "to the centroid displacement test")
+                    resegment_ratio=DYN_RESEG_RATIO)
                 if dynamic_viz:
                     DYN_PUB = DynamicClusterPublisher()
                     if not DYN_PUB.start():
@@ -821,16 +836,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                     _s = _s.copy()
                     _s[:, 1, :] = _s[:, 0, :]
                 OCC_SEGS_NOW = _s
-                if ep_steps % 10 == 1:
-                    print(f"[DEBUG occ] raw={0 if _raw is None else len(_raw)} "
-                          f"trk={0 if _s is None else len(_s)} used={OCC_USED_N} "
-                          f"query_r={OCC_QUERY_R} k_occ={K_OCC} "
-                          + ("" if OCC_GATE_DBG is None else
-                             "goal_drop={}->{} (r_goal={:.1f}m, nearest boundary {:.1f}m "
-                             "from goal)".format(*OCC_GATE_DBG))
-                          + ("" if OCC_RANGE_DBG is None else
-                             "  nearest_to_ego={:.1f}m corner=({:.1f},{:.1f}) "
-                             "ego=({:.1f},{:.1f})".format(*OCC_RANGE_DBG)))
             else:
                 OCC_SEGS_NOW = None
 
@@ -841,14 +846,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                     DYN_LAST_STAMP = _stamp
                     _cl = LIDAR_COSTMAP.clusters(cell=DYN_CELL, min_points=DYN_MIN_POINTS,
                                                  max_radius=DYN_MAX_RADIUS)
-                    # Load THIS scan's range image before fusing it, so the free-space
-                    # test runs against the same scan the clusters came from.
-                    if FS_CHECKER is not None:
-                        _oxyz, _opose = LIDAR_COSTMAP.ordered_cloud()
-                        FS_CHECKER.set_scan(_oxyz, _opose if _opose is not None else (0., 0.))
-                    DYN_TRACKER.update(_cl, _now, checker=FS_CHECKER)
+                    DYN_TRACKER.update(_cl, _now)
                     DYN_CL_N = 0 if _cl is None else len(_cl)
-                    FS_DBG = DYN_TRACKER.fs_counts()
                 else:
                     DYN_TRACKER.predict_to(_now)
                 DYN_NOW = DYN_TRACKER.dynamic(_now)
@@ -861,15 +860,11 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 if ep_steps % 10 == 1:
                     print(f"[DEBUG dyn] cl={DYN_DBG[0]} trk={DYN_DBG[1]} dyn={DYN_DBG[2]} "
                           f"used={0 if DYN_USED is None else len(DYN_USED)} "
-                          f"v_max={DYN_DBG[3]:.1f}m/s (v_min={DYN_V_MIN:.1f})"
-                          + ("" if FS_CHECKER is None else
-                             f" | freespace moved={FS_DBG[0]} occupied={FS_DBG[1]} "
-                             f"inconclusive={FS_DBG[2]}"))
+                          f"v_max={DYN_DBG[3]:.1f}m/s (v_min={DYN_V_MIN:.1f})")
   
                     if DYN_NOW is not None and len(DYN_NOW):
                         _vv = DYN_TRACKER.velocities()
                         _sg = DYN_TRACKER.vel_sigma()
-                        _fs = DYN_TRACKER.fs_labels()
                         _order = np.argsort(np.hypot(DYN_NOW[:, 0] - s[0],
                                                      DYN_NOW[:, 1] - s[1]))
                         for _rank, _i in enumerate(_order[:5]):
@@ -881,7 +876,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                                   f"r={_r:5.1f} d_ego={_d:6.1f} "
                                   f"v=({_vv[_i][0]:5.1f},{_vv[_i][1]:5.1f}) "
                                   f"|v|={np.hypot(*_vv[_i]):4.1f}+-{_sg[_i]:4.1f} "
-                                  f"age={_age:4.1f} fs={_fs[_i]:>4} {_mark}")
+                                  f"age={_age:4.1f} {_mark}")
             else:
                 DYN_NOW = None
         u_nom, mean = mppi(s, mean, goal_xy, u_prev)

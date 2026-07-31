@@ -201,43 +201,6 @@ dynamic_clusters:
   extent_alpha: 0.5         # EMA on the cluster RADIUS (not part of the KF state — it is a
                             #   shape statistic with no dynamics to propagate).
 
-  # ── Free-space ("seen through") detection — THE PRIMARY MOTION TEST ──────────
-  # Projects a track's PAST position into the current scan's beam grid and asks whether
-  # the beams now reach past it. A body that vacated a space is detected in ONE scan; a
-  # static body never vacates, so it can never trigger this however much its visible-face
-  # centroid drifts. See free_space.py. The centroid/displacement settings above are now
-  # only consulted where this test is INCONCLUSIVE (occluded, outside FOV, track too new).
-  # (flattened with an fs_ prefix — the config schema is one level deep)
-  fs_enabled: true           # false ⇒ fall back to the centroid displacement test alone,
-                            #   i.e. the old behaviour. Useful to A/B the two detectors.
-  fs_probe_age: 2.5          # [s] the OLDEST trail position inside this window is the one
-                            #   probed — the further back it is, the further the body has
-                            #   moved off it and the cleaner the verdict. This sets the SLOW
-                            #   end of detection (~r_cluster / probe_age, so ~2 m/s for a
-                            #   5 m body). Raising it costs NO false positives, unlike
-                            #   lowering extent_frac, because a static body never vacates.
-                            #   It does cost memory of a manoeuvre: a body that moved and
-                            #   came back within the window reads as still there.
-  fs_hold: 3.0               # [s] a MOVED verdict keeps the track dynamic this long without
-                            #   fresh confirmation — covers the object being briefly
-                            #   occluded mid-manoeuvre. MUST exceed the ~1 s scan period.
-  fs_trust: 3.0              # [s] a CONCLUSIVE verdict overrides the centroid test for this
-                            #   long. This is what lets an OCCUPIED reading actively VETO a
-                            #   bogus centroid displacement, which is the mechanism that
-                            #   kills the re-segmenting-wall false positives. Drop it to 0
-                            #   and the two tests OR together, and the false positives come
-                            #   straight back.
-  fs_slack: 2.0              # [m] range tolerance on "the beam terminated at the body". Must
-                            #   cover voxel/cluster quantisation (cell=2.0), or a body's own
-                            #   far face reads as through and everything looks like it moved.
-  fs_min_through: 3          # beams that must see past before MOVED is declared, so a single
-                            #   stray long return is not a verdict.
-  fs_core_frac: 0.6          # sample this fraction of the body's radius — its CORE, not its
-                            #   silhouette edge. Edge beams graze and their range is unstable,
-                            #   so they manufacture "through" votes on static bodies.
-  fs_elev_halfband: 3        # beam rows either side of horizontal to test. Safe to widen
-                            #   because OCCUPIED vetoes: a row angled over a low vehicle's
-                            #   roof reads through, but any row still hitting the body wins.
   ttl: 3.0                  # [s] drop a track unseen this long. Like the occlusion tracker's,
                             #   MUST exceed the ~1 s scan period with margin.
   min_hits: 2               # confirmations before a track is usable at all
