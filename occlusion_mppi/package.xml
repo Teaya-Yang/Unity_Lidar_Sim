@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>occlusion_mppi</name>
+  <version>0.0.1</version>
+  <description>
+    Occlusion-aware MPPI for a quadrotor, driven by ROG-Map occlusion boundaries.
+    Uses the same occlusion_stage_cost as the 2D Unity taxi controller; only the
+    distance source (voxel KD-tree instead of segment capsules) and the plant
+    (double integrator instead of bicycle) differ.
+  </description>
+  <maintainer email="palladinovittorio16@gmail.com">Vittorio Palladino</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>quadrotor_msgs</depend>
+</package>

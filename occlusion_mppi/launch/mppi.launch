@@ -1,0 +1,29 @@
+<launch>
+    <!-- Occlusion-aware MPPI. Replaces keyboard_control.py as the source of
+         /planning/pos_cmd, so do NOT run both at once.
+
+         Full stack (four terminals):
+           roslaunch occlusion_boundary wall_test.launch
+           roslaunch occlusion_boundary occlusion_boundary_walltest.launch
+           roslaunch occlusion_mppi mppi.launch
+           roslaunch rog_map_example rviz.launch
+    -->
+    <node name="occlusion_mppi" pkg="occlusion_mppi" type="mppi_node.py" output="screen">
+        <rosparam param="goal">[0.0, 12.0]</rosparam>
+        <param name="cruise_z" value="1.0"/>
+        <param name="boundary_topic" value="/rm_node/occlusion_frontier"/>
+        <param name="rate" value="10.0"/>
+        <param name="samples" value="1000"/>
+        <param name="horizon" value="30"/>
+
+        <param name="d_safe" value="1.0"/>
+        <param name="v_target" value="1.5"/>
+        <param name="t_grow_max" value="3.0"/>
+        <param name="w_soft" value="50.0"/>
+        <param name="d_infl" value="1.0"/>
+
+        <param name="v_max" value="2.0"/>
+        <param name="a_max" value="3.0"/>
+        <param name="z_band" value="1.5"/>
+    </node>
+</launch>
