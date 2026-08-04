@@ -138,6 +138,7 @@ class ObstacleCircles:
             def _cloud(self, msg):
                 pts = outer._parse_cloud(msg)
                 ordered = outer._parse_ordered(msg)
+                # (360, beams, 3)
                 if pts is not None:
                     with outer._lock:
                         outer._pts = pts
@@ -309,15 +310,19 @@ class ObstacleCircles:
         minᵢ(‖p − cᵢ‖ − rᵢ). The planners then require this ≥ the robot margin
         D_SAFE_STATIC, which is exactly ‖p − cᵢ‖ ≥ D_SAFE_STATIC + rᵢ. Returns 1e6
         where there are no circles (⇒ no static penalty)."""
+        #a0 and a1 respectively coordinate both are two array of N elements. 
         w0 = np.asarray(w0, float)
         w1 = np.asarray(w1, float)
         if not self._ready or self._circles is None or not len(self._circles):
             return np.full(w0.shape, 1e6)
+        # a0 and a1 respectively of each centre of the circles shape [M]
         c0 = self._circles[:, 0]
         c1 = self._circles[:, 1]
+        # radius of all the circles shape [M]
         r = self._circles[:, 2]
         dx = w0[:, None] - c0[None, :]
         dy = w1[:, None] - c1[None, :]
+        # for each query points the distance to the boundaries of that circles
         surf = np.sqrt(dx * dx + dy * dy) - r[None, :]      # (N, M) clearance per circle
         return surf.min(axis=1)
 

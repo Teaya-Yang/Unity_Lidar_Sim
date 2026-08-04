@@ -9,9 +9,21 @@
            roslaunch rog_map_example rviz.launch
     -->
     <node name="occlusion_mppi" pkg="occlusion_mppi" type="mppi_node.py" output="screen">
-        <rosparam param="goal">[0.0, 12.0]</rosparam>
+        <rosparam param="goal">[5.0, 12.0]</rosparam>
         <param name="cruise_z" value="1.0"/>
         <param name="boundary_topic" value="/rm_node/occlusion_frontier"/>
+        <!-- Occupied (inflated) voxels. The collision term is a plain membership
+             test against these, so occ_resolution MUST match the map's
+             inflation_resolution or the test never fires. -->
+        <param name="occupancy_topic" value="/rm_node/rog_map/inf_occ"/>
+        <param name="occ_resolution" value="0.2"/>
+        <!-- Keep this tight. The scene has a ground plane and
+             virtual_ground_height marks everything below it occupied; a wide
+             band folds the floor into every column and freezes the planner. -->
+        <param name="occ_z_band" value="0.3"/>
+        <param name="w_collision" value="1e6"/>
+        <!-- Flip to false for the baseline run: collision only, no occlusion. -->
+        <param name="use_occlusion" value="true"/>
         <param name="rate" value="10.0"/>
         <param name="samples" value="1000"/>
         <param name="horizon" value="30"/>

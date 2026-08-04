@@ -282,9 +282,9 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     s0_theta = float(s0[2])              # initial heading — the straight-line lock reference
 
     # Occlusion set for this solve: the DISCRETE blind-corner boundary points (like the MPC's
-    # P_occ), taken as the NEAR endpoints (corners) of the range-jump boundary segments. Filter
-    # to within OCC_QUERY_R of the ego (== the MPC) and hold them fixed over the horizon; d_occ
-    # per rollout pose = distance to the nearest.
+    # P_occ), taken as the NEAR endpoints (corners) of the range-jump boundary segments. Every
+    # DETECTED boundary counts — no ego-range gate — capped at the K_OCC nearest and held fixed
+    # over the horizon; d_occ per rollout pose = distance to the nearest.
     occ_segs = None
     OCC_USED_N = 0
     OCC_GATE_DBG = None
@@ -313,17 +313,15 @@ def mppi(s0, mean, goal_xy, u_prev=None):
                 _ego = np.array([[s0_fwd, s0_lat]])
                 _d = np.array([point_segment_distance_np(_ego, s[0], s[1])[0]
                                for s in _seg])
-                _in = _d < OCC_QUERY_R
-
                 _j = int(np.argmin(_d))
                 _opf = _seg[:, 0, :]
                 OCC_RANGE_DBG = (float(_d.min()), float(_opf[_j, 0]), float(_opf[_j, 1]),
                                  float(s0_fwd), float(s0_lat))
-                if _in.any():
-                    _near = _seg[_in]
-                    occ_segs = _near[np.argsort(_d[_in])[:K_OCC]]
-                    OCC_USED_N = len(occ_segs)
-                    OCC_SEGS_USED = occ_segs
+                # No range gate: a DETECTED boundary is a keep-out, however far away.
+                # Only the K_OCC cap remains, and it keeps the nearest ones.
+                occ_segs = _seg[np.argsort(_d)[:K_OCC]]
+                OCC_USED_N = len(occ_segs)
+                OCC_SEGS_USED = occ_segs
 
     OCC_INFEASIBLE = False
     dyn_set = None
@@ -455,16 +453,14 @@ def identify_bicycle_model(env, behavior_name, n_steps=200):
 
 # ── Main control loop ─────────────────────────────────────────────────────────
 
-def _dyn_bubbles(boxes):
-    """(N,3) [c0, c1, r] keep-out seeds from the ground-truth mover boxes published on
-    /dynamic_obstacles: the box centre and the half-diagonal, so the disc encloses the
-    whole footprint whatever its yaw."""
-    b = (np.asarray(boxes, float).reshape(-1, 5)
-         if boxes is not None and len(boxes) else np.empty((0, 5)))
-    if not len(b):
-        return np.empty((0, 3))
-    r = 0.5 * np.hypot(b[:, 2], b[:, 3])
-    return np.column_stack([b[:, 0], b[:, 1], r])
+def _detected_bubbles(dyn_used):
+    """(K,3) [c0, c1, r] seeds from the movers the solve actually DETECTED and
+    constrained against — DYN_USED, the tracked LiDAR clusters. Empty until a mover has
+    been sensed, so the figure never grows a bubble around an object the planner could
+    not yet see."""
+    d = (np.asarray(dyn_used, float).reshape(-1, 4)
+         if dyn_used is not None and len(dyn_used) else np.empty((0, 4)))
+    return d[:, :3] if len(d) else np.empty((0, 3))
 
 
 def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=None,
@@ -524,16 +520,21 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
         if fr.get("segs") is not None and len(fr["segs"]):
             d = point_segments_min_distance(plan[:, 0], plan[:, 1], fr["segs"])
             best = max(best, float(np.max((D_SAFE_HARD + V_TARGET * t) - d)))
-        for c0, c1, r_c in _dyn_bubbles(fr.get("dyn_boxes")):
+        for c0, c1, r_c in _detected_bubbles(fr.get("dyn_used")):
             d = np.hypot(plan[:, 0] - c0, plan[:, 1] - c1)
             best = max(best, float(np.max((D_SAFE_HARD + r_c + V_TARGET * t) - d)))
         return best
 
     # Prefer a solve that actually had a keep-out set — a frame without one has nothing
-    # expanding to show. Among those, the tightest one.
-    occ_ok = [f for f in frames
-              if (f.get("segs") is not None and len(f["segs"]))
-              or (f.get("dyn_boxes") is not None and len(f["dyn_boxes"]))]
+    # expanding to show. Among those, the tightest one. Preference order: solves showing
+    # BOTH keep-out kinds, then either alone. Ranking on "tightest" alone would pick the
+    # tightest occlusion frame, which is usually from before any mover was sensed.
+    _has_seg = lambda f: f.get("segs") is not None and len(f["segs"])
+    _has_dyn = lambda f: f.get("dyn_used") is not None and len(f["dyn_used"])
+    both_ok = [f for f in frames if _has_seg(f) and _has_dyn(f)]
+    occ_ok = both_ok or [f for f in frames if _has_seg(f) or _has_dyn(f)]
+    n_dyn_frames = sum(1 for f in frames if _has_dyn(f))
+    n_seg_frames = sum(1 for f in frames if _has_seg(f))
     if solve_t is not None:
         fr = min(frames, key=lambda f: abs(f["t"] - solve_t))
         if abs(fr["t"] - solve_t) > DT:
@@ -545,10 +546,27 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     tk = (np.arange(len(plan)) + 1) * DT
     segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
             if fr.get("segs") is not None and len(fr["segs"]) else np.empty((0, 2, 2)))
-    # Movers as Unity publishes them on /dynamic_obstacles, at THIS solve. Each seeds an
-    # expanding CIRCLE of radius D_SAFE_HARD + r_obj + V_TARGET*t_k — the same growth law
-    # as the occlusion capsules, so they are drawn at the same sampled t_k, same colour.
-    dyn_set = _dyn_bubbles(fr.get("dyn_boxes"))
+    # Movers the LiDAR had DETECTED at THIS solve (tracked clusters, post-gating). Each
+    # seeds an expanding CIRCLE of radius D_SAFE_HARD + r_obj + V_TARGET*t_k — the same
+    # growth law as the occlusion capsules, so they are drawn at the same sampled t_k,
+    # same colour. A mover that is present in the scene but not yet detected gets no
+    # bubble: only its ground-truth footprint is drawn.
+    dyn_set = _detected_bubbles(fr.get("dyn_used"))
+    if not len(dyn_set):
+        print(f"[traj] no mover bubbles on this figure: {n_dyn_frames}/{len(frames)} "
+              f"solves had a DETECTED mover"
+              + ("" if n_dyn_frames else " — the tracker never confirmed one (check "
+                                          "--dynamic-obstacles, dynamic_clusters.v_min "
+                                          "and the cluster settings)"))
+    if not len(segs):
+        _st = [f["t"] for f in frames if _has_seg(f)]
+        print(f"[traj] no occlusion capsules on this figure: {n_seg_frames}/{len(frames)} "
+              f"solves had a gated occlusion boundary"
+              + (f" (t={_st[0]:.1f}..{_st[-1]:.1f}s — no solve had one AT THE SAME TIME "
+                 f"as a detected mover, so this figure can only show one kind; pin one "
+                 f"with --plot-solve-t)" if _st else
+                 " — none survived gating all run (check --occlusion-aware and the "
+                 "OCC_* gates)"))
 
     fig, ax = plt.subplots(figsize=(11, 11))
 
@@ -567,7 +585,8 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
         poly = box_polygon(bx, by, bsx, bsy, byaw)
         ax.fill(poly[:, 0], poly[:, 1], color="tab:orange", alpha=0.45, ec="tab:orange",
                 lw=1.2, zorder=2,
-                label="dynamic objects at $t_k$ = 0 (Unity)" if i == 0 else None)
+                label="dynamic objects at $t_k$ = 0 (Unity ground truth)"
+                      if i == 0 else None)
 
     ax.plot(x, y, "-", color="0.65", lw=1.2, zorder=1, label="executed trajectory")
     ax.plot(x[0], y[0], "o", color="tab:green", ms=9, zorder=3, label="start")
@@ -619,7 +638,7 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
 
     for i, (c0, c1, _r) in enumerate(dyn_set):
         ax.plot(c0, c1, "x", color="k", ms=7, mew=1.5, zorder=6,
-                label="dynamic object centre (bubble seed)" if i == 0 else None)
+                label="detected mover centre (bubble seed)" if i == 0 else None)
 
     # Zoom on the EGO's own extent (start → end) plus the plan it is executing. Static
     # obstacles and the outer keep-out capsules are deliberately left out of the bounds:
@@ -653,7 +672,7 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     plt.close(fig)
     print(f"[traj] saved {stem}.csv and {stem}.png (rollout from the solve at "
           f"t={fr['t']:.1f}s, {len(set(stages.tolist()))} sampled stages, "
-          f"{len(segs)} occlusion boundaries, {len(dyn_set)} dynamic objects)")
+          f"{len(segs)} occlusion boundaries, {len(dyn_set)} detected movers)")
 
 
 def run(unity_exec_path=None, port=5004, run_sysid=True,
@@ -915,8 +934,17 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                                # keep-outs are the enforced ones.
                                "segs": (np.array(_segs, dtype=float)
                                         if _segs is not None and len(_segs) else None),
-                               # Ground-truth movers as of THIS solve.
+                               # Ground-truth movers as of THIS solve — drawn as
+                               # footprints only, they are NOT what seeds the bubbles.
                                "dyn_boxes": (None if dyn_obs is None else dyn_obs.boxes()),
+                               # Every mover the LiDAR had DETECTED (confirmed tracks)
+                               # at this solve: (K,4) [c0, c1, r, age]. The expanding
+                               # bubbles are drawn from these, so nothing expands around
+                               # an object before it is sensed — and a detected one is
+                               # shown even if the cost only used the K nearest.
+                               "dyn_used": (np.array(DYN_NOW, dtype=float)
+                                            if DYN_NOW is not None and len(DYN_NOW)
+                                            else None),
                                "infeasible": bool(OCC_INFEASIBLE)})
 
         u_cmd      = u_nom

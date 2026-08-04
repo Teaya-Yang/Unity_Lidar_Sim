@@ -111,3 +111,90 @@ class BoundarySet:
             diff = q[i:i + step, None, :] - self._xy[None, :, :]
             out[i:i + step] = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)
         return out
+
+
+class OccupancySet:
+    """Occupied voxels as a membership test, not a distance field.
+
+    `inside(p)` answers only "does p fall in an occupied cell". Kept separate from
+    the occlusion keep-out because that one grows with horizon time (the hidden
+    agent moves) and a wall does not.
+
+    Voxels are quantised to integer indices packed into one int64 key, so a K x H
+    batch costs one searchsorted instead of a nearest-neighbour query.
+    """
+
+    _MASK = (1 << 21) - 1
+    _BIAS = 1 << 20      # keeps negative world coordinates inside the mask
+
+    def __init__(self, points, resolution=0.1, planar=True, z_band=None, ego_z=None):
+        """planar : a query is occupied when ANY occupied voxel shares its (x,y)
+        column, matching the 2D rollout, which carries no z.
+
+        z_band : keep only voxels with |z - ego_z| <= z_band. NOT optional in
+        practice when planar=True. The floor is occupied (MARSIM scenes have a
+        ground plane, and virtual_ground_height marks everything below it
+        occupied too), so folding z away without a band makes every column in
+        the map solid -- every rollout then collides, every cost is identical,
+        the softmax goes uniform and the drone freezes in place. Band it to
+        roughly the drone's half-height so only voxels at flight altitude count.
+        """
+        self.resolution = float(resolution)
+        self.planar = planar
+        pts = np.asarray(points, dtype=float).reshape(-1, 3)
+        if z_band is not None and ego_z is not None and len(pts):
+            pts = pts[np.abs(pts[:, 2] - ego_z) <= z_band]
+        self.points = pts
+        self._keys = np.unique(self._encode(pts[:, :2] if planar else pts))
+
+    def __len__(self):
+        return len(self._keys)
+
+    def _encode(self, pts):
+        if len(pts) == 0:
+            return np.empty(0, dtype=np.int64)
+        idx = np.floor(np.asarray(pts, dtype=float) / self.resolution).astype(np.int64)
+        idx = (idx + self._BIAS) & self._MASK
+        key = (idx[:, 0] << 42) | (idx[:, 1] << 21)
+        if idx.shape[1] == 3:
+            key |= idx[:, 2]
+        return key
+
+    def inside(self, query):
+        """(M,) bool -- True where the query pose lies in an occupied voxel.
+
+        All-False on an empty map, for the same reason distance() returns +inf:
+        an unobserved map must not read as solid.
+        """
+        q = np.asarray(query, dtype=float)
+        if len(q) == 0:
+            return np.zeros(0, dtype=bool)
+        if len(self._keys) == 0:
+            return np.zeros(len(q), dtype=bool)
+        k = self._encode(q)
+        i = np.clip(np.searchsorted(self._keys, k), 0, len(self._keys) - 1)
+        return self._keys[i] == k
+
+    def inside_segment(self, p0, p1):
+        """(M,) bool -- True where the segment p0->p1 crosses an occupied voxel.
+
+        Testing only the endpoints tunnels: rollout poses are v*dt apart (0.2 m at
+        2 m/s, 10 Hz), which is the same order as the inflated voxel size, so a
+        wall one slab thick sits entirely between two consecutive samples and is
+        never seen. Sub-sampling at half the voxel pitch makes that impossible.
+        """
+        p0 = np.asarray(p0, dtype=float)
+        p1 = np.asarray(p1, dtype=float)
+        if len(p0) == 0:
+            return np.zeros(0, dtype=bool)
+
+        step = self.resolution * 0.5
+        longest = float(np.max(np.linalg.norm(p1 - p0, axis=1))) if len(p0) else 0.0
+        n = int(np.ceil(longest / step)) if step > 0 else 1
+        n = max(1, min(n, 16))          # cap: a runaway rollout must not blow up cost
+
+        hit = self.inside(p1)
+        for s in range(1, n):
+            hit |= self.inside(p0 + (float(s) / n) * (p1 - p0))
+        return hit
+

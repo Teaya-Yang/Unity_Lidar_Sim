@@ -29,6 +29,7 @@ def parse_ordered_cloud(msg, n_h: int, n_v: int) -> Optional[np.ndarray]:
     points, because a dropped beam destroys the adjacency the jump test relies on.
     Returns None if the point count contradicts (n_h, n_v).
     """
+    #TODO how would this extend to Lixov prism flower type of lidar, not beams based such as the VLP32
     step = msg.point_step
     if step < 12:
         return None
@@ -123,7 +124,7 @@ def segments_from_ordered_cloud(
     max_range: float,
     ego_xy: Tuple[float, float],
     grazing_deg: float = 1.0,
-    min_jump: float = 30.0,
+    min_jump: float = 100.0,
     sigma: float = 0.0,
     wraps: bool = True,
     merge_radius: float = 10,
@@ -134,6 +135,7 @@ def segments_from_ordered_cloud(
     min_corner_range: float = 1.0,
     trend_window: int = 4,
     min_far_run: int = 10,
+    min_num_over_thresh: int = 20,
 ) -> Optional[np.ndarray]:
     """Occlusion boundary segments in WORLD (a0, a1) coordinates.
 
@@ -156,6 +158,11 @@ def segments_from_ordered_cloud(
               resumes immediately — a real corner instead has the far range PERSIST.
               This is what removes the column of spurious corners along a wall face.
               0 or 1 disables the check.
+    min_num_over_thresh: beams past the jump that must stay a full `min_jump` away from the
+              NEAR side for the candidate to survive. This is the live dropout filter: a
+              single NaN beam mid-wall is substituted to max_range and looks exactly like a
+              corner to |Δr| alone, but the surface resumes on the very next beam. Set it
+              above the widest NaN run you expect on a solid surface. 0 or 1 disables it.
     trend_window: beams fitted to the LOCAL WALL LINE on the near side of each candidate.
               A surface seen at grazing incidence produces a large per-beam range step, so
               |Δr| alone flags a wall viewed nearly edge-on along its whole length. But a
@@ -177,6 +184,7 @@ def segments_from_ordered_cloud(
     """
     n_h, n_v, _ = xyz.shape
     j = n_v // 2 if elev_row is None else int(np.clip(elev_row, 0, n_v - 1))
+    j_1 = n_v // 2 + 3
 
     #print(xyz[0].shape) # (360, 46, 3) shape of the point cloud 46 are the number of beams (circles)
     # ROS (x, y) -> world-aligned (a0, a1), the same mapping ObstacleCircles._build_circles uses.
@@ -210,7 +218,6 @@ def segments_from_ordered_cloud(
     cur = idx if wraps else idx[:-1]
 
     rA, rB = rng[cur], rng[nxt]
-    near = np.where(rA <= rB, rA, rB)
     delta = np.abs(rA - rB)
 
     # A continuous surface at range r spans r*dtheta/tan(grazing) between adjacent
@@ -224,6 +231,42 @@ def segments_from_ordered_cloud(
     # Cartesian line-fit test below (in the per-candidate loop) then rejects the grazing
     # surfaces, which need the beam geometry that only survives to that loop.
     detect = delta > 100
+
+    # Avoid a spurious NaN — substituted to max range next to a real return — always being
+    # classified as an occlusion. A genuine corner has the far side PERSIST for several
+    # beams; an isolated dropout has the surface come straight back. So require the next
+    # min_num_over_thresh beams PAST the jump to stay far from the NEAR (wall) side.
+    #
+    # Which side is near depends on the sign of the step, and the beams to walk lie beyond
+    # whichever side is far — walking forward from nxt when the range steps UP, backward
+    # from cur when it steps DOWN. Getting this wrong deletes every corner of one
+    # handedness, because the far side's own neighbours are all at max range.
+    # if min_num_over_thresh and min_num_over_thresh > 1:
+    #     # Only the candidates need walking — the rest of the scan is already rejected.
+    #     h = np.where(detect)[0]
+    #     if len(h):
+    #         i, j = cur[h], nxt[h]
+    #         near_is_i = rng[i] <= rng[j]
+    #         r_near = np.where(near_is_i, rng[i], rng[j])
+    #         # Start ON the far endpoint and step AWAY from the jump: forward from j when
+    #         # the range climbs, backward from i when it drops.
+    #         start = np.where(near_is_i, j, i)
+    #         step = np.where(near_is_i, 1, -1)
+
+    #         # Walk until the condition breaks. `alive` marks the candidates whose far run
+    #         # is still unbroken; once one breaks it never revives, so run[] freezes at the
+    #         # length reached. Stop early when every candidate has broken or gone the whole
+    #         # way round — for a real corner over open ground that is the full scan.
+    #         run = np.zeros(len(h), dtype=int)
+    #         alive = np.ones(len(h), dtype=bool)
+    #         for m in range(n_h):
+    #             beam = (start + step * m) % n_h
+    #             alive &= (rng[beam] - r_near) >= 100
+    #             if not alive.any():
+    #                 break
+    #             run += alive
+    #         detect[h] = run >= 3
+
     # if min_far_run and min_far_run > 1:
     #     # Past a genuine corner the escaping beams keep flying; past a dropout the surface
     #     # comes straight back. Require the far side to hold for min_far_run beams.
@@ -330,7 +373,7 @@ def segments_from_ordered_cloud(
     #         return None
     #     out = np.array([[s[0], s[1]] for s in kept])
 
-    # list of 360 per one beam detect, 
+    # detect list of 360 per one beam detect, 
     h = np.where(detect)[0]
     if not len(h):  
         return None
@@ -349,7 +392,7 @@ def segments_from_ordered_cloud(
     # Sensor-relative -> world (pure translation; axes are world-aligned).
     out[:, :, 0] += ego_xy[0]
     out[:, :, 1] += ego_xy[1]
-    print("DETECTED", out)
+    print("DETECTED", len(out))
     return out
 
 

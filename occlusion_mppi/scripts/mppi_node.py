@@ -25,7 +25,7 @@ from quadrotor_msgs.msg import PositionCommand
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from occlusion_mppi.boundary import BoundarySet          # noqa: E402
+from occlusion_mppi.boundary import BoundarySet, OccupancySet  # noqa: E402
 from occlusion_mppi.dynamics import DoubleIntegrator     # noqa: E402
 from occlusion_mppi.mppi import OcclusionMPPI, MPPIConfig  # noqa: E402
 
@@ -41,6 +41,14 @@ class MPPINode(object):
         # flying at fixed altitude; a boundary 4 m overhead cannot be hit
         # laterally and would inflate the keep-out for nothing.
         self.z_band = rospy.get_param("~z_band", 1.5)
+        # Must match rog_map/inflation_resolution of the cloud being subscribed:
+        # too small and rollouts step between voxel centres without ever landing
+        # in one, so the collision test silently never fires.
+        self.occ_res = rospy.get_param("~occ_resolution", 0.2)
+        # Much tighter than z_band: the occupancy test folds z away, so anything
+        # kept here makes its whole (x,y) column solid. At 1.5 m the floor would
+        # be included and the entire map would read as occupied. Drone half-height.
+        self.occ_z_band = rospy.get_param("~occ_z_band", 0.3)
 
         cfg = MPPIConfig(
             horizon=int(rospy.get_param("~horizon", 30)),
@@ -51,6 +59,8 @@ class MPPINode(object):
             t_grow_max=float(rospy.get_param("~t_grow_max", 3.0)),
             w_soft=float(rospy.get_param("~w_soft", 50.0)),
             d_infl=float(rospy.get_param("~d_infl", 1.0)),
+            w_collision=float(rospy.get_param("~w_collision", 1.0e6)),
+            use_occlusion=bool(rospy.get_param("~use_occlusion", True)),
         )
         self.cfg = cfg
 
@@ -61,6 +71,7 @@ class MPPINode(object):
         self.planner = OcclusionMPPI(plant, cfg, rng=np.random.default_rng(0))
 
         self.boundaries = BoundarySet(np.zeros((0, 3)))
+        self.occupancy = OccupancySet(np.zeros((0, 3)), resolution=self.occ_res)
         self.pos = None
         self.vel = np.zeros(2)
         # The setpoint is integrated, exactly like keyboard_control.py, rather than
@@ -76,11 +87,17 @@ class MPPINode(object):
         rospy.Subscriber(rospy.get_param("~boundary_topic",
                                          "/rm_node/occlusion_frontier"),
                          PointCloud2, self.cb_boundary, queue_size=1)
+        rospy.Subscriber(rospy.get_param("~occupancy_topic",
+                                         "/rm_node/rog_map/inf_occ"),
+                         PointCloud2, self.cb_occupancy, queue_size=1)
 
-        rospy.loginfo("[mppi] goal=%s d_safe=%.1f v_target=%.1f t_grow_max=%.1f "
-                      "=> keep-out grows %.1f -> %.1f m",
-                      self.goal.tolist(), cfg.d_safe, cfg.v_target, cfg.t_grow_max,
+        rospy.loginfo("[mppi] goal=%s occlusion=%s d_safe=%.1f v_target=%.1f "
+                      "t_grow_max=%.1f => keep-out grows %.1f -> %.1f m",
+                      self.goal.tolist(), cfg.use_occlusion, cfg.d_safe,
+                      cfg.v_target, cfg.t_grow_max,
                       cfg.d_safe, cfg.d_safe + cfg.v_target * cfg.t_grow_max)
+        if not cfg.use_occlusion:
+            rospy.logwarn("[mppi] occlusion term DISABLED -- collision only (baseline)")
 
         self.timer = rospy.Timer(rospy.Duration(1.0 / self.rate_hz), self.step)
 
@@ -99,6 +116,13 @@ class MPPINode(object):
         self.boundaries = BoundarySet(pts.reshape(-1, 3), z_band=self.z_band,
                                       ego_z=ego_z, planar=True)
 
+    def cb_occupancy(self, msg):
+        pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
+                                            skip_nans=True)), dtype=float)
+        ego_z = self.sp[2] if self.sp is not None else self.cruise_z
+        self.occupancy = OccupancySet(pts.reshape(-1, 3), resolution=self.occ_res,
+                                      planar=True, z_band=self.occ_z_band, ego_z=ego_z)
+
     def step(self, _evt):
         if self.pos is None or self.sp is None:
             return
@@ -108,19 +132,33 @@ class MPPINode(object):
             rospy.loginfo_throttle(5.0, "[mppi] goal reached")
             return
 
-        action, info = self.planner.plan(self.pos, self.vel, self.goal, self.boundaries)
+        action, info = self.planner.plan(self.pos, self.vel, self.goal,
+                                         self.boundaries, self.occupancy)
 
         # Integrate the setpoint with the planned acceleration.
         self.vel_cmd = np.clip(self.vel + action * self.cfg.dt,
                                -self.plant.v_max, self.plant.v_max)
         self.publish_cmd(self.vel_cmd)
 
+        # Every rollout colliding is not "very unsafe", it is degenerate: the costs
+        # are then all equal, the softmax is uniform and the mean action is ~0, so
+        # the drone freezes rather than avoids. Almost always an over-wide
+        # occ_z_band pulling the floor into the planar fold.
+        if info["frac_collide"] > 0.99:
+            rospy.logwarn_throttle(
+                2.0, "[mppi] ALL rollouts collide (occ=%d, occ_z_band=%.2f) -- "
+                "planner is degenerate and will not move", len(self.occupancy),
+                self.occ_z_band)
+
         d_now = float(self.boundaries.distance(self.pos[None, :])[0])
         rospy.loginfo_throttle(
-            2.0, "[mppi] pos=(%.1f,%.1f) |v|=%.2f  d_occ=%s  boundaries=%d  infeas=%.2f",
+            2.0, "[mppi] pos=(%.1f,%.1f) |v|=%.2f  d_occ=%s  boundaries=%d  occ=%d  "
+            "infeas=%.2f  collide=%.2f%s",
             self.pos[0], self.pos[1], float(np.linalg.norm(self.vel)),
             ("inf" if not np.isfinite(d_now) else "%.2f" % d_now),
-            len(self.boundaries), info["frac_infeasible"])
+            len(self.boundaries), len(self.occupancy),
+            info["frac_infeasible"], info["frac_collide"],
+            "  IN OCCUPIED CELL" if self.occupancy.inside(self.pos[None, :])[0] else "")
 
         self.publish_rollouts(info)
 

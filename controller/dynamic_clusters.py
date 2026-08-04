@@ -276,7 +276,10 @@ class DynamicClusterTracker:
             Q[i, i] = q * dt ** 3 / 3.0
             Q[i, j] = Q[j, i] = q * dt ** 2 / 2.0
             Q[j, j] = q * dt
+        # Kalman filter estimation is not done for the ego so dont pass the command u and so there is no term + Bu
+        # State prediction
         tr["x"] = F @ x
+        # Covariance prediction
         tr["P"] = F @ P @ F.T + Q
         tr["t"] = now
 
@@ -290,6 +293,8 @@ class DynamicClusterTracker:
         statistically right test but is only as good as the tuned covariance, so
         assoc_radius stays as a hard physical backstop against a diverged P swallowing
         a neighbouring object."""
+        # po, p1, last element is excluded :2, the measumerent is just the centroid
+        # Instead of taking the first two coordinates other wise multiply by a matrix with 0,0 1 and 1,1 1 and all the other components to zero
         innov = meas - tr["x"][:2]
         d = float(np.hypot(*innov))
         if d > self.assoc_radius:
@@ -303,15 +308,19 @@ class DynamicClusterTracker:
         return (m2, d) if m2 <= self.GATE_CHI2 else None
 
     def _correct(self, tr: dict, meas: np.ndarray, r_var: float) -> None:
+        # update step of the kalman filter
         x, P = tr["x"], tr["P"]
         S = P[:2, :2] + r_var * np.eye(2)
         det = S[0, 0] * S[1, 1] - S[0, 1] * S[1, 0]
         Sinv = np.array([[S[1, 1], -S[0, 1]], [-S[1, 0], S[0, 0]]]) / det
+        # kalman gain
+        # No observation matrix H transpose needed in the multplication because we have already dropped the velcity in the computation of the innovation
         K = P[:, :2] @ Sinv                                  # (4,2)
         tr["x"] = x + K @ (meas - x[:2])
         # Joseph form: it stays symmetric positive-definite under the repeated updates
         # and long coasts this tracker does, where the short form (I-KH)P silently loses
         # symmetry and the gate stops meaning anything.
+        # identity matrix
         IKH = np.eye(4)
         IKH[:, :2] -= K
         R = r_var * np.eye(2)
