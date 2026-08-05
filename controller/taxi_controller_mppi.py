@@ -467,6 +467,82 @@ def _dyn_bubbles(boxes):
     return np.column_stack([b[:, 0], b[:, 1], r])
 
 
+def _save_state_plot(stem, verdict, traj, goal_xy=None, t_mark=None, solve_ts=None):
+    """SECOND figure, `<stem>_state.png`: how the ego's own state evolves over the run —
+    one stacked panel per quantity, all sharing episode time. Separate from the map so
+    each keeps its own natural aspect.
+
+    Commanded vs actual is the point of the accel/steer panels: the planner emits a_cmd
+    and delta_cmd, but the vehicle model applies a first-order lag and a rate + speed
+    roll-off limit, so the two diverge exactly where the ego cannot follow the plan.
+
+    `t_mark` [s] marks the solve the map figure draws; `solve_ts` ticks every solve.
+    """
+    import matplotlib.pyplot as plt
+
+    t     = traj[:, 0]
+    theta = traj[:, 3]
+    v     = traj[:, 4]
+    a_cmd, delta_cmd = traj[:, 5], traj[:, 6]
+    # delta_act/a_act only exist on runs recorded after those columns were added.
+    delta_act = traj[:, 7] if traj.shape[1] > 7 else None
+    a_act     = traj[:, 8] if traj.shape[1] > 8 else None
+
+    n_ax = 5 if goal_xy is not None else 4
+    fig, axes = plt.subplots(n_ax, 1, figsize=(12, 2.0 * n_ax), sharex=True)
+    ax_v, ax_a, ax_d, ax_h = axes[:4]
+
+    ax_v.plot(t, v, "-", color="tab:blue", lw=1.4, label="v")
+    ax_v.axhline(V_TARGET, ls="--", color="0.5", lw=1.0, label=f"V_TARGET {V_TARGET:.1f}")
+    ax_v.set_ylabel("speed\n[m/s]")
+
+    ax_a.plot(t, a_cmd, "-", color="tab:red", lw=1.2, label="a commanded")
+    if a_act is not None:
+        ax_a.plot(t, a_act, "-", color="k", lw=1.0, alpha=0.7, label="a actual (lagged)")
+    ax_a.axhline(A_MAX, ls=":", color="0.5", lw=1.0)
+    ax_a.axhline(A_MIN, ls=":", color="0.5", lw=1.0, label="a limits")
+    ax_a.set_ylabel("accel\n[m/s²]")
+
+    ax_d.plot(t, np.degrees(delta_cmd), "-", color="tab:green", lw=1.2, label="δ commanded")
+    if delta_act is not None:
+        ax_d.plot(t, np.degrees(delta_act), "-", color="k", lw=1.0, alpha=0.7,
+                  label="δ actual (rate + roll-off limited)")
+    ax_d.axhline(np.degrees(DELTA_LIM), ls=":", color="0.5", lw=1.0)
+    ax_d.axhline(-np.degrees(DELTA_LIM), ls=":", color="0.5", lw=1.0, label="δ limits")
+    ax_d.set_ylabel("steer\n[deg]")
+
+    ax_h.plot(t, np.degrees(np.unwrap(theta)), "-", color="tab:purple", lw=1.2,
+              label="heading θ")
+    ax_h.set_ylabel("heading\n[deg]")
+
+    # What the whole cost is chasing: a flat stretch here while v > 0 means the ego is
+    # moving without making progress.
+    if goal_xy is not None:
+        ax_g = axes[4]
+        ax_g.plot(t, np.hypot(traj[:, 1] - goal_xy[0], traj[:, 2] - goal_xy[1]),
+                  "-", color="tab:brown", lw=1.2, label="distance to goal")
+        ax_g.set_ylabel("d_goal\n[m]")
+
+    axes[-1].set_xlabel("episode time t [s]")
+    axes[0].set_title(f"{verdict} — ego internal state over the run")
+    for a in axes:
+        a.grid(True, alpha=0.3)
+        a.set_xlim(t[0], t[-1])
+        for ts in (solve_ts or []):
+            a.axvline(ts, color="0.88", lw=0.5, zorder=0)
+        if t_mark is not None:
+            a.axvline(t_mark, color="k", ls="--", lw=1.2, zorder=1)
+        a.legend(loc="upper right", fontsize=8, framealpha=0.85, ncol=2)
+    if t_mark is not None:
+        axes[0].annotate(f"solve drawn on the map figure  t = {t_mark:.1f} s",
+                         xy=(t_mark, 1.0), xycoords=("data", "axes fraction"),
+                         xytext=(3, 3), textcoords="offset points", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(f"{stem}_state.png", dpi=120)
+    plt.close(fig)
+
+
 def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=None,
                      occ_frames=None, capsule_horizon=None, max_frames=6,
                      show_occlusion=True, static_boxes=None, solve_t=None, **_ignored):
@@ -486,7 +562,7 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     # verdict is still in the title and in the CSV's contents.
     stem = os.path.join(out_dir, "traj")
 
-    header = "t,x,y,theta,v,a_cmd,delta_cmd"
+    header = "t,x,y,theta,v,a_cmd,delta_cmd,delta_act,a_act"
     np.savetxt(f"{stem}.csv", traj, delimiter=",", header=header, comments="")
 
     try:
@@ -506,7 +582,10 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
 
     frames = [f for f in (occ_frames or []) if f.get("plan") is not None and len(f["plan"]) > 1]
     if not frames:
-        print(f"[traj] saved {stem}.csv (no recorded solve with a plan — no plot)")
+        # The state plot needs no solve, so it is still worth writing.
+        _save_state_plot(stem, verdict, traj, goal_xy)
+        print(f"[traj] saved {stem}.csv and {stem}_state.png "
+              f"(no recorded solve with a plan — no map plot)")
         return
 
     def _curvature(fr):
@@ -651,7 +730,11 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     fig.tight_layout()
     fig.savefig(f"{stem}.png", dpi=120)
     plt.close(fig)
-    print(f"[traj] saved {stem}.csv and {stem}.png (rollout from the solve at "
+
+    _save_state_plot(stem, verdict, traj, goal_xy, t_mark=fr["t"],
+                     solve_ts=[f["t"] for f in frames])
+
+    print(f"[traj] saved {stem}.csv, {stem}.png and {stem}_state.png (rollout from the solve at "
           f"t={fr['t']:.1f}s, {len(set(stages.tolist()))} sampled stages, "
           f"{len(segs)} occlusion boundaries, {len(dyn_set)} dynamic objects)")
 
@@ -954,7 +1037,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
 
 
         # Record ego pose this step (world frame: x=Unity Z, y=Unity X).
-        traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd))
+        traj.append((ep_steps * DT, s[0], s[1], s[2], s[3], a_cmd, delta_cmd,
+                     delta_actual, accel_actual))
 
         action = ActionTuple(
             continuous=np.array([[a_cmd, delta_cmd]], dtype=np.float32)

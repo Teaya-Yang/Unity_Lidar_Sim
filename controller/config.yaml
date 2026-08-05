@@ -289,14 +289,14 @@ scan:
 
 mppi:
   horizon: 40               # planning steps (x vehicle.dt seconds)
-  samples: 2000             # rollouts per control step
+  samples: 5000             # rollouts per control step
   lambda: 1.0               # temperature. See the scaling note under `cost`: this is the
                             #   correct knob for softmax discrimination.
   sig_a: 1.5                # noise std for acceleration samples
-  sig_d: 1.2               # noise std for steering samples
+  sig_d: 0.5              # noise std for steering samples
   # MPPI-local stage costs, layered on top of the shared `cost` section.
   w_lat: 0.05               # lane-centre lateral offset
-  w_head: 5.0               # MPPI-local heading weight (shadows cost.w_head in the MPPI rollout —
+  w_head: 20.0               # MPPI-local heading weight (shadows cost.w_head in the MPPI rollout —
                             #   THIS is the live value, cost.w_head is dead). Keep it SMALL:
                             #   (1-cos(th-psi)) rewards pointing at the goal, so it fights every
                             #   avoidance manoeuvre (which needs heading error) and is ~0 when
