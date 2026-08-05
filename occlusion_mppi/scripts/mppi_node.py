@@ -82,6 +82,21 @@ class MPPINode(object):
 
         self.pub_cmd = rospy.Publisher("/planning/pos_cmd", PositionCommand, queue_size=10)
         self.pub_viz = rospy.Publisher("~rollouts", MarkerArray, queue_size=1)
+        self.pub_keepout = rospy.Publisher("~keepout", MarkerArray, queue_size=1)
+        self.pub_status = rospy.Publisher("~status", Marker, queue_size=1)
+        self.pub_sight = rospy.Publisher("~sightlines", MarkerArray, queue_size=1)
+
+        # One marched ray per drawn sightline, so this is the one viz that costs
+        # real time. Keep it well under the boundary count.
+        self.sightline_max = int(rospy.get_param("~sightline_max", 120))
+
+        # Horizon times [s] at which to draw the keep-out. Anything past
+        # t_grow_max is the same radius, so the last useful slice is the cap.
+        self.keepout_times = rospy.get_param(
+            "~keepout_times", [0.0, 0.5 * cfg.t_grow_max, cfg.t_grow_max])
+        # One sphere per frontier voxel per slice; the frontier routinely runs to
+        # 10k+ voxels, which RViz will not draw at interactive rates. Stride down.
+        self.keepout_max_pts = int(rospy.get_param("~keepout_max_pts", 400))
 
         rospy.Subscriber("/lidar_slam/odom", Odometry, self.cb_odom, queue_size=10)
         rospy.Subscriber(rospy.get_param("~boundary_topic",
@@ -153,14 +168,26 @@ class MPPINode(object):
         d_now = float(self.boundaries.distance(self.pos[None, :])[0])
         rospy.loginfo_throttle(
             2.0, "[mppi] pos=(%.1f,%.1f) |v|=%.2f  d_occ=%s  boundaries=%d  occ=%d  "
-            "infeas=%.2f  collide=%.2f%s",
+            "infeas=%.2f  collide=%.2f  solve=%.1fms (%.1fHz, %.2fus/rollout-step)%s",
             self.pos[0], self.pos[1], float(np.linalg.norm(self.vel)),
             ("inf" if not np.isfinite(d_now) else "%.2f" % d_now),
             len(self.boundaries), len(self.occupancy),
             info["frac_infeasible"], info["frac_collide"],
+            info["solve_s"] * 1e3, info["solve_hz"], info["us_per_rollout_step"],
             "  IN OCCUPIED CELL" if self.occupancy.inside(self.pos[None, :])[0] else "")
 
+        # The timer fires at rate_hz; if a solve outlasts its own period the loop is
+        # already late and the integrated setpoint no longer matches real dt.
+        if info["solve_s"] > 1.0 / self.rate_hz:
+            rospy.logwarn_throttle(
+                2.0, "[mppi] solve %.0fms exceeds the %.0fms control period -- "
+                "lower ~samples/horizon or ~rate",
+                info["solve_s"] * 1e3, 1000.0 / self.rate_hz)
+
         self.publish_rollouts(info)
+        self.publish_keepout()
+        self.publish_status(info, d_now)
+        self.publish_sightlines()
 
     def publish_cmd(self, vel_cmd):
         dt = 1.0 / self.rate_hz
@@ -206,6 +233,103 @@ class MPPINode(object):
         arr.markers.append(best)
 
         self.pub_viz.publish(arr)
+
+    def publish_keepout(self):
+        """The keep-out volume the occlusion term actually enforces, per horizon time.
+
+        One SPHERE_LIST per time slice: same voxel centres, radius r_keep(t_k) from
+        cost.py. This is the region rollouts are charged w_collision for entering, so
+        a rollout crossing a drawn sphere is a bug in one of the two, not in RViz.
+        """
+        from geometry_msgs.msg import Point
+        pts = self.boundaries.points
+        if len(pts) > self.keepout_max_pts:
+            pts = pts[::int(np.ceil(len(pts) / float(self.keepout_max_pts)))]
+
+        arr = MarkerArray()
+        for i, t_k in enumerate(self.keepout_times):
+            t_eff = min(t_k, self.cfg.t_grow_max)
+            r_keep = self.cfg.d_safe + self.cfg.v_target * t_eff
+
+            m = Marker()
+            m.header.frame_id = self.frame_id
+            m.header.stamp = rospy.Time.now()
+            m.ns, m.id = "keepout", i
+            m.type, m.action = Marker.SPHERE_LIST, Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 2.0 * r_keep
+            # Later slices are bigger and would bury the earlier ones; fade them out.
+            frac = i / float(max(len(self.keepout_times) - 1, 1))
+            m.color.a = 0.30 - 0.20 * frac
+            m.color.r, m.color.g, m.color.b = 1.0, 0.55 * frac, 0.0
+            # Drawn at the flight altitude, not the voxel's own z: the cost folds z
+            # away (planar=True), so the enforced shape really is a column.
+            for p in pts:
+                m.points.append(Point(p[0], p[1], self.cruise_z))
+            arr.markers.append(m)
+
+        self.pub_keepout.publish(arr)
+
+    def publish_status(self, info, d_now):
+        """Live readout of WHICH term is binding, drawn above the drone.
+
+        The two failure modes look identical from the outside -- the drone stops --
+        so the numbers that separate them are what this shows: d_occ vs r_keep says
+        the occlusion term is biting, frac_collide says the occupancy term is.
+        """
+        c = self.cfg
+        r0 = c.d_safe
+        r1 = c.d_safe + c.v_target * c.t_grow_max
+        breach = np.isfinite(d_now) and d_now < r0
+
+        m = Marker()
+        m.header.frame_id = self.frame_id
+        m.header.stamp = rospy.Time.now()
+        m.ns, m.id, m.type, m.action = "status", 0, Marker.TEXT_VIEW_FACING, Marker.ADD
+        m.pose.position.x, m.pose.position.y = self.pos[0], self.pos[1]
+        m.pose.position.z = self.cruise_z + 1.5
+        m.pose.orientation.w = 1.0
+        m.scale.z = 0.35
+        m.color.a = 1.0
+        if info["frac_infeasible"] > 0.99:
+            m.color.r, m.color.g, m.color.b = 1.0, 0.2, 0.2
+        elif breach:
+            m.color.r, m.color.g, m.color.b = 1.0, 0.7, 0.1
+        else:
+            m.color.r, m.color.g, m.color.b = 0.2, 1.0, 0.4
+
+        m.text = (
+            "d_occ %s   r_keep %.1f->%.1f m%s\n"
+            "infeas %.0f%%   collide %.0f%%\n"
+            "bnd %d   occ %d   %.1f Hz"
+            % (("inf" if not np.isfinite(d_now) else "%.2f m" % d_now),
+               r0, r1, "   BREACH" if breach else "",
+               100.0 * info["frac_infeasible"], 100.0 * info["frac_collide"],
+               len(self.boundaries), len(self.occupancy), info["solve_hz"]))
+        self.pub_status.publish(m)
+
+    def publish_sightlines(self):
+        """One segment from the drone to each of a sample of boundary voxels."""
+        from geometry_msgs.msg import Point
+        pts = self.boundaries.points
+        if len(pts) > self.sightline_max:
+            pts = pts[::int(np.ceil(len(pts) / float(self.sightline_max)))]
+
+        m = Marker()
+        m.header.frame_id = self.frame_id
+        m.header.stamp = rospy.Time.now()
+        m.ns, m.id = "sightlines", 0
+        m.type, m.action = Marker.LINE_LIST, Marker.ADD
+        m.pose.orientation.w = 1.0
+        m.scale.x = 0.015
+        m.color.a, m.color.r, m.color.g, m.color.b = 0.5, 0.2, 1.0, 0.4
+        for q in pts:
+            m.points.append(Point(self.pos[0], self.pos[1], self.cruise_z))
+            m.points.append(Point(q[0], q[1], self.cruise_z))
+
+        arr = MarkerArray()
+        arr.markers.append(m)
+        self.pub_sight.publish(arr)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ copy of the 2D controller's. Everything novel is in how `d` is obtained
 (boundary.BoundarySet) and in the plant (dynamics.DoubleIntegrator).
 """
 
+import time
+
 import numpy as np
 
 from .cost import occlusion_stage_cost
@@ -69,6 +71,7 @@ class OcclusionMPPI:
         c = self.cfg
         d = self.plant.dim
         K, H = c.samples, c.horizon
+        t_start = time.perf_counter()
 
         noise = self.rng.normal(0.0, c.sigma_a, size=(K, H, d))
         actions = self.nominal[None, :, :] + noise
@@ -125,13 +128,19 @@ class OcclusionMPPI:
 
         self.nominal = np.einsum("k,khd->hd", w, actions)
         action = self.nominal[0].copy()
+        print(f"ACTION, {action}, SHAPE: {action.shape}")
 
         # Shift the nominal for the next step (receding horizon).
         self.nominal = np.roll(self.nominal, -1, axis=0)
         self.nominal[-1] = 0.0
 
+        solve_s = time.perf_counter() - t_start
         info = {
             "traj": traj, "cost": cost, "weights": w,
+            "solve_s": solve_s,
+            "solve_hz": 1.0 / solve_s if solve_s > 0 else float("inf"),
+            # Cost of one (rollout, stage) pair -- the unit that scales with K*H.
+            "us_per_rollout_step": solve_s * 1e6 / (K * H),
             "best": traj[int(np.argmin(cost))],
             "frac_infeasible": float(np.mean(cost >= c.w_hard * c.dt)),
             "frac_collide": float(np.mean(collided)),
