@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from occlusion_mppi.boundary import BoundarySet, OccupancySet  # noqa: E402
 from occlusion_mppi.dynamics import DoubleIntegrator     # noqa: E402
 from occlusion_mppi.mppi import OcclusionMPPI, MPPIConfig  # noqa: E402
+from occlusion_mppi.viz import nearest_markers  # noqa: E402
 
 
 class MPPINode(object):
@@ -40,7 +41,12 @@ class MPPINode(object):
         # Only boundaries within this vertical band of the drone matter while
         # flying at fixed altitude; a boundary 4 m overhead cannot be hit
         # laterally and would inflate the keep-out for nothing.
+        # With planar=False this only trims the set; the 3D distance already
+        # discounts height. Keep it wide enough not to clip real structure.
         self.z_band = rospy.get_param("~z_band", 1.5)
+        # False => genuinely 3D keep-out distance. Rollouts stay 2D (the plant is
+        # dim=2), so BoundarySet lifts them to the flight altitude via query_z.
+        self.planar = bool(rospy.get_param("~planar", False))
         # Must match rog_map/inflation_resolution of the cloud being subscribed:
         # too small and rollouts step between voxel centres without ever landing
         # in one, so the collision test silently never fires.
@@ -85,10 +91,17 @@ class MPPINode(object):
         self.pub_keepout = rospy.Publisher("~keepout", MarkerArray, queue_size=1)
         self.pub_status = rospy.Publisher("~status", Marker, queue_size=1)
         self.pub_sight = rospy.Publisher("~sightlines", MarkerArray, queue_size=1)
+        # The single distance the occlusion cost is actually reacting to, drawn as
+        # the vector that produced it. Everything else in the keep-out viz is a
+        # region; this is the one scalar, so when the drone stops for no visible
+        # reason this is the marker that says which voxel did it.
+        self.pub_nearest = rospy.Publisher("~nearest_boundary", MarkerArray,
+                                           queue_size=1)
 
         # One marched ray per drawn sightline, so this is the one viz that costs
         # real time. Keep it well under the boundary count.
         self.sightline_max = int(rospy.get_param("~sightline_max", 120))
+        self.show_nearest = bool(rospy.get_param("~show_nearest", True))
 
         # Horizon times [s] at which to draw the keep-out. Anything past
         # t_grow_max is the same radius, so the last useful slice is the cap.
@@ -129,7 +142,8 @@ class MPPINode(object):
                                             skip_nans=True)), dtype=float)
         ego_z = self.sp[2] if self.sp is not None else self.cruise_z
         self.boundaries = BoundarySet(pts.reshape(-1, 3), z_band=self.z_band,
-                                      ego_z=ego_z, planar=True)
+                                      ego_z=ego_z, planar=self.planar,
+                                      query_z=ego_z)
 
     def cb_occupancy(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
@@ -165,7 +179,10 @@ class MPPINode(object):
                 "planner is degenerate and will not move", len(self.occupancy),
                 self.occ_z_band)
 
-        d_now = float(self.boundaries.distance(self.pos[None, :])[0])
+        # nearest() rather than distance(): the index is what lets publish_nearest
+        # draw the actual voxel, and it is free -- the KD-tree returns it anyway.
+        d_arr, i_arr = self.boundaries.nearest(self.pos[None, :])
+        d_now, i_now = float(d_arr[0]), int(i_arr[0])
         rospy.loginfo_throttle(
             2.0, "[mppi] pos=(%.1f,%.1f) |v|=%.2f  d_occ=%s  boundaries=%d  occ=%d  "
             "infeas=%.2f  collide=%.2f  solve=%.1fms (%.1fHz, %.2fus/rollout-step)%s",
@@ -185,6 +202,8 @@ class MPPINode(object):
                 info["solve_s"] * 1e3, 1000.0 / self.rate_hz)
 
         self.publish_rollouts(info)
+        if self.show_nearest:
+            self.publish_nearest(d_now, i_now)
         self.publish_keepout()
         self.publish_status(info, d_now)
         self.publish_sightlines()
@@ -233,6 +252,12 @@ class MPPINode(object):
         arr.markers.append(best)
 
         self.pub_viz.publish(arr)
+
+    def publish_nearest(self, d_now, i_now):
+        """Draw the ego -> nearest-boundary vector. See occlusion_mppi.viz."""
+        self.pub_nearest.publish(
+            nearest_markers(self.boundaries, self.pos, self.cruise_z,
+                            self.cfg.d_safe, self.frame_id, d_now, i_now))
 
     def publish_keepout(self):
         """The keep-out volume the occlusion term actually enforces, per horizon time.

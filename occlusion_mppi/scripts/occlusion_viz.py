@@ -27,6 +27,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from occlusion_mppi.boundary import BoundarySet, OccupancySet  # noqa: E402
+from occlusion_mppi.viz import nearest_markers  # noqa: E402
 
 
 class OcclusionViz(object):
@@ -40,6 +41,7 @@ class OcclusionViz(object):
         self.v_target = float(rospy.get_param("~v_target", 1.5))
         self.t_grow_max = float(rospy.get_param("~t_grow_max", 3.0))
         self.z_band = float(rospy.get_param("~z_band", 1.5))
+        self.planar = bool(rospy.get_param("~planar", False))
         self.occ_res = float(rospy.get_param("~occ_resolution", 0.2))
         self.occ_z_band = float(rospy.get_param("~occ_z_band", 0.3))
         self.sightline_max = int(rospy.get_param("~sightline_max", 120))
@@ -54,6 +56,9 @@ class OcclusionViz(object):
         self.pub_keepout = rospy.Publisher("~keepout", MarkerArray, queue_size=1)
         self.pub_sight = rospy.Publisher("~sightlines", MarkerArray, queue_size=1)
         self.pub_status = rospy.Publisher("~status", Marker, queue_size=1)
+        self.show_nearest = bool(rospy.get_param("~show_nearest", True))
+        self.pub_nearest = rospy.Publisher("~nearest_boundary", MarkerArray,
+                                           queue_size=1)
 
         rospy.Subscriber("/lidar_slam/odom", Odometry, self.cb_odom, queue_size=10)
         rospy.Subscriber(rospy.get_param("~boundary_topic",
@@ -77,7 +82,8 @@ class OcclusionViz(object):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
                                             skip_nans=True)), dtype=float)
         self.boundaries = BoundarySet(pts.reshape(-1, 3), z_band=self.z_band,
-                                      ego_z=self.z, planar=True)
+                                      ego_z=self.z, planar=self.planar,
+                                      query_z=self.z)
 
     def cb_occupancy(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
@@ -91,6 +97,11 @@ class OcclusionViz(object):
             return
         self.publish_keepout()
         self.publish_sightlines()
+        if self.show_nearest:
+            d, i = self.boundaries.nearest(self.pos[None, :])
+            self.pub_nearest.publish(
+                nearest_markers(self.boundaries, self.pos, self.z, self.d_safe,
+                                self.frame_id, float(d[0]), int(i[0])))
         self.publish_status()
 
     def publish_keepout(self):

@@ -128,7 +128,6 @@ class OcclusionMPPI:
 
         self.nominal = np.einsum("k,khd->hd", w, actions)
         action = self.nominal[0].copy()
-        print(f"ACTION, {action}, SHAPE: {action.shape}")
 
         # Shift the nominal for the next step (receding horizon).
         self.nominal = np.roll(self.nominal, -1, axis=0)

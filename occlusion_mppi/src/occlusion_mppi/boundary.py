@@ -49,7 +49,7 @@ class BoundarySet:
     makes a K x H rollout batch affordable without precomputing a distance field.
     """
 
-    def __init__(self, points, z_band=None, ego_z=None, planar=True):
+    def __init__(self, points, z_band=None, ego_z=None, planar=True, query_z=None):
         """points : (N,3) world-frame boundary voxel centres.
 
         z_band  : if not None, keep only voxels with |z - ego_z| <= z_band. Use this
@@ -58,12 +58,18 @@ class BoundarySet:
                   laterally, and including it inflates the keep-out for no reason.
         planar  : if True the distance is computed in XY only (matching the 2D
                   controller). Set False for a genuinely 3D keep-out.
+        query_z : altitude at which to place 2D queries when planar=False. The
+                  plant is 2D (fixed altitude), so every caller -- rollouts
+                  included -- hands over (M,2). Lifting them here keeps the 3D
+                  distance available without threading a z through the planner.
+                  Required when planar=False; ignored otherwise.
         """
         pts = np.asarray(points, dtype=float).reshape(-1, 3)
         if z_band is not None and ego_z is not None and len(pts):
             pts = pts[np.abs(pts[:, 2] - ego_z) <= z_band]
 
         self.planar = planar
+        self.query_z = query_z
         self.points = pts
         self._xy = pts[:, :2] if planar else pts
 
@@ -71,6 +77,22 @@ class BoundarySet:
 
     def __len__(self):
         return len(self.points)
+
+    def _prep(self, query):
+        """Coerce a query to the tree's dimension, lifting (M,2) to (M,3) if needed.
+
+        A 3D set queried with a 2D pose is the normal case, not an error: the ego
+        flies at fixed altitude, so its z is a property of the BoundarySet's
+        configuration rather than of each query.
+        """
+        q = np.asarray(query, dtype=float)
+        if self.planar or q.ndim != 2 or q.shape[1] != 2:
+            return q
+        if self.query_z is None:
+            raise ValueError(
+                "BoundarySet(planar=False) received a 2D query but no query_z was "
+                "given at construction; the ego altitude is unknown.")
+        return np.column_stack([q, np.full(len(q), float(self.query_z))])
 
     def distance(self, query):
         """(M,) distance from each query pose to the nearest boundary voxel [m].
@@ -82,7 +104,7 @@ class BoundarySet:
         cost, i.e. "nothing is hidden, this term is silent". Returning 0.0 instead
         would make an empty map look maximally dangerous and freeze the ego.
         """
-        q = np.asarray(query, dtype=float)
+        q = self._prep(query)
         if len(q) == 0:
             return np.empty(0)
 
@@ -98,9 +120,31 @@ class BoundarySet:
         d, _ = self._tree.query(q)
         return d
 
+    def nearest(self, query):
+        """(d, idx) -- distance AND the index of the nearest boundary voxel.
+
+        Same query as distance(), but keeps the index the KD-tree already returns
+        and distance() throws away. `self.points[idx]` is then the (x,y,z) world
+        point, which is what a visualisation needs to draw the sightline the cost
+        is actually reacting to.
+
+        idx is -1 wherever d is +inf (no boundaries at all), so a caller must check
+        before indexing. Deliberately NOT folded into distance(): that one runs
+        K x H times per plan cycle and has no use for the index.
+        """
+        q = self._prep(query)
+        if len(q) == 0:
+            return np.empty(0), np.empty(0, dtype=int)
+        if len(self.points) == 0:
+            return np.full(len(q), np.inf), np.full(len(q), -1, dtype=int)
+        if self._tree is None:
+            return self._nearest_bruteforce(q)
+        d, i = self._tree.query(q)
+        return d, np.asarray(i, dtype=int)
+
     def distance_bruteforce(self, query):
         """SciPy-free fallback. O(M*N) -- only for tests or tiny boundary sets."""
-        q = np.asarray(query, dtype=float)
+        q = self._prep(query)
         if len(self.points) == 0:
             return np.full(len(q), np.inf)
         # Chunked so a K x H query against a large boundary set cannot allocate
@@ -111,6 +155,18 @@ class BoundarySet:
             diff = q[i:i + step, None, :] - self._xy[None, :, :]
             out[i:i + step] = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)
         return out
+
+    def _nearest_bruteforce(self, q):
+        """distance_bruteforce, keeping the argmin as well. Same chunking."""
+        out = np.empty(len(q))
+        idx = np.empty(len(q), dtype=int)
+        step = max(1, int(4e6 // max(len(self._xy), 1)))
+        for i in range(0, len(q), step):
+            diff = q[i:i + step, None, :] - self._xy[None, :, :]
+            dd = np.sqrt((diff ** 2).sum(axis=2))
+            idx[i:i + step] = np.argmin(dd, axis=1)
+            out[i:i + step] = dd.min(axis=1)
+        return out, idx
 
 
 class OccupancySet:
