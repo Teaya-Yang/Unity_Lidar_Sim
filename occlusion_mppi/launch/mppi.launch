@@ -9,19 +9,38 @@
            roslaunch rog_map_example rviz.launch
     -->
     <node name="occlusion_mppi" pkg="occlusion_mppi" type="mppi_node.py" output="screen">
-        <rosparam param="goal">[7.0, 17.0]</rosparam>
+        <!-- 3 => the ego climbs and can fly OVER an occluder; 2 is the old
+             fixed-altitude baseline. In 2D the occupancy test folds z away, so a
+             wall is solid at every altitude and there is no way over it. -->
+        <param name="dim" value="3"/>
+        <!-- [x,y] or [x,y,z]. With three elements the z is the goal altitude and
+             goal_z below is ignored; with two it is padded with goal_z. In 2D any
+             third element is dropped. -->
+        <rosparam param="goal">[0.0, 15.0, 1.0]</rosparam>
+        <!-- Altitude a 2-element goal is padded to. Defaults to cruise_z. -->
+        <param name="goal_z" value="1.0"/>
+        <!-- 3D: the takeoff/hold altitude only, not a constraint. 2D: enforced. -->
         <param name="cruise_z" value="1.0"/>
         <param name="boundary_topic" value="/rm_node/occlusion_frontier"/>
         <!-- Occupied (inflated) voxels. The collision term is a plain membership
              test against these, so occ_resolution MUST match the map's
              inflation_resolution or the test never fires. -->
         <param name="occupancy_topic" value="/rm_node/rog_map/inf_occ"/>
-        <param name="occ_resolution" value="0.4"/>
-        <!-- Keep this tight. The scene has a ground plane and
-             virtual_ground_height marks everything below it occupied; a wide
-             band folds the floor into every column and freezes the planner. -->
+        <param name="occ_resolution" value="0.1"/>
+        <!-- 2D ONLY (ignored when dim=3, where nothing is folded). Keep this
+             tight: virtual_ground_height marks everything below the floor
+             occupied, and a wide band folds it into every column, freezing the
+             planner. Same story for z_band below. -->
         <param name="occ_z_band" value="0.3"/>
         <param name="w_collision" value="100"/>
+        <!-- Altitude bounds, 3D only. inf_occ contains NO floor: ROG-Map's
+             virtual_ground_height is a z-test inside isOccupied() and never
+             reaches the occupancy buffer, so boxSearch never publishes it. In a
+             wall-only scene there is then nothing below the wall's bottom edge
+             and diving under it is a free way around. These put the floor back.
+             Leave empty to disable. -->
+        <param name="z_min" value="0.5"/>
+        <param name="z_max" value=""/>
         <!-- Flip to false for the baseline run: collision only, no occlusion. -->
         <param name="use_occlusion" value="false"/>
         <param name="rate" value="10.0"/>
@@ -31,6 +50,11 @@
         <!-- Arrow from the ego to the voxel setting d_occ. Costs one extra
              KD-tree index lookup per tick; set false to drop it entirely. -->
         <param name="show_nearest" value="true"/>
+        <!-- Ball above the drone: red once the MEASURED pose is inside an
+             occupied voxel. Green while the drone is visibly inside a wall means
+             that wall is not in the occupancy set at all, which is the only thing
+             that can make the collision term silently never fire. -->
+        <param name="show_occupied" value="true"/>
 
         <param name="d_safe" value="2.0"/>
         <param name="v_target" value="1.0"/>

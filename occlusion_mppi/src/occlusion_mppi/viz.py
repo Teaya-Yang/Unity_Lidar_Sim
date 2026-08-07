@@ -93,3 +93,113 @@ def nearest_markers(boundaries, pos, z, d_safe, frame_id, d_now, i_now,
     arr.markers.append(t)
 
     return arr
+
+
+def ego_occupied_markers(occupancy, pos, z, frame_id, stamp=None, ns="ego_occupied"):
+    """Is the ego itself standing in an occupied voxel? Ball above the drone.
+
+    This is the ground truth for the collision term. `hit` in the planner is
+    OccupancySet.inside_segment over ROLLOUT poses; this runs the same membership
+    test on the MEASURED pose, so it answers a question the rollout costs cannot:
+    whether the wall the drone is visibly inside of is in the occupancy set at all.
+
+    Red ball  => the ego is inside an occupied voxel. The map has the obstacle and
+                 the planner drove in anyway.
+    Green ball => the ego is in free space. If the drone is visibly inside a wall
+                 and this is still green, the occupancy set does not contain that
+                 wall -- an empty/stale inf_occ or a build/query mismatch -- and no
+                 amount of collision weight will ever stop it.
+
+    Returns (MarkerArray, inside) so a caller can log the same boolean it draws.
+    """
+    q = np.asarray(pos, dtype=float)[None, :]
+    inside = bool(len(occupancy)) and bool(occupancy.inside(q)[0])
+    stamp = stamp if stamp is not None else rospy.Time.now()
+
+    ball = Marker()
+    ball.header.frame_id = frame_id
+    ball.header.stamp = stamp
+    ball.ns, ball.id = ns, 0
+    ball.type, ball.action = Marker.SPHERE, Marker.ADD
+    ball.pose.orientation.w = 1.0
+    ball.pose.position.x, ball.pose.position.y = pos[0], pos[1]
+    ball.pose.position.z = z + 0.9
+    ball.scale.x = ball.scale.y = ball.scale.z = 0.4
+    ball.color.a = 0.95
+    ball.color.r = 1.0 if inside else 0.1
+    ball.color.g = 0.1 if inside else 0.9
+    ball.color.b = 0.1
+
+    txt = Marker()
+    txt.header.frame_id = frame_id
+    txt.header.stamp = stamp
+    txt.ns, txt.id = ns, 1
+    txt.type, txt.action = Marker.TEXT_VIEW_FACING, Marker.ADD
+    txt.pose.orientation.w = 1.0
+    txt.pose.position.x, txt.pose.position.y = pos[0], pos[1]
+    txt.pose.position.z = z + 1.3
+    txt.scale.z = 0.3
+    txt.color.a = 0.95
+    txt.color.r, txt.color.g, txt.color.b = ball.color.r, ball.color.g, ball.color.b
+    # occ=0 is a different failure from "free space", and they look identical on
+    # a ball alone, so the count is part of the label.
+    txt.text = ("IN OCCUPIED VOXEL" if inside else "free") + "  (occ=%d)" % len(occupancy)
+
+    arr = MarkerArray()
+    arr.markers.append(ball)
+    arr.markers.append(txt)
+    return arr, inside
+
+
+def nearest_occupied_markers(occupancy, pos, z, frame_id, stamp=None,
+                             ns="nearest_occupied"):
+    """Segment ego -> nearest occupied voxel, with the distance as text.
+
+    The obstacle-clearance counterpart to nearest_markers(): that one shows the
+    keep-out the occlusion term reacts to, this one shows how far the wall
+    actually is. Nothing in the planner consumes it -- the collision term is
+    binary membership -- so it is the number to read when asking whether the
+    collision test agrees with what you see.
+
+    Returns (MarkerArray, d), d = +inf on an empty map.
+    """
+    d_arr, i_arr = occupancy.nearest(np.asarray(pos, dtype=float)[None, :])
+    d, i = float(d_arr[0]), int(i_arr[0])
+    stamp = stamp if stamp is not None else rospy.Time.now()
+
+    line = Marker()
+    line.header.frame_id = frame_id
+    line.header.stamp = stamp
+    line.ns, line.id = ns, 0
+    line.type, line.action = Marker.LINE_LIST, Marker.ADD
+    line.pose.orientation.w = 1.0
+    line.scale.x = 0.04
+    line.color.a, line.color.r, line.color.g, line.color.b = 0.95, 0.2, 0.6, 1.0
+
+    txt = Marker()
+    txt.header.frame_id = frame_id
+    txt.header.stamp = stamp
+    txt.ns, txt.id = ns, 1
+    txt.type, txt.action = Marker.TEXT_VIEW_FACING, Marker.ADD
+    txt.pose.orientation.w = 1.0
+    txt.scale.z = 0.3
+    txt.color.a, txt.color.r, txt.color.g, txt.color.b = 0.95, 0.2, 0.6, 1.0
+    txt.text = ""
+
+    if i >= 0 and np.isfinite(d):
+        tgt = occupancy.points[i]
+        tip_z = tgt[2] if not occupancy.planar else z
+        line.points.append(Point(pos[0], pos[1], z))
+        line.points.append(Point(tgt[0], tgt[1], tip_z))
+        txt.pose.position.x = 0.5 * (pos[0] + tgt[0])
+        txt.pose.position.y = 0.5 * (pos[1] + tgt[1])
+        txt.pose.position.z = 0.5 * (z + tip_z) - 0.4
+        txt.text = "d_occ_cell %.2f m" % d
+    else:
+        txt.pose.position.x, txt.pose.position.y = pos[0], pos[1]
+        txt.pose.position.z = z - 0.4
+
+    arr = MarkerArray()
+    arr.markers.append(line)
+    arr.markers.append(txt)
+    return arr, d

@@ -27,7 +27,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from occlusion_mppi.boundary import BoundarySet, OccupancySet  # noqa: E402
-from occlusion_mppi.viz import nearest_markers  # noqa: E402
+from occlusion_mppi.viz import (nearest_markers, ego_occupied_markers,  # noqa: E402
+                                nearest_occupied_markers)  # noqa: E402
 
 
 class OcclusionViz(object):
@@ -41,22 +42,37 @@ class OcclusionViz(object):
         self.v_target = float(rospy.get_param("~v_target", 1.5))
         self.t_grow_max = float(rospy.get_param("~t_grow_max", 3.0))
         self.z_band = float(rospy.get_param("~z_band", 1.5))
-        self.planar = bool(rospy.get_param("~planar", False))
+        # Mirrors mppi_node: 3 => 3D geometry, no z folding, no z_band.
+        self.dim = int(rospy.get_param("~dim", 3))
+        self.planar = self.dim == 2
         self.occ_res = float(rospy.get_param("~occ_resolution", 0.2))
         self.occ_z_band = float(rospy.get_param("~occ_z_band", 0.3))
         self.sightline_max = int(rospy.get_param("~sightline_max", 120))
         self.keepout_times = rospy.get_param(
             "~keepout_times", [0.0, 0.5 * self.t_grow_max, self.t_grow_max])
 
-        self.boundaries = BoundarySet(np.zeros((0, 3)))
-        self.occupancy = OccupancySet(np.zeros((0, 3)), resolution=self.occ_res)
+        # Set before the placeholders below: query_z reads self.z.
         self.pos = None
         self.z = 1.0
+
+        # Must match the dimension the callbacks build at -- see mppi_node.
+        self.boundaries = BoundarySet(np.zeros((0, 3)), planar=self.planar,
+                                      query_z=self.z)
+        self.occupancy = OccupancySet(np.zeros((0, 3)), resolution=self.occ_res,
+                                      planar=self.planar)
 
         self.pub_keepout = rospy.Publisher("~keepout", MarkerArray, queue_size=1)
         self.pub_sight = rospy.Publisher("~sightlines", MarkerArray, queue_size=1)
         self.pub_status = rospy.Publisher("~status", Marker, queue_size=1)
         self.show_nearest = bool(rospy.get_param("~show_nearest", True))
+        self.show_occupied = bool(rospy.get_param("~show_occupied", True))
+        # Builds a KD-tree over inf_occ (tens of thousands of points) whenever the
+        # cloud changes. Nothing in the planner needs it -- turn it off if the
+        # solve rate suffers.
+        self.show_nearest_occ = bool(rospy.get_param("~show_nearest_occupied", True))
+        self.pub_nearest_occ = rospy.Publisher("~nearest_occupied", MarkerArray,
+                                               queue_size=1)
+        self.pub_occupied = rospy.Publisher("~ego_occupied", MarkerArray, queue_size=1)
         self.pub_nearest = rospy.Publisher("~nearest_boundary", MarkerArray,
                                            queue_size=1)
 
@@ -73,6 +89,17 @@ class OcclusionViz(object):
                       self.t_grow_max)
         rospy.Timer(rospy.Duration(1.0 / self.rate_hz), self.step)
 
+    def ego(self):
+        """Ego pose at the dimension the sets were built at.
+
+        self.pos is kept 2D because most of the drawing works in xy, but the
+        occupancy/boundary sets are 3D when dim=3 and a 2D query against them is
+        not a smaller query -- it is a different key space that matches nothing.
+        """
+        if self.dim == 3:
+            return np.array([self.pos[0], self.pos[1], self.z])
+        return self.pos
+
     def cb_odom(self, msg):
         p = msg.pose.pose.position
         self.pos = np.array([p.x, p.y])
@@ -81,16 +108,17 @@ class OcclusionViz(object):
     def cb_boundary(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
                                             skip_nans=True)), dtype=float)
-        self.boundaries = BoundarySet(pts.reshape(-1, 3), z_band=self.z_band,
-                                      ego_z=self.z, planar=self.planar,
-                                      query_z=self.z)
+        self.boundaries = BoundarySet(
+            pts.reshape(-1, 3),
+            z_band=self.z_band if self.dim == 2 else None,
+            ego_z=self.z, planar=self.planar, query_z=self.z)
 
     def cb_occupancy(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
                                             skip_nans=True)), dtype=float)
-        self.occupancy = OccupancySet(pts.reshape(-1, 3), resolution=self.occ_res,
-                                      planar=True, z_band=self.occ_z_band,
-                                      ego_z=self.z)
+        self.occupancy = OccupancySet(
+            pts.reshape(-1, 3), resolution=self.occ_res, planar=self.planar,
+            z_band=self.occ_z_band if self.dim == 2 else None, ego_z=self.z)
 
     def step(self, _evt):
         if self.pos is None:
@@ -98,10 +126,18 @@ class OcclusionViz(object):
         self.publish_keepout()
         self.publish_sightlines()
         if self.show_nearest:
-            d, i = self.boundaries.nearest(self.pos[None, :])
+            d, i = self.boundaries.nearest(self.ego()[None, :])
             self.pub_nearest.publish(
                 nearest_markers(self.boundaries, self.pos, self.z, self.d_safe,
                                 self.frame_id, float(d[0]), int(i[0])))
+        if self.show_occupied:
+            arr, _ = ego_occupied_markers(self.occupancy, self.ego(), self.z,
+                                          self.frame_id)
+            self.pub_occupied.publish(arr)
+        if self.show_nearest_occ:
+            arr, _ = nearest_occupied_markers(self.occupancy, self.ego(), self.z,
+                                              self.frame_id)
+            self.pub_nearest_occ.publish(arr)
         self.publish_status()
 
     def publish_keepout(self):
@@ -123,7 +159,8 @@ class OcclusionViz(object):
             m.color.a = 0.30 - 0.20 * frac
             m.color.r, m.color.g, m.color.b = 1.0, 0.55 * frac, 0.0
             for p in pts:
-                m.points.append(Point(p[0], p[1], self.z))
+                m.points.append(Point(p[0], p[1],
+                                      p[2] if self.dim == 3 else self.z))
             arr.markers.append(m)
         self.pub_keepout.publish(arr)
 
@@ -143,7 +180,7 @@ class OcclusionViz(object):
         m.color.a, m.color.r, m.color.g, m.color.b = 0.5, 0.2, 1.0, 0.4
         for q in pts:
             m.points.append(Point(self.pos[0], self.pos[1], self.z))
-            m.points.append(Point(q[0], q[1], self.z))
+            m.points.append(Point(q[0], q[1], q[2] if self.dim == 3 else self.z))
 
         arr = MarkerArray()
         arr.markers.append(m)
@@ -151,7 +188,7 @@ class OcclusionViz(object):
         self.n_drawn = len(pts)
 
     def publish_status(self):
-        d = float(self.boundaries.distance(self.pos[None, :])[0])
+        d = float(self.boundaries.distance(self.ego()[None, :])[0])
         r0 = self.d_safe
         r1 = self.d_safe + self.v_target * self.t_grow_max
         breach = np.isfinite(d) and d < r0

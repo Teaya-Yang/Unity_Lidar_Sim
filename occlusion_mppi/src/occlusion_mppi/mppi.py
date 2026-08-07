@@ -36,7 +36,7 @@ class MPPIConfig:
         self.d_safe = 1.0       # [m]
         self.v_target = 1.5     # [m/s] assumed speed of a hidden agent
         self.t_grow_max = 3.0   # [s] cap on keep-out growth
-        self.w_hard = 1.0e6
+        self.w_hard = 50.0
         self.w_soft = 50.0
         self.d_infl = 1.0       # [m]
 
@@ -44,6 +44,18 @@ class MPPIConfig:
         # of the occlusion term, so the two can be switched on and off separately.
         self.w_collision = 1.0e6
         self.use_occlusion = True
+
+        # Altitude bounds [m], 3D only. None disables.
+        #
+        # NOT redundant with the collision term. That term tests membership of the
+        # published occupancy cloud, and ROG-Map's virtual ground/ceiling are
+        # z-comparisons inside isOccupied() -- they are never written to the
+        # occupancy buffer, so boxSearch never emits them and inf_occ contains no
+        # floor. With a wall-only scene there is then nothing at all below the
+        # wall's bottom edge, and diving under the occluder is a collision-free,
+        # occlusion-free way around it. That is exactly what MPPI finds.
+        self.z_min = None
+        self.z_max = None
 
         for k, v in kw.items():
             if not hasattr(self, k):
@@ -106,6 +118,21 @@ class OcclusionMPPI:
                 cost += c.w_collision * hit
                 collided |= hit
 
+
+            #TODO add constrain on the actions proposed and removed the cost here, it needs this handled only the ground is not correclty occupied
+            # Altitude bounds. Binary and charged at w_hard for the same reason
+            # collision is: this is a constraint, and depth of violation is not a
+            # useful gradient -- the sampled rollouts supply the gradient by
+            # simply staying inside.
+            if d > 2 and (c.z_min is not None or c.z_max is not None):
+                z = p[:, 2]
+                out = np.zeros(len(z), dtype=bool)
+                if c.z_min is not None:
+                    out |= z < c.z_min
+                if c.z_max is not None:
+                    out |= z > c.z_max
+                cost += c.w_hard * out
+
             if c.use_occlusion:
                 dist = boundaries.distance(p)
                 cost += occlusion_stage_cost(
@@ -128,6 +155,7 @@ class OcclusionMPPI:
 
         self.nominal = np.einsum("k,khd->hd", w, actions)
         action = self.nominal[0].copy()
+        print(action)
 
         # Shift the nominal for the next step (receding horizon).
         self.nominal = np.roll(self.nominal, -1, axis=0)

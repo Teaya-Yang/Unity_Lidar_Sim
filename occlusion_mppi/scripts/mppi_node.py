@@ -28,7 +28,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from occlusion_mppi.boundary import BoundarySet, OccupancySet  # noqa: E402
 from occlusion_mppi.dynamics import DoubleIntegrator     # noqa: E402
 from occlusion_mppi.mppi import OcclusionMPPI, MPPIConfig  # noqa: E402
-from occlusion_mppi.viz import nearest_markers  # noqa: E402
+from occlusion_mppi.viz import (nearest_markers, ego_occupied_markers,  # noqa: E402
+                                nearest_occupied_markers)  # noqa: E402
+
+
+def _opt_float(v):
+    """None/'' -> None, so a bound can be switched off from a launch file."""
+    if v is None or v == "" or (isinstance(v, str) and v.lower() == "none"):
+        return None
+    return float(v)
 
 
 class MPPINode(object):
@@ -36,6 +44,7 @@ class MPPINode(object):
         self.frame_id = rospy.get_param("~frame_id", "world")
         self.goal = np.array(rospy.get_param("~goal", [0.0, 12.0]), dtype=float)
         self.cruise_z = rospy.get_param("~cruise_z", 1.0)
+        self.goal_z = rospy.get_param("~goal_z", None)
         self.rate_hz = rospy.get_param("~rate", 10.0)
         self.goal_tol = rospy.get_param("~goal_tol", 0.5)
         # Only boundaries within this vertical band of the drone matter while
@@ -44,16 +53,24 @@ class MPPINode(object):
         # With planar=False this only trims the set; the 3D distance already
         # discounts height. Keep it wide enough not to clip real structure.
         self.z_band = rospy.get_param("~z_band", 1.5)
-        # False => genuinely 3D keep-out distance. Rollouts stay 2D (the plant is
-        # dim=2), so BoundarySet lifts them to the flight altitude via query_z.
-        self.planar = bool(rospy.get_param("~planar", False))
+        # 3 => the ego climbs, so it can fly OVER an occluder. 2 keeps the old
+        # fixed-altitude baseline. Everything downstream keys off this: the plant
+        # dimension, whether the occupancy test folds z away, and whether the
+        # z_band pre-filters are applied at all.
+        self.dim = int(rospy.get_param("~dim", 3))
+        # Planar geometry only ever makes sense for a 2D ego. In 3D a folded
+        # occupancy column would make a wall solid at every altitude, so there
+        # would be no way over it.
+        self.planar = self.dim == 2
         # Must match rog_map/inflation_resolution of the cloud being subscribed:
         # too small and rollouts step between voxel centres without ever landing
         # in one, so the collision test silently never fires.
         self.occ_res = rospy.get_param("~occ_resolution", 0.2)
-        # Much tighter than z_band: the occupancy test folds z away, so anything
-        # kept here makes its whole (x,y) column solid. At 1.5 m the floor would
-        # be included and the entire map would read as occupied. Drone half-height.
+        # Much tighter than z_band: with planar=True the occupancy test folds z
+        # away, so anything kept here makes its whole (x,y) column solid. At 1.5 m
+        # the floor would be included and the entire map would read as occupied.
+        # Drone half-height. Unused in 3D -- nothing is folded, so nothing needs
+        # banding, and banding would delete the geometry the ego climbs over.
         self.occ_z_band = rospy.get_param("~occ_z_band", 0.3)
 
         cfg = MPPIConfig(
@@ -67,19 +84,44 @@ class MPPINode(object):
             d_infl=float(rospy.get_param("~d_infl", 1.0)),
             w_collision=float(rospy.get_param("~w_collision", 1.0e6)),
             use_occlusion=bool(rospy.get_param("~use_occlusion", True)),
+            # inf_occ carries no floor (ROG-Map's virtual ground never reaches the
+            # occupancy buffer), so without these the ego dives under an occluder
+            # instead of climbing over it.
+            z_min=_opt_float(rospy.get_param("~z_min", 0.5)),
+            z_max=_opt_float(rospy.get_param("~z_max", 3.5)),
         )
         self.cfg = cfg
 
-        plant = DoubleIntegrator(dim=2, dt=cfg.dt,
+        plant = DoubleIntegrator(dim=self.dim, dt=cfg.dt,
                                  v_max=float(rospy.get_param("~v_max", 2.0)),
                                  a_max=float(rospy.get_param("~a_max", 3.0)))
         self.plant = plant
         self.planner = OcclusionMPPI(plant, cfg, rng=np.random.default_rng(0))
 
-        self.boundaries = BoundarySet(np.zeros((0, 3)))
-        self.occupancy = OccupancySet(np.zeros((0, 3)), resolution=self.occ_res)
+        # Accept [x,y] or [x,y,z] regardless of dim, and normalise to exactly dim
+        # here. Everything downstream -- the goal cost and the goal-reached test
+        # against self.pos -- assumes the two match, and a 3-element goal against
+        # a 2D pose raises a broadcast error rather than anything readable.
+        if len(self.goal) < self.dim:
+            z = self.cruise_z if self.goal_z is None else float(self.goal_z)
+            self.goal = np.append(self.goal, z)
+        elif len(self.goal) > self.dim:
+            rospy.logwarn("[mppi] goal has %d elements but dim=%d -- ignoring z=%.2f",
+                          len(self.goal), self.dim, self.goal[2])
+            self.goal = self.goal[:self.dim]
+        if len(self.goal) != self.dim:
+            raise ValueError("~goal must have 2 or %d elements, got %d"
+                             % (self.dim, len(self.goal)))
+
+        # Placeholders must match the dimension the callbacks will build at:
+        # they are queried on every tick before the first cloud arrives, and a
+        # planar placeholder under dim=3 is a different key space, not an empty one.
+        self.boundaries = BoundarySet(np.zeros((0, 3)), planar=self.planar,
+                                      query_z=self.cruise_z)
+        self.occupancy = OccupancySet(np.zeros((0, 3)), resolution=self.occ_res,
+                                      planar=self.planar)
         self.pos = None
-        self.vel = np.zeros(2)
+        self.vel = np.zeros(self.dim)
         # The setpoint is integrated, exactly like keyboard_control.py, rather than
         # being snapped to the measured pose each tick -- feeding the measured pose
         # back into the setpoint would close a second loop through the plant and
@@ -102,6 +144,16 @@ class MPPINode(object):
         # real time. Keep it well under the boundary count.
         self.sightline_max = int(rospy.get_param("~sightline_max", 120))
         self.show_nearest = bool(rospy.get_param("~show_nearest", True))
+        # One membership test per tick on the measured pose. Cheap, but it is a
+        # diagnostic rather than something the controller needs.
+        self.show_occupied = bool(rospy.get_param("~show_occupied", True))
+        # Builds a KD-tree over inf_occ (tens of thousands of points) whenever the
+        # cloud changes. Nothing in the planner needs it -- turn it off if the
+        # solve rate suffers.
+        self.show_nearest_occ = bool(rospy.get_param("~show_nearest_occupied", True))
+        self.pub_nearest_occ = rospy.Publisher("~nearest_occupied", MarkerArray,
+                                               queue_size=1)
+        self.pub_occupied = rospy.Publisher("~ego_occupied", MarkerArray, queue_size=1)
 
         # Horizon times [s] at which to draw the keep-out. Anything past
         # t_grow_max is the same radius, so the last useful slice is the cap.
@@ -119,6 +171,7 @@ class MPPINode(object):
                                          "/rm_node/rog_map/inf_occ"),
                          PointCloud2, self.cb_occupancy, queue_size=1)
 
+        rospy.loginfo("[mppi] dim=%dD goal=%s", self.dim, self.goal.tolist())
         rospy.loginfo("[mppi] goal=%s occlusion=%s d_safe=%.1f v_target=%.1f "
                       "t_grow_max=%.1f => keep-out grows %.1f -> %.1f m",
                       self.goal.tolist(), cfg.use_occlusion, cfg.d_safe,
@@ -129,35 +182,52 @@ class MPPINode(object):
 
         self.timer = rospy.Timer(rospy.Duration(1.0 / self.rate_hz), self.step)
 
+    def ego_z(self):
+        """Altitude to draw at: the live one in 3D, the fixed cruise one in 2D."""
+        if self.dim == 3 and self.pos is not None:
+            return float(self.pos[2])
+        return float(self.cruise_z)
+
     def cb_odom(self, msg):
         p = msg.pose.pose.position
         v = msg.twist.twist.linear
-        self.pos = np.array([p.x, p.y])
-        self.vel = np.array([v.x, v.y])
+        if self.dim == 3:
+            self.pos = np.array([p.x, p.y, p.z])
+            self.vel = np.array([v.x, v.y, v.z])
+        else:
+            self.pos = np.array([p.x, p.y])
+            self.vel = np.array([v.x, v.y])
         if self.sp is None:
-            self.sp = np.array([p.x, p.y, self.cruise_z])
+            self.sp = np.array([p.x, p.y, p.z if self.dim == 3 else self.cruise_z])
 
     def cb_boundary(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
                                             skip_nans=True)), dtype=float)
         ego_z = self.sp[2] if self.sp is not None else self.cruise_z
-        self.boundaries = BoundarySet(pts.reshape(-1, 3), z_band=self.z_band,
-                                      ego_z=ego_z, planar=self.planar,
-                                      query_z=ego_z)
+        # z_band pre-filter is a 2D-cost device: it drops boundaries the planar
+        # distance would misjudge. In 3D the distance already accounts for
+        # height, and banding would hide exactly the top edge the ego flies over.
+        self.boundaries = BoundarySet(
+            pts.reshape(-1, 3),
+            z_band=self.z_band if self.dim == 2 else None,
+            ego_z=ego_z, planar=self.planar, query_z=ego_z)
 
     def cb_occupancy(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
                                             skip_nans=True)), dtype=float)
         ego_z = self.sp[2] if self.sp is not None else self.cruise_z
-        self.occupancy = OccupancySet(pts.reshape(-1, 3), resolution=self.occ_res,
-                                      planar=True, z_band=self.occ_z_band, ego_z=ego_z)
+        # planar/z_band are 2D-cost devices: folding z makes a wall solid at every
+        # altitude, so in 3D there would be no way over it.
+        self.occupancy = OccupancySet(
+            pts.reshape(-1, 3), resolution=self.occ_res, planar=self.planar,
+            z_band=self.occ_z_band if self.dim == 2 else None, ego_z=ego_z)
 
     def step(self, _evt):
         if self.pos is None or self.sp is None:
             return
 
         if np.linalg.norm(self.pos - self.goal) < self.goal_tol:
-            self.publish_cmd(np.zeros(2))
+            self.publish_cmd(np.zeros(self.dim))
             rospy.loginfo_throttle(5.0, "[mppi] goal reached")
             return
 
@@ -204,6 +274,14 @@ class MPPINode(object):
         self.publish_rollouts(info)
         if self.show_nearest:
             self.publish_nearest(d_now, i_now)
+        if self.show_occupied:
+            arr, _ = ego_occupied_markers(self.occupancy, self.pos, self.ego_z(),
+                                          self.frame_id)
+            self.pub_occupied.publish(arr)
+        if self.show_nearest_occ:
+            arr, _ = nearest_occupied_markers(self.occupancy, self.pos, self.ego_z(),
+                                              self.frame_id)
+            self.pub_nearest_occ.publish(arr)
         self.publish_keepout()
         self.publish_status(info, d_now)
         self.publish_sightlines()
@@ -212,13 +290,17 @@ class MPPINode(object):
         dt = 1.0 / self.rate_hz
         self.sp[0] += vel_cmd[0] * dt
         self.sp[1] += vel_cmd[1] * dt
-        self.sp[2] = self.cruise_z
+        if self.dim == 3:
+            self.sp[2] += vel_cmd[2] * dt
+        else:
+            self.sp[2] = self.cruise_z
+        vz = vel_cmd[2] if self.dim == 3 else 0.0
 
         m = PositionCommand()
         m.header.stamp = rospy.Time.now()
         m.header.frame_id = self.frame_id
         m.position.x, m.position.y, m.position.z = self.sp
-        m.velocity.x, m.velocity.y, m.velocity.z = vel_cmd[0], vel_cmd[1], 0.0
+        m.velocity.x, m.velocity.y, m.velocity.z = vel_cmd[0], vel_cmd[1], vz
         self.pub_cmd.publish(m)
 
     def publish_rollouts(self, info, n_show=40):
@@ -233,11 +315,12 @@ class MPPINode(object):
         m.color.a, m.color.r, m.color.g, m.color.b = 0.35, 0.2, 0.6, 1.0
         m.pose.orientation.w = 1.0
         from geometry_msgs.msg import Point
+        z0 = self.ego_z()
         for i in idx:
             for k in range(traj.shape[1] - 1):
-                a, b = traj[i, k, :2], traj[i, k + 1, :2]
-                m.points.append(Point(a[0], a[1], self.cruise_z))
-                m.points.append(Point(b[0], b[1], self.cruise_z))
+                a, b = traj[i, k, :self.dim], traj[i, k + 1, :self.dim]
+                m.points.append(Point(a[0], a[1], a[2] if self.dim == 3 else z0))
+                m.points.append(Point(b[0], b[1], b[2] if self.dim == 3 else z0))
         arr.markers.append(m)
 
         best = Marker()
@@ -247,8 +330,8 @@ class MPPINode(object):
         best.color.a, best.color.r, best.color.g, best.color.b = 1.0, 0.1, 1.0, 0.2
         best.pose.orientation.w = 1.0
         for k in range(info["best"].shape[0]):
-            p = info["best"][k, :2]
-            best.points.append(Point(p[0], p[1], self.cruise_z))
+            p = info["best"][k, :self.dim]
+            best.points.append(Point(p[0], p[1], p[2] if self.dim == 3 else z0))
         arr.markers.append(best)
 
         self.pub_viz.publish(arr)
@@ -256,7 +339,7 @@ class MPPINode(object):
     def publish_nearest(self, d_now, i_now):
         """Draw the ego -> nearest-boundary vector. See occlusion_mppi.viz."""
         self.pub_nearest.publish(
-            nearest_markers(self.boundaries, self.pos, self.cruise_z,
+            nearest_markers(self.boundaries, self.pos, self.ego_z(),
                             self.cfg.d_safe, self.frame_id, d_now, i_now))
 
     def publish_keepout(self):
@@ -290,7 +373,8 @@ class MPPINode(object):
             # Drawn at the flight altitude, not the voxel's own z: the cost folds z
             # away (planar=True), so the enforced shape really is a column.
             for p in pts:
-                m.points.append(Point(p[0], p[1], self.cruise_z))
+                m.points.append(Point(p[0], p[1],
+                                      p[2] if self.dim == 3 else self.cruise_z))
             arr.markers.append(m)
 
         self.pub_keepout.publish(arr)
@@ -312,7 +396,7 @@ class MPPINode(object):
         m.header.stamp = rospy.Time.now()
         m.ns, m.id, m.type, m.action = "status", 0, Marker.TEXT_VIEW_FACING, Marker.ADD
         m.pose.position.x, m.pose.position.y = self.pos[0], self.pos[1]
-        m.pose.position.z = self.cruise_z + 1.5
+        m.pose.position.z = self.ego_z() + 1.5
         m.pose.orientation.w = 1.0
         m.scale.z = 0.35
         m.color.a = 1.0
@@ -348,9 +432,10 @@ class MPPINode(object):
         m.pose.orientation.w = 1.0
         m.scale.x = 0.015
         m.color.a, m.color.r, m.color.g, m.color.b = 0.5, 0.2, 1.0, 0.4
+        z0 = self.ego_z()
         for q in pts:
-            m.points.append(Point(self.pos[0], self.pos[1], self.cruise_z))
-            m.points.append(Point(q[0], q[1], self.cruise_z))
+            m.points.append(Point(self.pos[0], self.pos[1], z0))
+            m.points.append(Point(q[0], q[1], q[2] if self.dim == 3 else z0))
 
         arr = MarkerArray()
         arr.markers.append(m)

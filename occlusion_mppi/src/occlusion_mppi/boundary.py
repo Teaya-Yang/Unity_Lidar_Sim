@@ -201,15 +201,75 @@ class OccupancySet:
         if z_band is not None and ego_z is not None and len(pts):
             pts = pts[np.abs(pts[:, 2] - ego_z) <= z_band]
         self.points = pts
-        self._keys = np.unique(self._encode(pts[:, :2] if planar else pts))
+        self._pts_q = pts[:, :2] if planar else pts
+        self._keys = np.unique(self._encode(self._pts_q))
+        # Built on first nearest() call, not here: inf_occ routinely carries tens
+        # of thousands of points and the planner never needs a distance -- its
+        # collision term is pure membership. Only the viz asks.
+        self._tree = None
 
     def __len__(self):
         return len(self._keys)
 
+    def _prep(self, query):
+        """Validate a query against the dimension the keys were built at.
+
+        A mismatch here used to be silent and total: _encode only mixes z in when
+        the array has three columns, so a 2D query against a 3D set produces keys
+        that can never match any stored key and inside() returns False for every
+        pose, wall or no wall. Raise instead -- "no collision ever" is not a
+        failure anyone reads as a bug.
+        """
+        q = np.asarray(query, dtype=float)
+        if q.ndim != 2:
+            raise ValueError("query must be (M,2) or (M,3), got shape %s" % (q.shape,))
+        want = 2 if self.planar else 3
+        if q.shape[1] != want:
+            raise ValueError(
+                "OccupancySet(planar=%s) needs (M,%d) queries, got (M,%d). The "
+                "caller is working in a different dimension than the map."
+                % (self.planar, want, q.shape[1]))
+        return q
+
+    def nearest(self, query):
+        """(d, idx) -- distance and index of the nearest OCCUPIED voxel centre.
+
+        Distance to the obstacle surface, as opposed to inside()'s binary "am I in
+        it". Purely diagnostic: the collision cost is a membership test on purpose
+        (penetration depth is not a useful gradient), so nothing in the planner
+        consumes this.
+
+        +inf / -1 when the map is empty, matching BoundarySet.nearest.
+        """
+        q = self._prep(query)
+        if len(q) == 0:
+            return np.empty(0), np.empty(0, dtype=int)
+        if len(self.points) == 0:
+            return np.full(len(q), np.inf), np.full(len(q), -1, dtype=int)
+        if self._tree is None:
+            if not _HAS_SCIPY:
+                d = np.sqrt(((q[:, None, :] - self._pts_q[None, :, :]) ** 2).sum(2))
+                return d.min(axis=1), np.argmin(d, axis=1)
+            self._tree = cKDTree(self._pts_q)
+        d, i = self._tree.query(q)
+        return d, np.asarray(i, dtype=int)
+
     def _encode(self, pts):
         if len(pts) == 0:
             return np.empty(0, dtype=np.int64)
-        idx = np.floor(np.asarray(pts, dtype=float) / self.resolution).astype(np.int64)
+        # +0.5 because ROG-Map publishes voxel CENTRES, not corners. Plain
+        # floor(p/res) puts a centre c in the cell [c, c+res), so the occupied
+        # volume ends up shifted half a voxel from the real obstacle and the ego
+        # reads free until it is already past the surface.
+        #
+        # It is also what makes the binning fp-robust. Centres sit exactly on
+        # multiples of res, i.e. exactly on floor()'s discontinuity, and
+        # 8.1/0.1 == 80.99999999999999 -- so ~5% of centres landed one cell low,
+        # collapsing onto their neighbour and leaving one-cell holes straight
+        # through a wall. Offsetting by half a cell moves the boundary away from
+        # where the data sits.
+        idx = np.floor(np.asarray(pts, dtype=float) / self.resolution
+                       + 0.5).astype(np.int64)
         idx = (idx + self._BIAS) & self._MASK
         key = (idx[:, 0] << 42) | (idx[:, 1] << 21)
         if idx.shape[1] == 3:
@@ -222,7 +282,7 @@ class OccupancySet:
         All-False on an empty map, for the same reason distance() returns +inf:
         an unobserved map must not read as solid.
         """
-        q = np.asarray(query, dtype=float)
+        q = self._prep(query)
         if len(q) == 0:
             return np.zeros(0, dtype=bool)
         if len(self._keys) == 0:
