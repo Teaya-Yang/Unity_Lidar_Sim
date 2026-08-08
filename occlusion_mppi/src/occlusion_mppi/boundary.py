@@ -257,19 +257,16 @@ class OccupancySet:
     def _encode(self, pts):
         if len(pts) == 0:
             return np.empty(0, dtype=np.int64)
-        # +0.5 because ROG-Map publishes voxel CENTRES, not corners. Plain
-        # floor(p/res) puts a centre c in the cell [c, c+res), so the occupied
-        # volume ends up shifted half a voxel from the real obstacle and the ego
-        # reads free until it is already past the surface.
+        # ROG-Map centres its voxels at (i + 0.5) * res -- published coordinates
+        # are 0.45, 10.05, -13.25 and so on, never multiples of res. Plain floor
+        # therefore maps each centre to its own cell and keeps centres away from
+        # floor()'s discontinuity.
         #
-        # It is also what makes the binning fp-robust. Centres sit exactly on
-        # multiples of res, i.e. exactly on floor()'s discontinuity, and
-        # 8.1/0.1 == 80.99999999999999 -- so ~5% of centres landed one cell low,
-        # collapsing onto their neighbour and leaving one-cell holes straight
-        # through a wall. Offsetting by half a cell moves the boundary away from
-        # where the data sits.
-        idx = np.floor(np.asarray(pts, dtype=float) / self.resolution
-                       + 0.5).astype(np.int64)
+        # Do NOT re-add the +0.5 that used to be here: on half-offset data it put
+        # every centre exactly on the discontinuity, collapsing 12871 voxels onto
+        # 5073 keys and opening holes straight through a wall, so inside_segment
+        # returned False for a segment crossing 10k occupied voxels.
+        idx = np.floor(np.asarray(pts, dtype=float) / self.resolution).astype(np.int64)
         idx = (idx + self._BIAS) & self._MASK
         key = (idx[:, 0] << 42) | (idx[:, 1] << 21)
         if idx.shape[1] == 3:

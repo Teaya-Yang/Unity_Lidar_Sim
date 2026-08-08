@@ -83,6 +83,10 @@ class MPPINode(object):
             w_soft=float(rospy.get_param("~w_soft", 50.0)),
             d_infl=float(rospy.get_param("~d_infl", 1.0)),
             w_collision=float(rospy.get_param("~w_collision", 1.0e6)),
+            # Settling authority. At the default 1.2 the damping is ~0.12*v^2 per
+            # stage against a goal pull of 2*d, so rushing the goal always beats
+            # slowing for it and the ego orbits instead of arriving.
+            w_v=float(rospy.get_param("~w_v", 1.2)),
             use_occlusion=bool(rospy.get_param("~use_occlusion", True)),
             # inf_occ carries no floor (ROG-Map's virtual ground never reaches the
             # occupancy buffer), so without these the ego dives under an occluder
@@ -127,6 +131,7 @@ class MPPINode(object):
         # back into the setpoint would close a second loop through the plant and
         # let tracking error accumulate into the command.
         self.sp = None
+        self.at_goal = False
 
         self.pub_cmd = rospy.Publisher("/planning/pos_cmd", PositionCommand, queue_size=10)
         self.pub_viz = rospy.Publisher("~rollouts", MarkerArray, queue_size=1)
@@ -139,6 +144,14 @@ class MPPINode(object):
         # reason this is the marker that says which voxel did it.
         self.pub_nearest = rospy.Publisher("~nearest_boundary", MarkerArray,
                                            queue_size=1)
+        # Latched: the goal never moves, and RViz is usually started last.
+        self.pub_goal = rospy.Publisher("~goal", MarkerArray, queue_size=1,
+                                        latch=True)
+        self.publish_goal()
+        # Scalar d_occ for time-series plotting (rqt_plot ~d_occ/data).
+        from std_msgs.msg import Float32
+        self._Float32 = Float32
+        self.pub_docc = rospy.Publisher("~d_occ", Float32, queue_size=10)
 
         # One marched ray per drawn sightline, so this is the one viz that costs
         # real time. Keep it well under the boundary count.
@@ -163,7 +176,12 @@ class MPPINode(object):
         # 10k+ voxels, which RViz will not draw at interactive rates. Stride down.
         self.keepout_max_pts = int(rospy.get_param("~keepout_max_pts", 400))
 
-        rospy.Subscriber("/lidar_slam/odom", Odometry, self.cb_odom, queue_size=10)
+        # /Odometry_imu (200 Hz, IMU-extrapolated), NOT /lidar_slam/odom: the
+        # latter is stamped at scan-end and trails the true pose by ~0.35 m at
+        # 1.2 m/s, which is a whole goal_tol. Planning on a pose that stale is
+        # what makes the ego overshoot and orbit the goal instead of settling.
+        rospy.Subscriber(rospy.get_param("~odom_topic", "/Odometry_imu"),
+                         Odometry, self.cb_odom, queue_size=10)
         rospy.Subscriber(rospy.get_param("~boundary_topic",
                                          "/rm_node/occlusion_frontier"),
                          PointCloud2, self.cb_boundary, queue_size=1)
@@ -215,6 +233,12 @@ class MPPINode(object):
     def cb_occupancy(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
                                             skip_nans=True)), dtype=float)
+        # inf_occ flickers to zero points under load. An empty message is not
+        # "the world became free": planning one blind cycle at 2 m/s walks the
+        # ego straight through a wall the previous message contained. Keep the
+        # last real map until a non-empty one arrives.
+        if len(pts) == 0 and self.occupancy is not None and len(self.occupancy):
+            return
         ego_z = self.sp[2] if self.sp is not None else self.cruise_z
         # planar/z_band are 2D-cost devices: folding z makes a wall solid at every
         # altitude, so in 3D there would be no way over it.
@@ -226,33 +250,49 @@ class MPPINode(object):
         if self.pos is None or self.sp is None:
             return
 
-        if np.linalg.norm(self.pos - self.goal) < self.goal_tol:
+        # Hysteresis: releasing at the same radius it latches at makes the ego
+        # chatter in and out of "arrived" on estimator noise, which reads as
+        # circling. Latch at goal_tol, release only at 1.5x.
+        d_goal = float(np.linalg.norm(self.pos - self.goal))
+        if d_goal < self.goal_tol:
+            self.at_goal = True
+        elif d_goal > 1.5 * self.goal_tol:
+            self.at_goal = False
+        if self.at_goal:
+            # Park the setpoint ON the goal rather than wherever sp drifted to,
+            # then hold it: publishing zero velocity alone leaves the PID
+            # chasing a stale sp offset from the goal.
+            self.sp[:self.dim] = self.goal[:self.dim]
             self.publish_cmd(np.zeros(self.dim))
-            rospy.loginfo_throttle(5.0, "[mppi] goal reached")
+            rospy.loginfo_throttle(5.0, "[mppi] goal reached (d=%.2f)", d_goal)
             return
 
         action, info = self.planner.plan(self.pos, self.vel, self.goal,
                                          self.boundaries, self.occupancy)
+
+        # Every rollout colliding is degenerate: all costs equal, the softmax is
+        # uniform and the mean action is the stale nominal -- which WALKS THE EGO
+        # THROUGH THE WALL it is facing. Do not follow it: brake at full
+        # authority until some rollout survives again.
+        if info["frac_collide"] > 0.99:
+            rospy.logwarn_throttle(
+                2.0, "[mppi] ALL rollouts collide (occ=%d) -- braking instead "
+                "of following the degenerate mean", len(self.occupancy))
+            speed = float(np.linalg.norm(self.vel))
+            action = (-self.plant.a_max * self.vel / speed if speed > 1e-3
+                      else np.zeros(self.dim))
 
         # Integrate the setpoint with the planned acceleration.
         self.vel_cmd = np.clip(self.vel + action * self.cfg.dt,
                                -self.plant.v_max, self.plant.v_max)
         self.publish_cmd(self.vel_cmd)
 
-        # Every rollout colliding is not "very unsafe", it is degenerate: the costs
-        # are then all equal, the softmax is uniform and the mean action is ~0, so
-        # the drone freezes rather than avoids. Almost always an over-wide
-        # occ_z_band pulling the floor into the planar fold.
-        if info["frac_collide"] > 0.99:
-            rospy.logwarn_throttle(
-                2.0, "[mppi] ALL rollouts collide (occ=%d, occ_z_band=%.2f) -- "
-                "planner is degenerate and will not move", len(self.occupancy),
-                self.occ_z_band)
-
         # nearest() rather than distance(): the index is what lets publish_nearest
         # draw the actual voxel, and it is free -- the KD-tree returns it anyway.
         d_arr, i_arr = self.boundaries.nearest(self.pos[None, :])
         d_now, i_now = float(d_arr[0]), int(i_arr[0])
+        if np.isfinite(d_now):
+            self.pub_docc.publish(self._Float32(data=d_now))
         rospy.loginfo_throttle(
             2.0, "[mppi] pos=(%.1f,%.1f) |v|=%.2f  d_occ=%s  boundaries=%d  occ=%d  "
             "infeas=%.2f  collide=%.2f  solve=%.1fms (%.1fHz, %.2fus/rollout-step)%s",
@@ -292,6 +332,18 @@ class MPPINode(object):
         self.sp[1] += vel_cmd[1] * dt
         if self.dim == 3:
             self.sp[2] += vel_cmd[2] * dt
+            # Hard clamp: the ground is NOT in inf_occ (ROG-Map's virtual ground
+            # is a z-test, never published), so the cost alone cannot stop a
+            # dive. The commanded setpoint must never leave the altitude band.
+            lo = self.cfg.z_min if self.cfg.z_min is not None else -np.inf
+            hi = self.cfg.z_max if self.cfg.z_max is not None else np.inf
+            z_free = self.sp[2]
+            self.sp[2] = float(np.clip(self.sp[2], lo, hi))
+            # At the bound, also stop commanding vertical speed -- a clamped
+            # position with a live vz makes the PID overshoot past the floor.
+            if self.sp[2] != z_free:
+                vel_cmd = vel_cmd.copy()
+                vel_cmd[2] = 0.0
         else:
             self.sp[2] = self.cruise_z
         vz = vel_cmd[2] if self.dim == 3 else 0.0
@@ -378,6 +430,36 @@ class MPPINode(object):
             arr.markers.append(m)
 
         self.pub_keepout.publish(arr)
+
+    def publish_goal(self):
+        """Goal as a sphere sized to goal_tol, so 'inside the sphere' == arrived."""
+        gx, gy = float(self.goal[0]), float(self.goal[1])
+        gz = float(self.goal[2]) if self.dim == 3 else float(self.cruise_z)
+
+        arr = MarkerArray()
+        s = Marker()
+        s.header.frame_id = self.frame_id
+        s.header.stamp = rospy.Time.now()
+        s.ns, s.id, s.type, s.action = "goal", 0, Marker.SPHERE, Marker.ADD
+        s.pose.position.x, s.pose.position.y, s.pose.position.z = gx, gy, gz
+        s.pose.orientation.w = 1.0
+        s.scale.x = s.scale.y = s.scale.z = 2.0 * self.goal_tol
+        s.color.r, s.color.g, s.color.b, s.color.a = 0.1, 0.9, 0.2, 0.45
+        arr.markers.append(s)
+
+        t = Marker()
+        t.header.frame_id = self.frame_id
+        t.header.stamp = s.header.stamp
+        t.ns, t.id, t.type, t.action = "goal", 1, Marker.TEXT_VIEW_FACING, Marker.ADD
+        t.pose.position.x, t.pose.position.y = gx, gy
+        t.pose.position.z = gz + self.goal_tol + 0.4
+        t.pose.orientation.w = 1.0
+        t.scale.z = 0.45
+        t.color.r, t.color.g, t.color.b, t.color.a = 0.1, 0.9, 0.2, 1.0
+        t.text = "goal (%.1f, %.1f, %.1f)  tol %.1fm" % (gx, gy, gz, self.goal_tol)
+        arr.markers.append(t)
+
+        self.pub_goal.publish(arr)
 
     def publish_status(self, info, d_now):
         """Live readout of WHICH term is binding, drawn above the drone.

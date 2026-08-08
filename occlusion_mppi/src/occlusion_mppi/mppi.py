@@ -105,6 +105,11 @@ class OcclusionMPPI:
 
             cost += c.w_goal * np.linalg.norm(p - goal, axis=1) * c.dt
             cost += c.w_ctrl * np.sum(actions[:, k, :] ** 2, axis=1) * c.dt
+            # Velocity damping: near the goal the position gradient flattens and
+            # the weighted mean degenerates to averaged noise; this keeps the
+            # low-cost rollouts the slow ones so the ego settles instead of
+            # dithering around the goal.
+            cost += c.w_v * np.sum(v ** 2, axis=1) * c.dt
 
             # Collision: charged once per stage whose SEGMENT crosses an occupied
             # cell. Swept rather than point-sampled, because v*dt is the same order
@@ -141,8 +146,9 @@ class OcclusionMPPI:
                     t_grow_max=c.t_grow_max, w_soft=c.w_soft, d_infl=c.d_infl,
                 )
 
-        cost += c.w_goal_term * np.linalg.norm(pos_t[:, -1, :] - goal, axis=1)
 
+        cost += c.w_goal_term * np.linalg.norm(pos_t[:, -1, :] - goal, axis=1)
+    
         # MPPI weighting. Subtracting the min before exp is what keeps this from
         # underflowing to all-zero when every rollout is infeasible (cost ~1e6).
         beta = cost.min()
@@ -155,7 +161,6 @@ class OcclusionMPPI:
 
         self.nominal = np.einsum("k,khd->hd", w, actions)
         action = self.nominal[0].copy()
-        print(action)
 
         # Shift the nominal for the next step (receding horizon).
         self.nominal = np.roll(self.nominal, -1, axis=0)
