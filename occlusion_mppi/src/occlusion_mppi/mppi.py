@@ -87,6 +87,12 @@ class OcclusionMPPI:
 
         noise = self.rng.normal(0.0, c.sigma_a, size=(K, H, d))
         actions = self.nominal[None, :, :] + noise
+        # Sample only in the plane the plant can actually move in. The plant
+        # ignores a_z anyway, but leaving it sampled would charge w_ctrl for
+        # vertical effort that never happens and would return a nonzero a_z for
+        # the node to integrate into the setpoint.
+        if getattr(self.plant, "lock_z", False):
+            actions[:, :, 2] = 0.0
 
         s0 = self.plant.initial_state(pos, vel, K)
         traj = self.plant.rollout(s0, actions)          # (K, H, 2d)
@@ -97,6 +103,11 @@ class OcclusionMPPI:
 
         cost = np.zeros(K)
         collided = np.zeros(K, dtype=bool)
+        # A rollout is infeasible if ANY stage breached a hard keep-out. Tracked
+        # separately from `cost`: the goal term alone sums to hundreds over the
+        # horizon, so comparing the total against w_hard reads 1.00 always and
+        # says nothing.
+        breached = np.zeros(K, dtype=bool)
         for k in range(H):
             t_k = (k + 1) * c.dt
             p = pos_t[:, k, :]
@@ -140,6 +151,8 @@ class OcclusionMPPI:
 
             if c.use_occlusion:
                 dist = boundaries.distance(p)
+                t_eff = min(t_k, c.t_grow_max) if c.t_grow_max is not None else t_k
+                breached |= dist < c.d_safe + c.v_target * t_eff
                 cost += occlusion_stage_cost(
                     d=dist, v=speed, t_k=t_k,
                     v_target=c.v_target, d_safe=c.d_safe, w_obs=c.w_hard,
@@ -174,7 +187,7 @@ class OcclusionMPPI:
             # Cost of one (rollout, stage) pair -- the unit that scales with K*H.
             "us_per_rollout_step": solve_s * 1e6 / (K * H),
             "best": traj[int(np.argmin(cost))],
-            "frac_infeasible": float(np.mean(cost >= c.w_hard * c.dt)),
+            "frac_infeasible": float(np.mean(breached | collided)),
             "frac_collide": float(np.mean(collided)),
         }
         return action, info

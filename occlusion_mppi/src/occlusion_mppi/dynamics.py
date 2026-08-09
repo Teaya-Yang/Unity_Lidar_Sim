@@ -26,21 +26,42 @@ class DoubleIntegrator:
     Action : (K, dim)    -> acceleration command [m/s^2]
     """
 
-    def __init__(self, dim=2, dt=0.1, v_max=3.0, a_max=4.0):
+    def __init__(self, dim=2, dt=0.1, v_max=3.0, a_max=4.0, lock_z=False):
+        """lock_z : constrain the plant to the horizontal plane it starts in.
+
+        Only meaningful at dim=3. The state stays 3D -- the collision test, the
+        altitude bounds and the viz all still work in 3D -- but the vertical
+        action and velocity are held at zero, so every rollout is a level flight
+        at the ego's current altitude.
+
+        This exists to match a PLANAR occlusion distance. Folding z out of the
+        keep-out while leaving the plant free is incoherent: the cost cannot see
+        a climb, so climbing is free, and MPPI will happily spend vertical
+        authority that buys it nothing against a ground agent. Constrain the
+        plant to the same plane the cost is measured in and the two agree.
+        """
         self.dim = dim
         self.dt = dt
         self.v_max = v_max
         self.a_max = a_max
+        self.lock_z = bool(lock_z) and dim > 2
 
     def initial_state(self, pos, vel, K):
         s = np.zeros((K, 2 * self.dim))
         s[:, :self.dim] = np.asarray(pos, dtype=float)[:self.dim]
         s[:, self.dim:] = np.asarray(vel, dtype=float)[:self.dim]
+        # A measured vz would otherwise coast the whole rollout off the plane,
+        # since with lock_z there is no action able to cancel it.
+        if self.lock_z:
+            s[:, -1] = 0.0
         return s
 
     def step(self, state, action):
         d = self.dim
         a = np.clip(action, -self.a_max, self.a_max)
+        if self.lock_z:
+            a = a.copy()
+            a[:, 2] = 0.0
 
         vel = state[:, d:] + a * self.dt
         # Clip SPEED, not per-axis velocity: per-axis clipping would silently bias

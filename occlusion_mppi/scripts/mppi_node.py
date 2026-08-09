@@ -62,6 +62,14 @@ class MPPINode(object):
         # occupancy column would make a wall solid at every altitude, so there
         # would be no way over it.
         self.planar = self.dim == 2
+        # Planar-ness of the OCCLUSION distance only, decoupled from dim. The
+        # occupancy test must stay 3D when dim=3 (folding z makes a wall solid at
+        # every altitude, so there is no way over it), but the keep-out is a
+        # different question: a hidden agent is on the ground and its threat is
+        # where it can reach in XY, not how far below the drone it currently is.
+        # A 3D distance lets the ego "escape" a boundary by climbing, which buys
+        # no safety against an agent that simply walks out from under it.
+        self.boundary_planar = bool(rospy.get_param("~boundary_planar", True))
         # Must match rog_map/inflation_resolution of the cloud being subscribed:
         # too small and rollouts step between voxel centres without ever landing
         # in one, so the collision test silently never fires.
@@ -72,6 +80,12 @@ class MPPINode(object):
         # Drone half-height. Unused in 3D -- nothing is folded, so nothing needs
         # banding, and banding would delete the geometry the ego climbs over.
         self.occ_z_band = rospy.get_param("~occ_z_band", 0.3)
+        # Drop boundary voxels below this z before they enter the keep-out.
+        # The under-ground volume is unknown+attached+hidden, so the extractor
+        # can emit it as occlusion frontier, but nothing can emerge from
+        # underground -- distance to those voxels is pure false keep-out.
+        # Belt-and-braces with the extractor's own min_frontier_z filter.
+        self.boundary_z_min = _opt_float(rospy.get_param("~boundary_z_min", 0.3))
 
         cfg = MPPIConfig(
             horizon=int(rospy.get_param("~horizon", 30)),
@@ -96,9 +110,16 @@ class MPPINode(object):
         )
         self.cfg = cfg
 
+        # Lock the ego to a level plane. Defaults to following boundary_planar:
+        # a planar keep-out cannot see a climb, so leaving the plant free lets
+        # MPPI spend vertical authority the cost does not score. Set explicitly
+        # to decouple them (e.g. planar cost but 3D motion to clear an obstacle).
+        self.lock_altitude = bool(rospy.get_param("~lock_altitude",
+                                                  self.boundary_planar))
         plant = DoubleIntegrator(dim=self.dim, dt=cfg.dt,
                                  v_max=float(rospy.get_param("~v_max", 2.0)),
-                                 a_max=float(rospy.get_param("~a_max", 3.0)))
+                                 a_max=float(rospy.get_param("~a_max", 3.0)),
+                                 lock_z=self.lock_altitude)
         self.plant = plant
         self.planner = OcclusionMPPI(plant, cfg, rng=np.random.default_rng(0))
 
@@ -116,11 +137,19 @@ class MPPINode(object):
         if len(self.goal) != self.dim:
             raise ValueError("~goal must have 2 or %d elements, got %d"
                              % (self.dim, len(self.goal)))
+        # Locked to a plane, the ego can never cancel a z error against the goal,
+        # so any mismatch is a constant offset added to every d_goal -- large
+        # enough and goal_tol is unreachable and the ego orbits forever with no
+        # visible cause. Snap the goal into the plane it is allowed to fly in.
+        if self.dim == 3 and self.lock_altitude and self.goal[2] != self.cruise_z:
+            rospy.logwarn("[mppi] lock_altitude: goal z %.2f -> cruise_z %.2f",
+                          self.goal[2], self.cruise_z)
+            self.goal[2] = self.cruise_z
 
         # Placeholders must match the dimension the callbacks will build at:
         # they are queried on every tick before the first cloud arrives, and a
         # planar placeholder under dim=3 is a different key space, not an empty one.
-        self.boundaries = BoundarySet(np.zeros((0, 3)), planar=self.planar,
+        self.boundaries = BoundarySet(np.zeros((0, 3)), planar=self.boundary_planar,
                                       query_z=self.cruise_z)
         self.occupancy = OccupancySet(np.zeros((0, 3)), resolution=self.occ_res,
                                       planar=self.planar)
@@ -220,15 +249,18 @@ class MPPINode(object):
 
     def cb_boundary(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
-                                            skip_nans=True)), dtype=float)
+                                            skip_nans=True)), dtype=float).reshape(-1, 3)
+        if self.boundary_z_min is not None and len(pts):
+            pts = pts[pts[:, 2] >= self.boundary_z_min]
         ego_z = self.sp[2] if self.sp is not None else self.cruise_z
-        # z_band pre-filter is a 2D-cost device: it drops boundaries the planar
-        # distance would misjudge. In 3D the distance already accounts for
-        # height, and banding would hide exactly the top edge the ego flies over.
+        # z_band pre-filter belongs to the PLANAR distance, not to dim: folding z
+        # away makes a boundary 4 m overhead read as zero lateral distance, so it
+        # has to be trimmed first. A 3D distance already discounts height and
+        # banding would hide exactly the top edge the ego flies over.
         self.boundaries = BoundarySet(
             pts.reshape(-1, 3),
-            z_band=self.z_band if self.dim == 2 else None,
-            ego_z=ego_z, planar=self.planar, query_z=ego_z)
+            z_band=self.z_band if self.boundary_planar else None,
+            ego_z=ego_z, planar=self.boundary_planar, query_z=ego_z)
 
     def cb_occupancy(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
@@ -282,9 +314,15 @@ class MPPINode(object):
             action = (-self.plant.a_max * self.vel / speed if speed > 1e-3
                       else np.zeros(self.dim))
 
-        # Integrate the setpoint with the planned acceleration.
-        self.vel_cmd = np.clip(self.vel + action * self.cfg.dt,
-                               -self.plant.v_max, self.plant.v_max)
+        # Integrate the setpoint with the planned acceleration. Clip SPEED like
+        # the rollout plant does, not per-axis: per-axis lets a diagonal command
+        # reach v_max*sqrt(2), so the drone flies faster than anything the
+        # planner ever simulated.
+        vel_cmd = self.vel + action * self.cfg.dt
+        speed = float(np.linalg.norm(vel_cmd))
+        if speed > self.plant.v_max:
+            vel_cmd *= self.plant.v_max / speed
+        self.vel_cmd = vel_cmd
         self.publish_cmd(self.vel_cmd)
 
         # nearest() rather than distance(): the index is what lets publish_nearest
@@ -330,7 +368,15 @@ class MPPINode(object):
         dt = 1.0 / self.rate_hz
         self.sp[0] += vel_cmd[0] * dt
         self.sp[1] += vel_cmd[1] * dt
-        if self.dim == 3:
+        if self.dim == 3 and self.lock_altitude:
+            # Level flight: hold the commanded altitude outright rather than
+            # integrating a vz the planner never produced. Held at cruise_z, not
+            # at whatever z the setpoint reached before the lock, so the plane is
+            # a stated altitude instead of an accident of takeoff.
+            self.sp[2] = self.cruise_z
+            vel_cmd = vel_cmd.copy()
+            vel_cmd[2] = 0.0
+        elif self.dim == 3:
             self.sp[2] += vel_cmd[2] * dt
             # Hard clamp: the ground is NOT in inf_occ (ROG-Map's virtual ground
             # is a z-test, never published), so the cost alone cannot stop a

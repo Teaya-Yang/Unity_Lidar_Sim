@@ -8,7 +8,14 @@
            roslaunch occlusion_mppi mppi.launch
            roslaunch rog_map_example rviz.launch
     -->
+    <!-- /Odometry_imu is FAST-LIO's 200 Hz IMU-extrapolated pose and requires the
+         FAST-LIO stack to be running. With bare MARSIM (use_dynamics:=false)
+         nothing publishes it and the planner sits silent waiting for a pose.
+         Pass /lidar_slam/odom for that case. -->
+    <arg name="odom_topic" default="/Odometry_imu"/>
+
     <node name="occlusion_mppi" pkg="occlusion_mppi" type="mppi_node.py" output="screen">
+        <param name="odom_topic" value="$(arg odom_topic)"/>
         <!-- 3 => the ego climbs and can fly OVER an occluder; 2 is the old
              fixed-altitude baseline. In 2D the occupancy test folds z away, so a
              wall is solid at every altitude and there is no way over it. -->
@@ -16,22 +23,26 @@
         <!-- [x,y] or [x,y,z]. With three elements the z is the goal altitude and
              goal_z below is ignored; with two it is padded with goal_z. In 2D any
              third element is dropped. -->
-        <rosparam param="goal">[8.0, 16.0, 1.0]</rosparam>
+        <rosparam param="goal">[15.0, 7.0, 1.0]</rosparam>
         <!-- Altitude a 2-element goal is padded to. Defaults to cruise_z. -->
         <param name="goal_z" value="1.0"/>
         <!-- 3D: the takeoff/hold altitude only, not a constraint. 2D: enforced. -->
         <param name="cruise_z" value="1.0"/>
         <param name="boundary_topic" value="/rm_node/occlusion_frontier"/>
-        <!-- Occupied (inflated) voxels. The collision term is a plain membership
-             test against these, so occ_resolution MUST match the map's
-             inflation_resolution or the test never fires. -->
+        <!-- Occlusion geometry (boundary_planar, z_band, boundary_z_min, d_safe,
+             v_target, t_grow_max, occ_resolution, occ_z_band): SHARED with
+             occlusion_viz.launch. Edit the yaml, never this file. These two
+             nodes disagreeing is not a visible failure; occlusion_viz simply
+             draws a keep-out the planner is not enforcing. -->
+        <rosparam command="load"
+                  file="$(find occlusion_mppi)/config/occlusion_common.yaml"/>
+        <!-- Level flight: a_z and v_z are held at zero in every rollout and in
+             the command, so the ego stays at cruise_z. Defaults to whatever
+             boundary_planar is, since a planar keep-out cannot score a climb and
+             would let MPPI spend vertical authority for nothing. Set explicitly
+             to decouple the two. -->
+        <param name="lock_altitude" value="true"/>
         <param name="occupancy_topic" value="/rm_node/rog_map/inf_occ"/>
-        <param name="occ_resolution" value="0.1"/>
-        <!-- 2D ONLY (ignored when dim=3, where nothing is folded). Keep this
-             tight: virtual_ground_height marks everything below the floor
-             occupied, and a wide band folds it into every column, freezing the
-             planner. Same story for z_band below. -->
-        <param name="occ_z_band" value="0.3"/>
         <param name="w_collision" value="100"/>
         <!-- Altitude bounds, 3D only. inf_occ contains NO floor: ROG-Map's
              virtual_ground_height is a z-test inside isOccupied() and never
@@ -44,8 +55,8 @@
         <!-- Flip to false for the baseline run: collision only, no occlusion. -->
         <param name="use_occlusion" value="true"/>
         <param name="rate" value="10.0"/>
-        <param name="samples" value="500"/>
-        <param name="horizon" value="20"/>
+        <param name="samples" value="300"/>
+        <param name="horizon" value="40"/>
 
         <!-- Arrow from the ego to the voxel setting d_occ. Costs one extra
              KD-tree index lookup per tick; set false to drop it entirely. -->
@@ -56,14 +67,20 @@
              that can make the collision term silently never fire. -->
         <param name="show_occupied" value="true"/>
 
-        <param name="d_safe" value="0.0"/>
-        <param name="v_target" value="1.0"/>
-        <param name="t_grow_max" value="2.0"/>
+        <!-- d_safe / v_target / t_grow_max now come from occlusion_common.yaml
+             above. w_soft and d_infl are the COST's shape, not the geometry, and
+             occlusion_viz does not use them, so they stay here. -->
         <param name="w_soft" value="50.0"/>
         <param name="d_infl" value="1.0"/>
 
+        <!-- Settling authority. The MPPIConfig default of 1.2 gives damping of
+             ~0.12*v^2 per stage against a goal pull of 2*d: rushing the goal
+             always beats braking for it and the ego overshoots, the at-goal
+             latch releases at 1.5*goal_tol, and it orbits forever. 15 makes
+             braking win inside the last metre. -->
+        <param name="w_v" value="15.0"/>
+
         <param name="v_max" value="2.0"/>
         <param name="a_max" value="3.0"/>
-        <param name="z_band" value="1.5"/>
     </node>
 </launch>

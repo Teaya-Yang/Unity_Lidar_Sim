@@ -43,7 +43,8 @@ def nearest_markers(boundaries, pos, z, d_safe, frame_id, d_now, i_now,
     # No boundaries (or none in the z_band) => nothing to draw, but the stale arrow
     # from the last tick must go, or it reads as a live measurement.
     if not np.isfinite(d_now) or i_now < 0 or i_now >= len(boundaries):
-        for ns, mid in (("nearest", 0), ("nearest_text", 1)):
+        for ns, mid in (("nearest", 0), ("nearest_text", 1),
+                        ("nearest_voxel", 2), ("nearest_voxel_text", 3)):
             m = Marker()
             m.header.frame_id = frame_id
             m.ns, m.id, m.action = ns, mid, Marker.DELETE
@@ -91,6 +92,40 @@ def nearest_markers(boundaries, pos, z, d_safe, frame_id, d_now, i_now,
     t.color.r, t.color.g, t.color.b = m.color.r, m.color.g, m.color.b
     t.text = "d=%.2f / r=%.2f" % (d_now, r_now)
     arr.markers.append(t)
+
+    # The voxel ITSELF, at its true (x,y,z) -- never folded to flight altitude
+    # like the arrow tip is. When the distance is planar the arrow lies flat and
+    # can appear to end on a solid surface while the voxel it actually chose is
+    # metres above or below; this cube is the only marker that shows where the
+    # KD-tree hit really is. Drawn big and magenta to be findable through a
+    # point cloud that would otherwise draw over it.
+    c = Marker()
+    c.header.frame_id = frame_id
+    c.header.stamp = stamp
+    c.ns, c.id = "nearest_voxel", 2
+    c.type, c.action = Marker.CUBE, Marker.ADD
+    c.pose.position.x, c.pose.position.y, c.pose.position.z = (
+        float(tgt[0]), float(tgt[1]), float(tgt[2]))
+    c.pose.orientation.w = 1.0
+    c.scale.x = c.scale.y = c.scale.z = 0.45
+    c.color.a = 0.9
+    c.color.r, c.color.g, c.color.b = 1.0, 0.0, 1.0
+    arr.markers.append(c)
+
+    # Its coordinates in text, so the value can be read without probing in RViz.
+    ct = Marker()
+    ct.header.frame_id = frame_id
+    ct.header.stamp = stamp
+    ct.ns, ct.id = "nearest_voxel_text", 3
+    ct.type, ct.action = Marker.TEXT_VIEW_FACING, Marker.ADD
+    ct.pose.position.x, ct.pose.position.y = float(tgt[0]), float(tgt[1])
+    ct.pose.position.z = float(tgt[2]) + 0.5
+    ct.pose.orientation.w = 1.0
+    ct.scale.z = 0.3
+    ct.color.a = 0.95
+    ct.color.r, ct.color.g, ct.color.b = 1.0, 0.3, 1.0
+    ct.text = "voxel (%.2f, %.2f, %.2f)" % (tgt[0], tgt[1], tgt[2])
+    arr.markers.append(ct)
 
     return arr
 

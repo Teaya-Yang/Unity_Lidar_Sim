@@ -86,7 +86,12 @@ class BoundarySet:
         configuration rather than of each query.
         """
         q = np.asarray(query, dtype=float)
-        if self.planar or q.ndim != 2 or q.shape[1] != 2:
+        if self.planar:
+            # A 3D ego querying a planar set is now the normal case (dim=3 with
+            # boundary_planar): drop z rather than hand a (M,3) query to a tree
+            # built on (N,2), which SciPy rejects outright.
+            return q[:, :2] if (q.ndim == 2 and q.shape[1] == 3) else q
+        if q.ndim != 2 or q.shape[1] != 2:
             return q
         if self.query_z is None:
             raise ValueError(

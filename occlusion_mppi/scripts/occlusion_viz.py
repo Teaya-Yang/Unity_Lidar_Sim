@@ -38,13 +38,19 @@ class OcclusionViz(object):
 
         # Kept identical to mppi_node.py's defaults so the picture drawn here is the
         # one the planner would act on. Override both together or not at all.
-        self.d_safe = float(rospy.get_param("~d_safe", 1.0))
+        self.d_safe = float(rospy.get_param("~d_safe", 0.5))
         self.v_target = float(rospy.get_param("~v_target", 1.5))
-        self.t_grow_max = float(rospy.get_param("~t_grow_max", 3.0))
+        self.t_grow_max = float(rospy.get_param("~t_grow_max", 2.0))
         self.z_band = float(rospy.get_param("~z_band", 1.5))
         # Mirrors mppi_node: 3 => 3D geometry, no z folding, no z_band.
         self.dim = int(rospy.get_param("~dim", 3))
+        # Occupancy stays keyed to dim; the OCCLUSION distance is planar or not
+        # on its own account. Same split as mppi_node -- keep them in step, or
+        # this draws a keep-out the planner is not using.
         self.planar = self.dim == 2
+        self.boundary_planar = bool(rospy.get_param("~boundary_planar", True))
+        # Underground frontier is phantom keep-out; see mppi_node.
+        self.boundary_z_min = rospy.get_param("~boundary_z_min", 0.3)
         self.occ_res = float(rospy.get_param("~occ_resolution", 0.2))
         self.occ_z_band = float(rospy.get_param("~occ_z_band", 0.3))
         self.sightline_max = int(rospy.get_param("~sightline_max", 120))
@@ -56,7 +62,7 @@ class OcclusionViz(object):
         self.z = 1.0
 
         # Must match the dimension the callbacks build at -- see mppi_node.
-        self.boundaries = BoundarySet(np.zeros((0, 3)), planar=self.planar,
+        self.boundaries = BoundarySet(np.zeros((0, 3)), planar=self.boundary_planar,
                                       query_z=self.z)
         self.occupancy = OccupancySet(np.zeros((0, 3)), resolution=self.occ_res,
                                       planar=self.planar)
@@ -75,8 +81,23 @@ class OcclusionViz(object):
         self.pub_occupied = rospy.Publisher("~ego_occupied", MarkerArray, queue_size=1)
         self.pub_nearest = rospy.Publisher("~nearest_boundary", MarkerArray,
                                            queue_size=1)
+        # The distance as a time series, so it can be watched while flying:
+        #   rqt_plot /occlusion_viz/d_occ/data
+        # The marker answers "which voxel", this answers "how has it moved".
+        from std_msgs.msg import Float32
+        self._Float32 = Float32
+        self.pub_docc = rospy.Publisher("~d_occ", Float32, queue_size=10)
+        # EXACTLY what the KD-tree was built on, after boundary_z_min and z_band
+        # have trimmed the incoming cloud. Comparing this against
+        # /rm_node/occlusion_frontier is the only way to see what the filters
+        # removed -- and, more importantly, what they did not.
+        self.pub_used = rospy.Publisher("~boundary_used", PointCloud2, queue_size=1)
 
-        rospy.Subscriber("/lidar_slam/odom", Odometry, self.cb_odom, queue_size=10)
+        # Ground truth by default: this node is for inspecting the FRONTIER, and
+        # a drifting pose estimate would be an extra variable in that question.
+        # Pass /Odometry_imu to look at what FAST-LIO actually gives the planner.
+        rospy.Subscriber(rospy.get_param("~odom_topic", "/lidar_slam/odom"),
+                         Odometry, self.cb_odom, queue_size=10)
         rospy.Subscriber(rospy.get_param("~boundary_topic",
                                          "/rm_node/occlusion_frontier"),
                          PointCloud2, self.cb_boundary, queue_size=1)
@@ -107,11 +128,13 @@ class OcclusionViz(object):
 
     def cb_boundary(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
-                                            skip_nans=True)), dtype=float)
+                                            skip_nans=True)), dtype=float).reshape(-1, 3)
+        if self.boundary_z_min is not None and len(pts):
+            pts = pts[pts[:, 2] >= float(self.boundary_z_min)]
         self.boundaries = BoundarySet(
-            pts.reshape(-1, 3),
-            z_band=self.z_band if self.dim == 2 else None,
-            ego_z=self.z, planar=self.planar, query_z=self.z)
+            pts,
+            z_band=self.z_band if self.boundary_planar else None,
+            ego_z=self.z, planar=self.boundary_planar, query_z=self.z)
 
     def cb_occupancy(self, msg):
         pts = np.array(list(pc2.read_points(msg, field_names=("x", "y", "z"),
@@ -120,9 +143,17 @@ class OcclusionViz(object):
             pts.reshape(-1, 3), resolution=self.occ_res, planar=self.planar,
             z_band=self.occ_z_band if self.dim == 2 else None, ego_z=self.z)
 
+    def publish_used(self):
+        """Republish the tree's own points, so RViz shows the queried set."""
+        from std_msgs.msg import Header
+        h = Header(stamp=rospy.Time.now(), frame_id=self.frame_id)
+        self.pub_used.publish(
+            pc2.create_cloud_xyz32(h, self.boundaries.points.tolist()))
+
     def step(self, _evt):
         if self.pos is None:
             return
+        self.publish_used()
         self.publish_keepout()
         self.publish_sightlines()
         if self.show_nearest:
@@ -159,8 +190,11 @@ class OcclusionViz(object):
             m.color.a = 0.30 - 0.20 * frac
             m.color.r, m.color.g, m.color.b = 1.0, 0.55 * frac, 0.0
             for p in pts:
+                # Voxel's own z only when the keep-out is genuinely 3D. Planar
+                # folds z away, so the enforced shape is a column and drawing it
+                # at the voxel height would misreport what is being enforced.
                 m.points.append(Point(p[0], p[1],
-                                      p[2] if self.dim == 3 else self.z))
+                                      self.z if self.boundary_planar else p[2]))
             arr.markers.append(m)
         self.pub_keepout.publish(arr)
 
@@ -180,7 +214,8 @@ class OcclusionViz(object):
         m.color.a, m.color.r, m.color.g, m.color.b = 0.5, 0.2, 1.0, 0.4
         for q in pts:
             m.points.append(Point(self.pos[0], self.pos[1], self.z))
-            m.points.append(Point(q[0], q[1], q[2] if self.dim == 3 else self.z))
+            m.points.append(Point(q[0], q[1],
+                                  self.z if self.boundary_planar else q[2]))
 
         arr = MarkerArray()
         arr.markers.append(m)
@@ -192,6 +227,26 @@ class OcclusionViz(object):
         r0 = self.d_safe
         r1 = self.d_safe + self.v_target * self.t_grow_max
         breach = np.isfinite(d) and d < r0
+
+        if np.isfinite(d):
+            self.pub_docc.publish(self._Float32(data=d))
+        # The nearest voxel's ACTUAL coordinates, including the z the planar
+        # distance folded away. An arrow that appears to end on an occupied
+        # surface is either a frontier voxel whose z is elsewhere (projection) or
+        # a voxel that should never have been published; only the z tells them
+        # apart, and the arrow cannot show it.
+        _, i_near = self.boundaries.nearest(self.ego()[None, :])
+        tgt = ("-" if int(i_near[0]) < 0
+               else "(%.2f,%.2f,%.2f)" % tuple(self.boundaries.points[int(i_near[0])]))
+        z_all = self.boundaries.points[:, 2]
+        rospy.loginfo_throttle(
+            1.0, "[occ_viz] pos=(%.1f,%.1f,%.1f)  d_occ=%s  nearest=%s  "
+            "r_keep=%.1f->%.1f%s  boundaries=%d (z %.2f..%.2f)",
+            self.pos[0], self.pos[1], self.z,
+            ("inf" if not np.isfinite(d) else "%.2f m" % d), tgt, r0, r1,
+            "  BREACH" if breach else "", len(self.boundaries),
+            float(z_all.min()) if len(z_all) else float("nan"),
+            float(z_all.max()) if len(z_all) else float("nan"))
 
         m = Marker()
         m.header.frame_id = self.frame_id

@@ -1,0 +1,47 @@
+# Occlusion geometry, SHARED by mppi_node.py and occlusion_viz.py.
+#
+# These two nodes must agree exactly: the whole point of occlusion_viz is that
+# what it draws is what the planner acts on, and that stops being true the
+# moment a value is changed in one launch file and not the other. It has already
+# caused two false debugging trails (a z_band edited in mppi.launch while the
+# arrow being watched came from occlusion_viz, which still had the old value).
+#
+# Both launch files rosparam-load this INSIDE their <node>, so everything here
+# lands in that node's private namespace. Anything node-specific (goal, rates,
+# MPPI weights, plant limits) belongs in the launch file, not here.
+
+# Occlusion distance in XY only, independent of dim. A hidden agent is on the
+# ground: the threat is how far it can reach laterally, not how far below the
+# drone it currently sits.
+boundary_planar: true
+
+# Half-width [m] of the slab kept around the ego's altitude when the distance is
+# planar. Folding z away makes a voxel directly overhead read as ZERO lateral
+# distance, so anything outside this band must be discarded before the KD-tree
+# is built. Applied ONLY when boundary_planar is true (a 3D distance already
+# discounts height, and banding would hide the top edge the ego flies over).
+#
+# Size it as the ego's half-height plus tolerated vertical error. Too wide and a
+# floor or ceiling in the frontier folds into every column and the keep-out
+# swallows the map. The cut is binary, not a taper: a voxel at |dz| = z_band
+# counts fully and one just past it vanishes, so an ego drifting in altitude
+# makes d_occ jump. lock_altitude suppresses that by pinning z.
+z_band: 0.2
+
+# Frontier voxels below this z are dropped. The volume under the ground plane is
+# unknown, attached to an occluder and hidden from the ego, so it passes every
+# shadow test -- but nothing emerges from underground. Matches the extractor's
+# own min_frontier_z; kept here as well so the planner is safe against an
+# extractor that forgets to filter.
+boundary_z_min: 0.3
+
+# Keep-out geometry: the radius grows d_safe -> d_safe + v_target * t_grow_max
+# over the horizon, modelling a hidden agent moving at up to v_target.
+d_safe: 2.5
+v_target: 0.0
+t_grow_max: 2.0
+
+# Occupancy (collision) side. occ_resolution MUST equal the map's
+# inflation_resolution or the membership test never fires.
+occ_resolution: 0.2
+occ_z_band: 0.3

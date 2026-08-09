@@ -1,0 +1,46 @@
+<launch>
+    <!-- Occlusion geometry, drawn from ODOMETRY instead of from a plan.
+
+         "Is the frontier sane here?" and "is the planner sane?" are separate
+         questions, and answering the first should not require running the
+         second. This node draws the same keep-out, sightlines, nearest-boundary
+         arrow and status readout as mppi_node.py, but takes the pose straight
+         from odometry, so you can fly the drone by hand and watch d_occ.
+
+         Run INSTEAD of mppi.launch, since keyboard_control.py and the planner
+         both publish /planning/pos_cmd:
+           roslaunch occlusion_boundary wall_test.launch
+           roslaunch occlusion_boundary occlusion_boundary_walltest.launch
+           roslaunch occlusion_mppi occlusion_viz.launch
+           roslaunch rog_map_example rviz.launch
+           rosrun rog_map_example keyboard_control.py
+
+         The distance as a time series:
+           rqt_plot /occlusion_viz/d_occ/data
+
+         EVERY occlusion parameter here must match mppi.launch. The whole point
+         of this node is that what it draws is what the planner would act on,
+         which stops being true the moment the two configs diverge.
+    -->
+
+    <arg name="odom_topic" default="/lidar_slam/odom"/>
+
+    <node name="occlusion_viz" pkg="occlusion_mppi" type="occlusion_viz.py"
+          output="screen">
+        <param name="odom_topic" value="$(arg odom_topic)"/>
+        <param name="dim" value="3"/>
+        <!-- Occlusion geometry: SHARED with mppi.launch. Edit the yaml, never
+             this file, or the two nodes silently disagree. -->
+        <rosparam command="load"
+                  file="$(find occlusion_mppi)/config/occlusion_common.yaml"/>
+
+        <param name="boundary_topic" value="/rm_node/occlusion_frontier"/>
+        <param name="occupancy_topic" value="/rm_node/rog_map/inf_occ"/>
+
+        <param name="rate" value="5.0"/>
+        <param name="sightline_max" value="120"/>
+        <param name="show_nearest" value="true"/>
+        <param name="show_occupied" value="true"/>
+        <param name="show_nearest_occupied" value="true"/>
+    </node>
+</launch>
