@@ -333,13 +333,13 @@ class MPPINode(object):
             self.pub_docc.publish(self._Float32(data=d_now))
         rospy.loginfo_throttle(
             2.0, "[mppi] pos=(%.1f,%.1f) |v|=%.2f  d_occ=%s  boundaries=%d  occ=%d  "
-            "infeas=%.2f  collide=%.2f  solve=%.1fms (%.1fHz, %.2fus/rollout-step)%s",
+            "infeas=%.2f  collide=%.2f  solve=%.1fms (%.1fHz, %.2fus/rollout-step)%s ess=%.1f",
             self.pos[0], self.pos[1], float(np.linalg.norm(self.vel)),
             ("inf" if not np.isfinite(d_now) else "%.2f" % d_now),
             len(self.boundaries), len(self.occupancy),
             info["frac_infeasible"], info["frac_collide"],
             info["solve_s"] * 1e3, info["solve_hz"], info["us_per_rollout_step"],
-            "  IN OCCUPIED CELL" if self.occupancy.inside(self.pos[None, :])[0] else "")
+            "  IN OCCUPIED CELL" if self.occupancy.inside(self.pos[None, :])[0] else "", info["ess"])
 
         # The timer fires at rate_hz; if a solve outlasts its own period the loop is
         # already late and the integrated setpoint no longer matches real dt.

@@ -120,7 +120,7 @@ class OcclusionMPPI:
             # the weighted mean degenerates to averaged noise; this keeps the
             # low-cost rollouts the slow ones so the ego settles instead of
             # dithering around the goal.
-            cost += c.w_v * np.sum(v ** 2, axis=1) * c.dt
+            #cost += c.w_v * np.sum(v ** 2, axis=1) * c.dt
 
             # Collision: charged once per stage whose SEGMENT crosses an occupied
             # cell. Swept rather than point-sampled, because v*dt is the same order
@@ -157,7 +157,7 @@ class OcclusionMPPI:
                     d=dist, v=speed, t_k=t_k,
                     v_target=c.v_target, d_safe=c.d_safe, w_obs=c.w_hard,
                     t_grow_max=c.t_grow_max, w_soft=c.w_soft, d_infl=c.d_infl,
-                ) * c.dt
+                )
 
 
         cost += c.w_goal_term * np.linalg.norm(pos_t[:, -1, :] - goal, axis=1)
@@ -187,5 +187,6 @@ class OcclusionMPPI:
             "best": traj[int(np.argmin(cost))],
             "frac_infeasible": float(np.mean(breached | collided)),
             "frac_collide": float(np.mean(collided)),
+            "ess": float(1.0 / np.sum(w ** 2)),   # effective sample size, out of K
         }
         return action, info

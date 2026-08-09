@@ -60,6 +60,6 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
     # sitting exactly on the keep-out boundary and 0 at r_keep + d_infl and beyond.
     if w_soft and d_infl:
         margin = fmax(0.0, (r_keep + d_infl) - d)
-        cost = cost + w_soft * margin * margin
+        cost = cost + (w_soft / d_infl) * margin * margin
 
     return cost
