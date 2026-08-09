@@ -23,7 +23,7 @@
         <!-- [x,y] or [x,y,z]. With three elements the z is the goal altitude and
              goal_z below is ignored; with two it is padded with goal_z. In 2D any
              third element is dropped. -->
-        <rosparam param="goal">[15.0, 7.0, 1.0]</rosparam>
+        <rosparam param="goal">[18.0, 7.0, 1.0]</rosparam>
         <!-- Altitude a 2-element goal is padded to. Defaults to cruise_z. -->
         <param name="goal_z" value="1.0"/>
         <!-- 3D: the takeoff/hold altitude only, not a constraint. 2D: enforced. -->
@@ -55,8 +55,8 @@
         <!-- Flip to false for the baseline run: collision only, no occlusion. -->
         <param name="use_occlusion" value="true"/>
         <param name="rate" value="10.0"/>
-        <param name="samples" value="300"/>
-        <param name="horizon" value="40"/>
+        <param name="samples" value="500"/>
+        <param name="horizon" value="30"/>
 
         <!-- Arrow from the ego to the voxel setting d_occ. Costs one extra
              KD-tree index lookup per tick; set false to drop it entirely. -->
@@ -70,7 +70,7 @@
         <!-- d_safe / v_target / t_grow_max now come from occlusion_common.yaml
              above. w_soft and d_infl are the COST's shape, not the geometry, and
              occlusion_viz does not use them, so they stay here. -->
-        <param name="w_soft" value="50.0"/>
+        <param name="w_soft" value="5.0"/>
         <param name="d_infl" value="1.0"/>
 
         <!-- Settling authority. The MPPIConfig default of 1.2 gives damping of

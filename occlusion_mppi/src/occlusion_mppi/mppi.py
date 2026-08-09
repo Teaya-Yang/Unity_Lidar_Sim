@@ -135,19 +135,19 @@ class OcclusionMPPI:
                 collided |= hit
 
 
-            #TODO add constrain on the actions proposed and removed the cost here, it needs this handled only the ground is not correclty occupied
-            # Altitude bounds. Binary and charged at w_hard for the same reason
-            # collision is: this is a constraint, and depth of violation is not a
-            # useful gradient -- the sampled rollouts supply the gradient by
-            # simply staying inside.
-            if d > 2 and (c.z_min is not None or c.z_max is not None):
-                z = p[:, 2]
-                out = np.zeros(len(z), dtype=bool)
-                if c.z_min is not None:
-                    out |= z < c.z_min
-                if c.z_max is not None:
-                    out |= z > c.z_max
-                cost += c.w_hard * out
+            # #TODO add constrain on the actions proposed and removed the cost here, it needs this handled only the ground is not correclty occupied
+            # # Altitude bounds. Binary and charged at w_hard for the same reason
+            # # collision is: this is a constraint, and depth of violation is not a
+            # # useful gradient -- the sampled rollouts supply the gradient by
+            # # simply staying inside.
+            # if d > 2 and (c.z_min is not None or c.z_max is not None):
+            #     z = p[:, 2]
+            #     out = np.zeros(len(z), dtype=bool)
+            #     if c.z_min is not None:
+            #         out |= z < c.z_min
+            #     if c.z_max is not None:
+            #         out |= z > c.z_max
+            #     cost += c.w_hard * out
 
             if c.use_occlusion:
                 dist = boundaries.distance(p)
@@ -157,7 +157,7 @@ class OcclusionMPPI:
                     d=dist, v=speed, t_k=t_k,
                     v_target=c.v_target, d_safe=c.d_safe, w_obs=c.w_hard,
                     t_grow_max=c.t_grow_max, w_soft=c.w_soft, d_infl=c.d_infl,
-                )
+                ) * c.dt
 
 
         cost += c.w_goal_term * np.linalg.norm(pos_t[:, -1, :] - goal, axis=1)
@@ -167,10 +167,8 @@ class OcclusionMPPI:
         beta = cost.min()
         w = np.exp(-(cost - beta) / c.lam)
         w_sum = w.sum()
-        if not np.isfinite(w_sum) or w_sum <= 0:
-            w = np.ones(K) / K
-        else:
-            w = w / w_sum
+
+        w = w / w_sum
 
         self.nominal = np.einsum("k,khd->hd", w, actions)
         action = self.nominal[0].copy()

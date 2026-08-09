@@ -48,7 +48,7 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
     fmax = np.maximum if fmax is None else fmax
     sqrt = np.sqrt if sqrt is None else sqrt
 
-    t_eff = t_k if t_grow_max is None else min(t_k, t_grow_max)
+    t_eff = t_k
     r_grow = v_target * t_eff
     r_keep = r_grow + d_safe
 
