@@ -23,10 +23,10 @@
         <!-- [x,y] or [x,y,z]. With three elements the z is the goal altitude and
              goal_z below is ignored; with two it is padded with goal_z. In 2D any
              third element is dropped. -->
-        <rosparam param="goal">[7.0, 15.0, 1.0]</rosparam>
+        <rosparam param="goal">[18.0, 7.0, 1.0]</rosparam>
         <!-- Altitude a 2-element goal is padded to. Defaults to cruise_z. -->
         <param name="goal_z" value="1.0"/>
-        <!-- 3D: the takeoff/hold altitude only, not a constraint. 2D: enforced. -->
+        <!-- 3D: the takeoff/hold altitde only, not a constraint. 2D: enforced. -->
         <param name="cruise_z" value="1.0"/>
         <param name="boundary_topic" value="/rm_node/occlusion_frontier"/>
         <!-- Occlusion geometry (boundary_planar, z_band, boundary_z_min, d_safe,
@@ -44,6 +44,22 @@
         <param name="lock_altitude" value="true"/>
         <param name="occupancy_topic" value="/rm_node/rog_map/inf_occ"/>
         <param name="w_collision" value="100"/>
+        <!-- Obstacle keep-out: hold d_clear metres from the SURFACE of the
+             nearest occupied voxel. This is around real matter; d_safe in the
+             yaml is around the occlusion frontier, which is empty space at the
+             mouth of a shadow. The two sets barely overlap - an observed wall
+             face has no frontier near it, a doorway has frontier and no wall.
+
+             w_clear is the cost per stage for sitting exactly on the surface,
+             ramping linearly to 0 at d_clear and continuing to climb inside, so
+             a rollout leaving an occupied cell outscores one driving deeper.
+             That continuation is what w_collision, being binary, cannot express.
+
+             NOTE inf_occ is ALREADY inflated by ROG-Map, so the true standoff is
+             d_clear plus that inflation radius. Subtract it here if the ego
+             gives walls a wider berth than intended. 0 disables the term. -->
+        <param name="w_clear" value="200.0"/>
+        <param name="d_clear" value="1.5"/>
         <!-- Altitude bounds, 3D only. inf_occ contains NO floor: ROG-Map's
              virtual_ground_height is a z-test inside isOccupied() and never
              reaches the occupancy buffer, so boxSearch never publishes it. In a
@@ -54,8 +70,16 @@
         <param name="z_max" value=""/>
         <!-- Flip to false for the baseline run: collision only, no occlusion. -->
         <param name="use_occlusion" value="true"/>
+        <!-- How the K rollouts collapse into one command. "best" = argmin,
+             "mean" = textbook softmax-weighted MPPI. The mean is an average of
+             trajectories, not a trajectory: at a corner the batch splits into
+             go-left and go-right modes and their mean drives into the occluder
+             between them, which is why ~rollouts drew a plan clearing the corner
+             while the ego breached the wall. Switch back to "mean" once the two
+             modes are no longer symmetric. -->
+        <param name="selection" value="mean"/>
         <param name="rate" value="10.0"/>
-        <param name="samples" value="500"/>
+        <param name="samples" value="100"/>
         <param name="horizon" value="30"/>
 
         <!-- Arrow from the ego to the voxel setting d_occ. Costs one extra
@@ -70,7 +94,7 @@
         <!-- d_safe / v_target / t_grow_max now come from occlusion_common.yaml
              above. w_soft and d_infl are the COST's shape, not the geometry, and
              occlusion_viz does not use them, so they stay here. -->
-        <param name="w_soft" value="5.0"/>
+        <param name="w_soft" value="50.0"/>
         <param name="d_infl" value="1.0"/>
 
         <!-- Settling authority. The MPPIConfig default of 1.2 gives damping of
@@ -80,7 +104,7 @@
              braking win inside the last metre. -->
         <param name="w_v" value="15.0"/>
 
-        <param name="v_max" value="2.0"/>
+        <param name="v_max" value="1.0"/>
         <param name="a_max" value="3.0"/>
     </node>
 </launch>

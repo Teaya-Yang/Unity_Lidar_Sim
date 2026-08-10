@@ -19,6 +19,28 @@ class MPPIConfig:
         self.lam = 1.0          # temperature
         self.sigma_a = 1.5      # action noise std [m/s^2]
 
+        # How the K sampled action sequences are collapsed into one command.
+        #
+        #   "mean" -- textbook MPPI: the softmax-weighted average of all K.
+        #   "best" -- the single lowest-cost rollout (argmin), i.e. random
+        #             shooting / MPPI with a zero-temperature limit.
+        #
+        # "best" exists because the weighted mean is an average of trajectories,
+        # not itself a trajectory. At a corner the rollouts split into two modes
+        # -- around the left of the occluder and around the right -- both cheap,
+        # and their mean points straight between them, into the obstacle neither
+        # mode chose. The published "best" marker was visibly clearing the corner
+        # while the ego, following the mean, drove into the wall.
+        #
+        # The trade is real: argmin discards the variance reduction that is the
+        # whole point of averaging, so consecutive ticks may pick samples from
+        # unrelated parts of the distribution and the command jitters. That
+        # jitter is bounded by nominal warm-starting and by sigma_a, but it is
+        # not zero. Prefer "mean" again once the modes stop being symmetric
+        # (a geodesic goal cost does that); until then a coherent wrong plan is
+        # worse than an incoherent right one.
+        self.selection = "mean"
+
         self.dt = 0.1
 
         # Goal / regulation weights
@@ -36,7 +58,6 @@ class MPPIConfig:
         self.d_safe = 1.0       # [m]
         self.v_target = 1.5     # [m/s] assumed speed of a hidden agent
         self.t_grow_max = 3.0   # [s] cap on keep-out growth
-        self.w_hard = 50.0
         self.w_soft = 50.0
         self.d_infl = 1.0       # [m]
 
@@ -44,6 +65,21 @@ class MPPIConfig:
         # of the occlusion term, so the two can be switched on and off separately.
         self.w_collision = 1.0e6
         self.use_occlusion = True
+
+        # Obstacle clearance keep-out. A margin around the OCCUPIED voxels, i.e.
+        # around real matter -- NOT around the occlusion frontier, which is empty
+        # space at the mouth of a shadow and is handled by d_safe/v_target above.
+        # The two are separate sets: a fully observed wall has no frontier near
+        # its face, and a doorway has a frontier with nothing solid behind it.
+        #
+        # Distance is measured from the surface of the sphere CIRCUMSCRIBING the
+        # nearest voxel, so the voxel's own extent is never mistaken for
+        # clearance. Cost ramps linearly from 0 at d_clear to w_clear at the
+        # surface, and keeps climbing inside it -- that continuation is what lets
+        # a rollout leaving an occupied cell score better than one driving
+        # deeper, which the binary w_collision term cannot express.
+        self.w_clear = 200.0    # cost/stage for sitting exactly on the surface
+        self.d_clear = 1.5      # [m] keep-out measured OUTSIDE the voxel sphere
 
         # Altitude bounds [m], 3D only. None disables.
         #
@@ -70,12 +106,20 @@ class OcclusionMPPI:
         self.rng = rng or np.random.default_rng(0)
         self.nominal = np.zeros((self.cfg.horizon, plant.dim))
 
-    def plan(self, pos, vel, goal, boundaries, occupancy=None):
+    def plan(self, pos, vel, goal, boundaries, occupancy=None, clearance=None):
         """One control step.
 
         occupancy : OccupancySet or None. Without it nothing stops a rollout going
         through a wall -- the occlusion boundaries are the shadow mouth, not the
         obstacle surface.
+
+        clearance : OccupancySet used for the w_clear keep-out, or None to reuse
+        `occupancy`. They are separate because the two terms want different
+        geometry. inside_segment() must see the floor -- flying into the ground
+        is a collision. nearest() must NOT: it returns only THE nearest voxel, so
+        with the ground 1 m below a drone at cruise_z every query returns ~1 m
+        and no wall further than the flight altitude is ever visible to the
+        keep-out. Pass a z-banded set here and the term regains its full reach.
 
         Returns (action, info) where action is the acceleration to apply now and
         info carries the rollout batch for visualisation / debugging.
@@ -84,6 +128,8 @@ class OcclusionMPPI:
         d = self.plant.dim
         K, H = c.samples, c.horizon
         t_start = time.perf_counter()
+
+        clear = clearance if clearance is not None else occupancy
 
         noise = self.rng.normal(0.0, c.sigma_a, size=(K, H, d))
         actions = self.nominal[None, :, :] + noise
@@ -101,8 +147,26 @@ class OcclusionMPPI:
         vel_t = traj[:, :, d:]
         goal = np.asarray(goal, dtype=float)[:d]
 
+        # Surface distance for every (rollout, stage) pose, in ONE tree query
+        # rather than H queries of K points inside the loop. Same work for the
+        # tree, a thirtieth of the per-call overhead, and it parallelises -- the
+        # per-stage version pushed solve time from ~3 to ~17 us/rollout-step and
+        # blew through the control period.
+        d_surf = None
+        if clear is not None and c.w_clear and len(clear):
+            # Half the voxel's space diagonal: the radius of the sphere that
+            # CIRCUMSCRIBES it. Inscribing would claim clearance in the corners
+            # the voxel actually occupies; circumscribing errs safe.
+            r_voxel = 0.5 * np.sqrt(2 if clear.planar else 3) * clear.resolution
+            d_ctr, _ = clear.nearest(pos_t.reshape(-1, d))
+            d_surf = d_ctr.reshape(K, H) - r_voxel
+
         cost = np.zeros(K)
         collided = np.zeros(K, dtype=bool)
+        # Breached the obstacle keep-out (as opposed to `breached`, which is the
+        # occlusion one). Reported separately so a run can be read as "too close
+        # to a wall" vs "too close to a shadow" without guessing.
+        too_close = np.zeros(K, dtype=bool)
         # A rollout is infeasible if ANY stage breached a hard keep-out. Tracked
         # separately from `cost`: the goal term alone sums to hundreds over the
         # horizon, so comparing the total against w_hard reads 1.00 always and
@@ -134,12 +198,11 @@ class OcclusionMPPI:
                 cost += c.w_collision * hit
                 collided |= hit
 
+            # if d_surf is not None:
+            #     margin = np.maximum(0.0, c.d_clear - d_surf[:, k])
+            #     cost += c.w_clear * (margin / c.d_clear) * c.dt
+            #     too_close |= margin > 0.0
 
-            # #TODO add constrain on the actions proposed and removed the cost here, it needs this handled only the ground is not correclty occupied
-            # # Altitude bounds. Binary and charged at w_hard for the same reason
-            # # collision is: this is a constraint, and depth of violation is not a
-            # # useful gradient -- the sampled rollouts supply the gradient by
-            # # simply staying inside.
             # if d > 2 and (c.z_min is not None or c.z_max is not None):
             #     z = p[:, 2]
             #     out = np.zeros(len(z), dtype=bool)
@@ -155,7 +218,7 @@ class OcclusionMPPI:
                 breached |= dist < c.d_safe + c.v_target * t_eff
                 cost += occlusion_stage_cost(
                     d=dist, v=speed, t_k=t_k,
-                    v_target=c.v_target, d_safe=c.d_safe, w_obs=c.w_hard,
+                    v_target=c.v_target, d_safe=c.d_safe, w_obs=c.w_collision,
                     t_grow_max=c.t_grow_max, w_soft=c.w_soft, d_infl=c.d_infl,
                 )
 
@@ -170,7 +233,18 @@ class OcclusionMPPI:
 
         w = w / w_sum
 
-        self.nominal = np.einsum("k,khd->hd", w, actions)
+        # Weights are computed either way: `ess` is the diagnostic that says how
+        # multimodal the batch was, and it is exactly as informative under "best"
+        # as under "mean" -- more so, since it is the number that justifies not
+        # trusting the mean in the first place.
+        k_best = int(np.argmin(cost))
+        if c.selection == "best":
+            self.nominal = actions[k_best].copy()
+        elif c.selection == "mean":
+            self.nominal = np.einsum("k,khd->hd", w, actions)
+        else:
+            raise ValueError("selection must be 'mean' or 'best', got %r"
+                             % (c.selection,))
         action = self.nominal[0].copy()
 
         # Shift the nominal for the next step (receding horizon).
@@ -184,9 +258,13 @@ class OcclusionMPPI:
             "solve_hz": 1.0 / solve_s if solve_s > 0 else float("inf"),
             # Cost of one (rollout, stage) pair -- the unit that scales with K*H.
             "us_per_rollout_step": solve_s * 1e6 / (K * H),
-            "best": traj[int(np.argmin(cost))],
+            # Under selection="best" this marker IS the executed plan, so the
+            # RViz curve and the ego's behaviour finally describe the same thing.
+            "best": traj[k_best],
+            "selection": c.selection,
             "frac_infeasible": float(np.mean(breached | collided)),
             "frac_collide": float(np.mean(collided)),
+            "frac_too_close": float(np.mean(too_close)),
             "ess": float(1.0 / np.sum(w ** 2)),   # effective sample size, out of K
         }
         return action, info

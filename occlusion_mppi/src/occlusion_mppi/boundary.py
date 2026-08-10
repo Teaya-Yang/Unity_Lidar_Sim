@@ -256,7 +256,10 @@ class OccupancySet:
                 d = np.sqrt(((q[:, None, :] - self._pts_q[None, :, :]) ** 2).sum(2))
                 return d.min(axis=1), np.argmin(d, axis=1)
             self._tree = cKDTree(self._pts_q)
-        d, i = self._tree.query(q)
+        # workers=-1: the planner queries K*H points at once against tens of
+        # thousands of voxels, which is the dominant cost of a solve. SciPy
+        # releases the GIL here, so this is close to free parallelism.
+        d, i = self._tree.query(q, workers=-1)
         return d, np.asarray(i, dtype=int)
 
     def _encode(self, pts):

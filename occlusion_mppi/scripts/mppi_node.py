@@ -97,11 +97,20 @@ class MPPINode(object):
             w_soft=float(rospy.get_param("~w_soft", 50.0)),
             d_infl=float(rospy.get_param("~d_infl", 1.0)),
             w_collision=float(rospy.get_param("~w_collision", 1.0e6)),
+            # Obstacle keep-out, around occupied voxels. Distinct from d_safe,
+            # which is the keep-out around the occlusion FRONTIER.
+            w_clear=float(rospy.get_param("~w_clear", 200.0)),
+            d_clear=float(rospy.get_param("~d_clear", 1.5)),
             # Settling authority. At the default 1.2 the damping is ~0.12*v^2 per
             # stage against a goal pull of 2*d, so rushing the goal always beats
             # slowing for it and the ego orbits instead of arriving.
             w_v=float(rospy.get_param("~w_v", 1.2)),
             use_occlusion=bool(rospy.get_param("~use_occlusion", True)),
+            # "best" (argmin) or "mean" (softmax-weighted). See MPPIConfig: the
+            # mean of a two-mode batch at a corner points between the modes,
+            # into the occluder, which is why the drawn plan cleared the corner
+            # while the ego did not.
+            selection=str(rospy.get_param("~selection", "best")),
             # inf_occ carries no floor (ROG-Map's virtual ground never reaches the
             # occupancy buffer), so without these the ego dives under an occluder
             # instead of climbing over it.
@@ -152,6 +161,12 @@ class MPPINode(object):
         self.boundaries = BoundarySet(np.zeros((0, 3)), planar=self.boundary_planar,
                                       query_z=self.cruise_z)
         self.occupancy = OccupancySet(np.zeros((0, 3)), resolution=self.occ_res,
+                                      planar=self.planar)
+        # Second view of the same cloud, z-banded to flight altitude, for the
+        # w_clear keep-out only. See plan()'s `clearance` argument: nearest()
+        # returns THE nearest voxel, so an unbanded set puts the floor 1 m below
+        # the ego and caps the keep-out's horizontal reach at cruise_z.
+        self.clearance = OccupancySet(np.zeros((0, 3)), resolution=self.occ_res,
                                       planar=self.planar)
         self.pos = None
         self.vel = np.zeros(self.dim)
@@ -277,6 +292,13 @@ class MPPINode(object):
         self.occupancy = OccupancySet(
             pts.reshape(-1, 3), resolution=self.occ_res, planar=self.planar,
             z_band=self.occ_z_band if self.dim == 2 else None, ego_z=ego_z)
+        # Banded at EVERY dim, unlike the collision set above. z_band is applied
+        # before the planar branch in OccupancySet.__init__, so this works in 3D.
+        # The floor is 71% of wall_scene.pcd and is genuinely observed, so
+        # without this the clearance term sees nothing but ground.
+        self.clearance = OccupancySet(
+            pts.reshape(-1, 3), resolution=self.occ_res, planar=self.planar,
+            z_band=self.occ_z_band, ego_z=ego_z)
 
     def step(self, _evt):
         if self.pos is None or self.sp is None:
@@ -300,7 +322,8 @@ class MPPINode(object):
             return
 
         action, info = self.planner.plan(self.pos, self.vel, self.goal,
-                                         self.boundaries, self.occupancy)
+                                         self.boundaries, self.occupancy,
+                                         clearance=self.clearance)
 
         # Every rollout colliding is degenerate: all costs equal, the softmax is
         # uniform and the mean action is the stale nominal -- which WALKS THE EGO
@@ -333,11 +356,12 @@ class MPPINode(object):
             self.pub_docc.publish(self._Float32(data=d_now))
         rospy.loginfo_throttle(
             2.0, "[mppi] pos=(%.1f,%.1f) |v|=%.2f  d_occ=%s  boundaries=%d  occ=%d  "
-            "infeas=%.2f  collide=%.2f  solve=%.1fms (%.1fHz, %.2fus/rollout-step)%s ess=%.1f",
+            "infeas=%.2f  collide=%.2f  near=%.2f  "
+            "solve=%.1fms (%.1fHz, %.2fus/rollout-step)%s ess=%.1f",
             self.pos[0], self.pos[1], float(np.linalg.norm(self.vel)),
             ("inf" if not np.isfinite(d_now) else "%.2f" % d_now),
             len(self.boundaries), len(self.occupancy),
-            info["frac_infeasible"], info["frac_collide"],
+            info["frac_infeasible"], info["frac_collide"], info["frac_too_close"],
             info["solve_s"] * 1e3, info["solve_hz"], info["us_per_rollout_step"],
             "  IN OCCUPIED CELL" if self.occupancy.inside(self.pos[None, :])[0] else "", info["ess"])
 
