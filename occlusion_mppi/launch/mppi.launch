@@ -23,12 +23,39 @@
         <!-- [x,y] or [x,y,z]. With three elements the z is the goal altitude and
              goal_z below is ignored; with two it is padded with goal_z. In 2D any
              third element is dropped. -->
-        <rosparam param="goal">[8.0, 15.0, 1.0]</rosparam>
+        <rosparam param="goal">[18.0, 7.0, 1.0]</rosparam>
         <!-- Altitude a 2-element goal is padded to. Defaults to cruise_z. -->
         <param name="goal_z" value="1.0"/>
         <!-- 3D: the takeoff/hold altitde only, not a constraint. 2D: enforced. -->
         <param name="cruise_z" value="1.0"/>
-        <param name="boundary_topic" value="/rm_node/occlusion_frontier"/>
+        <!-- SILHOUETTE GATES, not the occlusion frontier.
+             Both come from rm_node and both are PointCloud2 keep-out seeds, so
+             this is a drop-in swap. They are found by opposite methods:
+
+               occlusion_frontier  UNKNOWN voxels adjacent to free space. Detects
+                                   the ABSENCE of data, which is also the exact
+                                   definition of a pinhole (a wall cell that
+                                   never got a return). The two are locally
+                                   indistinguishable, so the wall FACE filled
+                                   with keep-out bubbles the drone could see
+                                   straight into, and each one got dilated by
+                                   d_safe + v_target*t_grow_max into a
+                                   multi-metre phantom obstacle in open air.
+
+               silhouette_gates    OCCUPIED voxels at an occluder EDGE, found as
+                                   range jumps in a polar profile, with the
+                                   shadow then CONSTRUCTED behind them. A pinhole
+                                   is an absent voxel: it cannot lower a bin's
+                                   range, cannot raise it, cannot manufacture a
+                                   jump. It never enters the computation.
+
+             The gates are emitted at the ego's altitude, so z_band in
+             occlusion_common.yaml still applies and boundary_z_min is inert for
+             them (nothing is published below cruise_z).
+
+             To A/B against the old behaviour, point this back at
+             /rm_node/occlusion_frontier. rm_node publishes both regardless. -->
+        <param name="boundary_topic" value="/rm_node/silhouette_gates"/>
         <!-- Occlusion geometry (boundary_planar, z_band, boundary_z_min, d_safe,
              v_target, t_grow_max, occ_resolution, occ_z_band): SHARED with
              occlusion_viz.launch. Edit the yaml, never this file. These two
@@ -69,7 +96,7 @@
         <param name="z_min" value="0.5"/>
         <param name="z_max" value=""/>
         <!-- Flip to false for the baseline run: collision only, no occlusion. -->
-        <param name="use_occlusion" value="false  "/>
+        <param name="use_occlusion" value="false"/>
         <!-- How the K rollouts collapse into one command. "best" = argmin,
              "mean" = textbook softmax-weighted MPPI. The mean is an average of
              trajectories, not a trajectory: at a corner the batch splits into

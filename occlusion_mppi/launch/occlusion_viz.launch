@@ -34,7 +34,11 @@
         <rosparam command="load"
                   file="$(find occlusion_mppi)/config/occlusion_common.yaml"/>
 
-        <param name="boundary_topic" value="/rm_node/occlusion_frontier"/>
+        <!-- MUST match mppi.launch. The whole point of this node is that what it
+             draws is what the planner acts on, and pointing the two at different
+             boundary sources breaks that guarantee more thoroughly than the
+             z_band mismatch the yaml header warns about. -->
+        <param name="boundary_topic" value="/rm_node/silhouette_gates"/>
         <param name="occupancy_topic" value="/rm_node/rog_map/inf_occ"/>
 
         <param name="rate" value="5.0"/>
