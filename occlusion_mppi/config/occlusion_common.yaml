@@ -37,11 +37,22 @@ boundary_z_min: 0.3
 
 # Keep-out geometry: the radius grows d_safe -> d_safe + v_target * t_grow_max
 # over the horizon, modelling a hidden agent moving at up to v_target.
-d_safe: 2.0
-v_target: 0.5
+d_safe: 0.5
+v_target: 1.0
 t_grow_max: 3.0
 
-# Occupancy (collision) side. occ_resolution MUST equal the map's
-# inflation_resolution or the membership test never fires.
-occ_resolution: 0.2
+# Occupancy (collision) side. occ_resolution MUST equal the map's EFFECTIVE
+# inflation_resolution -- which is not necessarily the number written in
+# ROG-Map/examples/occlusion_boundary/config/wall_test.yaml, because
+# counter_map.cpp rounds inflation_resolution to an integer multiple of the prob
+# map resolution and then recomputes it. Track the derived value, not the
+# configured one.
+#
+# A mismatch does not merely weaken the collision test, it MISALIGNS it:
+# OccupancySet hashes voxels with floor(p / occ_resolution) (boundary.py), so
+# hits get reported on empty cells while the actual wall is missed. With
+# w_collision at 1e6 that is enough to send the ego off in a direction unrelated
+# to the goal, and nothing in either node logs a complaint. The symptom is
+# frac_collide high while the drone is visibly in open space.
+occ_resolution: 0.1
 occ_z_band: 0.3

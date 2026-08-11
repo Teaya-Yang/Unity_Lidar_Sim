@@ -23,7 +23,7 @@
         <!-- [x,y] or [x,y,z]. With three elements the z is the goal altitude and
              goal_z below is ignored; with two it is padded with goal_z. In 2D any
              third element is dropped. -->
-        <rosparam param="goal">[18.0, 7.0, 1.0]</rosparam>
+        <rosparam param="goal">[8.0, 15.0, 1.0]</rosparam>
         <!-- Altitude a 2-element goal is padded to. Defaults to cruise_z. -->
         <param name="goal_z" value="1.0"/>
         <!-- 3D: the takeoff/hold altitde only, not a constraint. 2D: enforced. -->
@@ -69,7 +69,7 @@
         <param name="z_min" value="0.5"/>
         <param name="z_max" value=""/>
         <!-- Flip to false for the baseline run: collision only, no occlusion. -->
-        <param name="use_occlusion" value="true"/>
+        <param name="use_occlusion" value="false  "/>
         <!-- How the K rollouts collapse into one command. "best" = argmin,
              "mean" = textbook softmax-weighted MPPI. The mean is an average of
              trajectories, not a trajectory: at a corner the batch splits into
