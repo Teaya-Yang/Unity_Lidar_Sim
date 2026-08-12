@@ -292,7 +292,7 @@ mppi:
   samples: 5000             # rollouts per control step
   lambda: 1.0               # temperature. See the scaling note under `cost`: this is the
                             #   correct knob for softmax discrimination.
-  sig_a: 1.5                # noise std for acceleration samples
+  sig_a: 0.5                # noise std for acceleration samples
   sig_d: 0.5              # noise std for steering samples
   # MPPI-local stage costs, layered on top of the shared `cost` section.
   w_lat: 0.05               # lane-centre lateral offset
