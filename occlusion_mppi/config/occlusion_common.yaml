@@ -38,7 +38,7 @@ boundary_z_min: 0.3
 # Keep-out geometry: the radius grows d_safe -> d_safe + v_target * t_grow_max
 # over the horizon, modelling a hidden agent moving at up to v_target.
 d_safe: 0.5
-v_target: 1.0
+v_target: 0.5
 t_grow_max: 3.0
 
 # Occupancy (collision) side. occ_resolution MUST equal the map's EFFECTIVE

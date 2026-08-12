@@ -30,6 +30,7 @@ from occlusion_mppi.dynamics import DoubleIntegrator     # noqa: E402
 from occlusion_mppi.mppi import OcclusionMPPI, MPPIConfig  # noqa: E402
 from occlusion_mppi.viz import (nearest_markers, ego_occupied_markers,  # noqa: E402
                                 nearest_occupied_markers)  # noqa: E402
+from occlusion_mppi.plot_run import save_run  # noqa: E402
 
 
 def _opt_float(v):
@@ -233,6 +234,32 @@ class MPPINode(object):
                                          "/rm_node/rog_map/inf_occ"),
                          PointCloud2, self.cb_occupancy, queue_size=1)
 
+        # ---- run recording, for the post-run figure (occlusion_mppi.plot_run) --
+        # Off unless ~save_dir is set: a long run holds one frontier snapshot per
+        # recorded solve, which is the only part of this node that grows without
+        # bound. Empty string disables recording entirely rather than recording
+        # into the cwd, which under roslaunch is ~/.ros.
+        self.save_dir = str(rospy.get_param("~save_dir", "")).strip()
+        # Record every Nth solve, not every one: at 10 Hz a 60 s run is 600
+        # frontier snapshots (~200 MB), and the figure draws ONE of them.
+        self.plot_stride = max(1, int(rospy.get_param("~plot_stride", 5)))
+        self.plot_max_frames = int(rospy.get_param("~plot_max_frames", 6))
+        self.plot_solve_t = _opt_float(rospy.get_param("~plot_solve_t", None))
+        # Hard cap on retained frames; oldest are dropped. Bounds memory on a run
+        # that never terminates, which is the normal way these get stopped.
+        self.plot_max_records = int(rospy.get_param("~plot_max_records", 400))
+        # Subsample of inf_occ kept per frame, for the figure's map backdrop.
+        self.plot_occ_max = int(rospy.get_param("~plot_occ_max", 6000))
+        self._traj = []
+        self._frames = []
+        self._solve_count = -1
+        self._t0 = None
+        self._collided = False
+        if self.save_dir:
+            rospy.on_shutdown(self.save_figure)
+            rospy.loginfo("[mppi] recording run -> %s/traj.{csv,png} "
+                          "(stride %d)", self.save_dir, self.plot_stride)
+
         rospy.loginfo("[mppi] dim=%dD goal=%s", self.dim, self.goal.tolist())
         rospy.loginfo("[mppi] goal=%s occlusion=%s d_safe=%.1f v_target=%.1f "
                       "t_grow_max=%.1f => keep-out grows %.1f -> %.1f m",
@@ -304,6 +331,10 @@ class MPPINode(object):
         if self.pos is None or self.sp is None:
             return
 
+        # Sampled before the at-goal early return, so the executed path in the
+        # CSV runs all the way to the goal instead of stopping a tick short.
+        self.record_pose()
+
         # Hysteresis: releasing at the same radius it latches at makes the ego
         # chatter in and out of "arrived" on estimator noise, which reads as
         # circling. Latch at goal_tol, release only at 1.5x.
@@ -373,6 +404,8 @@ class MPPINode(object):
                 "lower ~samples/horizon or ~rate",
                 info["solve_s"] * 1e3, 1000.0 / self.rate_hz)
 
+        self.record_solve(info)
+
         self.publish_rollouts(info)
         if self.show_nearest:
             self.publish_nearest(d_now, i_now)
@@ -387,6 +420,76 @@ class MPPINode(object):
         self.publish_keepout()
         self.publish_status(info, d_now)
         self.publish_sightlines()
+
+    # ---- run recording ----------------------------------------------------
+    # Everything below is diagnostics: it must never change what the node
+    # commands. All of it is a no-op unless ~save_dir is set.
+
+    def episode_t(self):
+        """Seconds since the first recorded tick. Wall-clock episode time, not
+        ROS time since epoch -- the figure's x axis has to start at 0."""
+        now = rospy.Time.now().to_sec()
+        if self._t0 is None:
+            self._t0 = now
+        return now - self._t0
+
+    def record_pose(self):
+        """One row of the executed trajectory: [t, pos..., vel...]."""
+        if not self.save_dir:
+            return
+        self._traj.append(np.concatenate(
+            [[self.episode_t()], self.pos[:self.dim], self.vel[:self.dim]]))
+        # Latches: a run that touched a wall once is a collision run even if it
+        # recovered, and the verdict in the title must say so.
+        if len(self.occupancy) and self.occupancy.inside(self.pos[None, :])[0]:
+            self._collided = True
+
+    def record_solve(self, info):
+        """Snapshot of ONE solve: the plan plus the two point sets it was scored
+        against. The map is stored per frame, not once, because it changes every
+        tick -- drawing the final map behind an early solve would show the ego
+        avoiding a shadow that had not been discovered yet."""
+        if not self.save_dir:
+            return
+        # Strided on SOLVES, not on retained frames: striding on the latter
+        # would thin out only after the cap started dropping.
+        self._solve_count += 1
+        if self._solve_count % self.plot_stride:
+            return
+
+        occ = self.clearance.points
+        if len(occ) > self.plot_occ_max:
+            occ = occ[::int(np.ceil(len(occ) / float(self.plot_occ_max)))]
+
+        self._frames.append({
+            "t": self.episode_t(),
+            "ex": self.pos[:self.dim].copy(),
+            # info["best"] is the executed plan under selection="best" (see
+            # mppi.plan), so this is the ego's own intent, not a sibling sample.
+            "plan": info["best"][:, :self.dim].copy(),
+            "bnd": self.boundaries.points.copy(),
+            "planar": self.boundaries.planar,
+            "query_z": self.boundaries.query_z,
+            "occ": occ.copy(),
+            "infeasible": info["frac_collide"] > 0.99,
+        })
+        if len(self._frames) > self.plot_max_records:
+            del self._frames[0]
+
+    def save_figure(self):
+        """Shutdown hook. Wrapped: a plotting failure must not turn a finished
+        run into a traceback with no CSV written."""
+        if not self.save_dir or not self._traj:
+            return
+        verdict = ("collision" if self._collided else
+                   "reached" if self.at_goal else "stopped")
+        try:
+            save_run(self.save_dir, verdict, self.goal, np.array(self._traj),
+                     self._frames, self.cfg, dim=self.dim,
+                     solve_t=self.plot_solve_t,
+                     max_frames=self.plot_max_frames)
+        except Exception as e:      # noqa: BLE001 -- diagnostics, never fatal
+            rospy.logerr("[mppi] could not save the run figure: %s", e)
 
     def publish_cmd(self, vel_cmd):
         dt = 1.0 / self.rate_hz

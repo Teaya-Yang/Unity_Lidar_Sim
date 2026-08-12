@@ -23,7 +23,7 @@
         <!-- [x,y] or [x,y,z]. With three elements the z is the goal altitude and
              goal_z below is ignored; with two it is padded with goal_z. In 2D any
              third element is dropped. -->
-        <rosparam param="goal">[18.0, 7.0, 1.0]</rosparam>
+        <rosparam param="goal">[4.0, 15.0, 1.0]</rosparam>
         <!-- Altitude a 2-element goal is padded to. Defaults to cruise_z. -->
         <param name="goal_z" value="1.0"/>
         <!-- 3D: the takeoff/hold altitde only, not a constraint. 2D: enforced. -->
@@ -133,5 +133,17 @@
 
         <param name="v_max" value="1.0"/>
         <param name="a_max" value="3.0"/>
+
+        <!-- Post-run figure (occlusion_mppi/plot_run.py). Written on shutdown,
+             so Ctrl-C the run rather than killing it. Empty disables recording
+             entirely; leaving it on costs one frontier snapshot per recorded
+             solve, which is the only unbounded state in this node.
+             plot_solve_t pins WHICH solve is drawn (episode seconds); unset,
+             the figure picks the solve whose plan came closest to its own
+             expanding keep-out. -->
+        <param name="save_dir" value="$(env HOME)/rog_ws/runs"/>
+        <param name="plot_stride" value="5"/>
+        <param name="plot_max_frames" value="6"/>
+        <param name="plot_solve_t" value=""/>
     </node>
 </launch>
