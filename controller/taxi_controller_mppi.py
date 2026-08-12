@@ -405,23 +405,24 @@ def mppi(s0, mean, goal_xy, u_prev=None):
         keep = np.argsort(cost)[:MPPI_KEEP_ROLLOUTS]
         MPPI_ROLLOUTS, MPPI_COSTS = paths[keep], cost[keep]
 
-    n_feasible = int((cost <= C_INFEAS).sum())
-    if n_feasible <= INFEAS_FRAC * K_MPPI:
-        print(f"[MPPI] INFEASIBLE: {n_feasible}/{K_MPPI} rollouts under {C_INFEAS:.2e} "
-              f"(depth {INFEAS_DEPTH:.2f} m), min cost {cost.min():.3e} — braking")
-        u_stop = np.array([A_MIN, 0.0])                 # max decel, hold wheel straight
-        # Roll the braking command out over the horizon so the figure can show WHERE the
-        # ego still ends up while stopping — the case where it clips the keep-outs is
-        # exactly the one worth looking at, so this must not be left as a stale plan.
-        _st = np.asarray(s0, float)[None, :]
-        _brake = np.empty((H_MPPI, 2))
-        for _k in range(H_MPPI):
-            _st = _rollout_step(_st, u_stop[0:1], u_stop[1:2])
-            _brake[_k] = _st[0, :2]
-        OCC_PLAN = _brake
-        OCC_INFEASIBLE = True
-        return u_stop, np.zeros((H_MPPI, 2))
+    # n_feasible = int((cost <= C_INFEAS).sum())
+    # if n_feasible <= INFEAS_FRAC * K_MPPI:
+    #     print(f"[MPPI] INFEASIBLE: {n_feasible}/{K_MPPI} rollouts under {C_INFEAS:.2e} "
+    #           f"(depth {INFEAS_DEPTH:.2f} m), min cost {cost.min():.3e} — braking")
+    #     u_stop = np.array([A_MIN, 0.0])                 # max decel, hold wheel straight
+    #     # Roll the braking command out over the horizon so the figure can show WHERE the
+    #     # ego still ends up while stopping — the case where it clips the keep-outs is
+    #     # exactly the one worth looking at, so this must not be left as a stale plan.
+    #     _st = np.asarray(s0, float)[None, :]
+    #     _brake = np.empty((H_MPPI, 2))
+    #     for _k in range(H_MPPI):
+    #         _st = _rollout_step(_st, u_stop[0:1], u_stop[1:2])
+    #         _brake[_k] = _st[0, :2]
+    #     OCC_PLAN = _brake
+    #     OCC_INFEASIBLE = True
+    #     return u_stop, np.zeros((H_MPPI, 2))
 
+    # print("FEASIBLE: ", n_feasible)
     # Leave -cost.min() to avoid underflow, softmax to compute the weights
     w   = np.exp(-(cost - cost.min()) / LAMBDA)
     w  /= w.sum()
@@ -983,21 +984,6 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                            0 if DYN_NOW is None else len(DYN_NOW),
                            max(_sp) if _sp else 0.0)
   
-                if DYN_NOW is not None and len(DYN_NOW):
-                    _vv = DYN_TRACKER.velocities()
-                    _sg = DYN_TRACKER.vel_sigma()
-                    _order = np.argsort(np.hypot(DYN_NOW[:, 0] - s[0],
-                                                    DYN_NOW[:, 1] - s[1]))
-                    for _rank, _i in enumerate(_order[:5]):
-                        _c0, _c1, _r, _age = DYN_NOW[_i]
-                        _d = float(np.hypot(_c0 - s[0], _c1 - s[1]))
-                        _mark = "<-USED" if _rank < (0 if DYN_USED is None
-                                                        else len(DYN_USED)) else ""
-                        print(f"           #{_rank} @({_c0:7.1f},{_c1:7.1f}) "
-                                f"r={_r:5.1f} d_ego={_d:6.1f} "
-                                f"v=({_vv[_i][0]:5.1f},{_vv[_i][1]:5.1f}) "
-                                f"|v|={np.hypot(*_vv[_i]):4.1f}+-{_sg[_i]:4.1f} "
-                                f"age={_age:4.1f} {_mark}")
             else:
                 DYN_NOW = None
         u_nom, mean = mppi(s, mean, goal_xy, u_prev)
