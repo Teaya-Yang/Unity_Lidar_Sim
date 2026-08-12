@@ -13,6 +13,12 @@
          nothing publishes it and the planner sits silent waiting for a pose.
          Pass /lidar_slam/odom for that case. -->
     <arg name="odom_topic" default="/Odometry_imu"/>
+    <!-- Goal, as an arg so a different MARSIM scene can be flown without editing
+         this file: mppi.launch goal:="[-2.0, 6.0, 1.0]". The default is a
+         wall_scene.pcd goal and means nothing in any other map. Pick one from
+         that scene's free space, or the goal sits inside an obstacle and the
+         ego orbits it forever. -->
+    <arg name="goal" default="[4.0, 15.0, 1.0]"/>
 
     <node name="occlusion_mppi" pkg="occlusion_mppi" type="mppi_node.py" output="screen">
         <param name="odom_topic" value="$(arg odom_topic)"/>
@@ -23,7 +29,7 @@
         <!-- [x,y] or [x,y,z]. With three elements the z is the goal altitude and
              goal_z below is ignored; with two it is padded with goal_z. In 2D any
              third element is dropped. -->
-        <rosparam param="goal">[4.0, 15.0, 1.0]</rosparam>
+        <rosparam param="goal" subst_value="true">$(arg goal)</rosparam>
         <!-- Altitude a 2-element goal is padded to. Defaults to cruise_z. -->
         <param name="goal_z" value="1.0"/>
         <!-- 3D: the takeoff/hold altitde only, not a constraint. 2D: enforced. -->
@@ -96,7 +102,7 @@
         <param name="z_min" value="0.5"/>
         <param name="z_max" value=""/>
         <!-- Flip to false for the baseline run: collision only, no occlusion. -->
-        <param name="use_occlusion" value="false"/>
+        <param name="use_occlusion" value="true"/>
         <!-- How the K rollouts collapse into one command. "best" = argmin,
              "mean" = textbook softmax-weighted MPPI. The mean is an average of
              trajectories, not a trajectory: at a corner the batch splits into
