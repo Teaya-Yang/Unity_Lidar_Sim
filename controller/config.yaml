@@ -99,7 +99,7 @@ keepout:
 
 
 occlusion:
-  v_target: 10.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
+  v_target: 7.0             # [m/s] assumed max speed of a hidden agent emerging from occlusion
   t_grow_max: 8.0           # [s] CAP on the expansion time inside occlusion_stage_cost, so the
                             #   keep-out saturates at d_safe_hard + v_target * t_grow_max
                             #   (15 + 8*3 = 39 m) instead of growing to 51 m by the end of the

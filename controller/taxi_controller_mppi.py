@@ -115,7 +115,14 @@ OCC_USED_N      = 0      # boundaries that actually entered the LAST solve's cos
                          # segments exist, the ego is provably driving the occlusion-UNAWARE
                          # trajectory no matter what --occlusion-aware was passed.
 
-OCCLUSION_AWARE = False  
+OCCLUSION_AWARE = False
+
+RVIZ_PUB        = None   # RvizVisualizer — /viz/* MarkerArrays for RViz2
+MPPI_ROLLOUTS   = None   # (n,H,2) sampled rollout paths from the LAST solve, kept only
+                         # when --rviz-viz is on: it is pure visualisation, and holding
+                         # every sample's path costs K*H*2 floats per step otherwise.
+MPPI_COSTS      = None   # (n,) their total costs, for the colour ramp
+MPPI_KEEP_ROLLOUTS = 0   # how many sampled paths mppi() records (0 = off)
 DYN_CELL       = CFG["dynamic_clusters"]["cell"]
 DYN_MIN_POINTS = CFG["dynamic_clusters"]["min_points"]
 DYN_MAX_RADIUS = CFG["dynamic_clusters"]["max_radius"]
@@ -242,7 +249,7 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     Returns (u_nom, new_mean).
     """
     global OCC_USED_N, OCC_GATE_DBG, OCC_RANGE_DBG, OCC_SEGS_USED, OCC_PLAN, DYN_USED
-    global OCC_INFEASIBLE
+    global OCC_INFEASIBLE, MPPI_ROLLOUTS, MPPI_COSTS
     # Nominal MPPI weights / limits. The frontal-threat "go-around" gate (in_corridor / aimed_at_us)
     # has been removed to keep the planner simple: plain lane-following + obstacle rings, and the
     # LiDAR visibility term is what drives any deliberate off-lane motion.
@@ -342,9 +349,16 @@ def mppi(s0, mean, goal_xy, u_prev=None):
         """
         return point_segments_min_distance(px, py, occ_segs)
 
+    # Sampled rollout paths for the RViz overlay. Filled in the loop below so the drawn
+    # lines are the SAMPLES the softmax weighted, not a re-simulation of them.
+    MPPI_ROLLOUTS = MPPI_COSTS = None
+    paths = (np.empty((K_MPPI, H_MPPI, 2)) if MPPI_KEEP_ROLLOUTS > 0 else None)
+
     for k in range(H_MPPI):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
+        if paths is not None:
+            paths[:, k, 0], paths[:, k, 1] = fwd, lat
 
         u_k   = na[:, k, :]                                  # (K, 2)
         u_km1 = u_prev[None, :] if k == 0 else na[:, k - 1, :]
@@ -386,6 +400,10 @@ def mppi(s0, mean, goal_xy, u_prev=None):
 
     cost += tcost.terminal_cost(st[:, 0], st[:, 1],
                                 goal_xy=(goal_fwd, goal_lat), w_goal_term=W_GOAL_TERM)
+
+    if paths is not None:
+        keep = np.argsort(cost)[:MPPI_KEEP_ROLLOUTS]
+        MPPI_ROLLOUTS, MPPI_COSTS = paths[keep], cost[keep]
 
     n_feasible = int((cost <= C_INFEAS).sum())
     if n_feasible <= INFEAS_FRAC * K_MPPI:
@@ -745,11 +763,13 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         d_infl=D_INFL, d_safe=D_SAFE, info_range=INFO_RANGE,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
         occlusion_aware=False, dynamic_obstacles=False, dynamic_viz=False,
-        occlusion_viz=False, save_traj=None, show_occlusion_plot=True, plot_solve_t=None):
+        occlusion_viz=False, save_traj=None, show_occlusion_plot=True, plot_solve_t=None,
+        rviz_viz=False, rviz_rollouts=40):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW, OCC_PUB
     global DYNAMIC_AVOID, DYN_TRACKER, DYN_NOW, DYN_DBG, DYN_PUB, DYN_LAST_STAMP, DYN_CL_N
+    global RVIZ_PUB, MPPI_KEEP_ROLLOUTS
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     N_SCEN          = n_scenarios
@@ -837,6 +857,15 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
     if dynamic_viz and not DYNAMIC_AVOID:
         print("[Controller] --dynamic-viz needs --dynamic-obstacles (there is nothing to "
               "draw without the detector) — DISABLED")
+    if rviz_viz:
+        from rviz_viz import RvizVisualizer
+        _rv = RvizVisualizer()
+        if _rv.start():
+            RVIZ_PUB = _rv
+            MPPI_KEEP_ROLLOUTS = max(int(rviz_rollouts), 0)
+            print(f"[Controller] RViz feed    : ON  (/viz/*, {MPPI_KEEP_ROLLOUTS} rollouts "
+                  f"drawn per solve)")
+
     # Static-obstacle footprints from Unity. Plot-only, so it is started only when a
     # trajectory is being saved and its absence never affects control.
     static_obs = None
@@ -981,6 +1010,14 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 _viz[:, 3] = 0.0
             DYN_PUB.publish(_viz, V_TARGET, D_SAFE_HARD, DYN_GROW_HORIZON)
 
+        if RVIZ_PUB is not None:
+            RVIZ_PUB.publish(ego=s, goal_xy=goal_xy, plan=OCC_PLAN,
+                             infeasible=OCC_INFEASIBLE,
+                             rollouts=MPPI_ROLLOUTS, rollout_costs=MPPI_COSTS,
+                             occ_segs=OCC_SEGS_USED, occ_segs_all=OCC_SEGS_NOW,
+                             dyn_set=DYN_USED, dt=DT, v_target=V_TARGET,
+                             d_safe=D_SAFE_HARD, t_grow_max=OCC_T_GROW_MAX)
+
         if save_traj is not None and DYN_USED is not None and len(DYN_USED):
             for _c0, _c1, _r, _age in DYN_USED:
                 dyn_track.append((ep_steps * DT, float(_c0), float(_c1)))
@@ -1064,6 +1101,8 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         DYN_PUB.shutdown()
     if OCC_PUB is not None:
         OCC_PUB.shutdown()
+    if RVIZ_PUB is not None:
+        RVIZ_PUB.shutdown()
 
     verdict = "collision" if collided else ("reached" if reached else "timeout")
 
@@ -1158,6 +1197,15 @@ if __name__ == "__main__":
                         "view. Shows the PYTHON detector's output, unlike "
                         "PhantomAgentVisualizer which draws Unity's own edge pass. "
                         "Requires --occlusion-aware.")
+    p.add_argument("--rviz-viz", action="store_true",
+                   help="Publish the detected occlusion boundaries (with their expanding "
+                        "keep-outs), the sampled MPPI rollouts and the executed plan as "
+                        "visualization_msgs/MarkerArray on /viz/* for RViz2, plus the "
+                        "map->lidar_link TF that puts them in the same frame as the "
+                        "Unity point cloud. Needs ROS 2 sourced (rclpy, tf2_ros).")
+    p.add_argument("--rviz-rollouts", type=int, default=40, metavar="N",
+                   help="How many of the cheapest sampled rollouts --rviz-viz draws per "
+                        "solve. 0 draws only the executed plan.")
     p.add_argument("--save-traj", default=None, metavar="DIR",
                    help="Save the run's ego trajectory as CSV + a top-down PNG plot into DIR.")
     p.add_argument("--plot-solve-t", type=float, default=None, metavar="SEC",
@@ -1189,4 +1237,6 @@ if __name__ == "__main__":
         occlusion_viz=args.occlusion_viz,
         show_occlusion_plot=not args.no_occlusion_plot,
         save_traj=args.save_traj,
-        plot_solve_t=args.plot_solve_t)
+        plot_solve_t=args.plot_solve_t,
+        rviz_viz=args.rviz_viz,
+        rviz_rollouts=args.rviz_rollouts)
