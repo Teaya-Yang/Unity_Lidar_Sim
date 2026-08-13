@@ -39,7 +39,7 @@ cost:
 dynamic_obstacles:
   k_obs: 10                  # obstacles in the observation vector (sets OBS_SIZE — see the
                             #   contract in taxi_controller_mppi.py's docstring)
-  d_safe: 20.0              # [m] keep-out radius
+  d_safe: 10.0              # [m] keep-out radius
   d_infl: 30.0              # [m] soft influence radius
   w_obs: 8.0                # soft influence ring weight
   rho_slack: 10.0           # linear exact-penalty weight on a keep-out violation. LINEAR is the
@@ -65,7 +65,7 @@ dynamic_obstacles:
 
 keepout:
   d_safe_hard: 15.0         # [m] ~1 aircraft width
-  w_hard: 1.0e+6            # "infinite" hard-constraint weight. See the CAVEAT above: the
+  w_hard: 1.0e+5            # "infinite" hard-constraint weight. See the CAVEAT above: the
                             #   residual violation is |grad(other terms)| / (2*w_hard), so this
                             #   is the knob that decides whether the keep-out EXISTS, not how
                             #   wide the ego swerves. At 50 the residual was ~10 m — i.e. the
@@ -290,7 +290,7 @@ scan:
 mppi:
   horizon: 40               # planning steps (x vehicle.dt seconds)
   samples: 5000             # rollouts per control step
-  lambda: 1.0               # temperature. See the scaling note under `cost`: this is the
+  lambda: 10.0               # temperature. See the scaling note under `cost`: this is the
                             #   correct knob for softmax discrimination.
   sig_a: 0.5                # noise std for acceleration samples
   sig_d: 0.5              # noise std for steering samples

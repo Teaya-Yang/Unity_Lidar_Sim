@@ -67,3 +67,6 @@ data
 
 runs/
 Recordings/
+# vendored upstream: mmdetection3d
+third_party/
+detector/checkpoints/

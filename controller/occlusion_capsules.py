@@ -628,18 +628,18 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
     r_keep = r_grow + d_safe
 
     # Hard term: binary, so every breach costs the same regardless of depth — a constraint,
-    #cost = np.where(d < r_keep, w_obs, 0.0)
+    cost = np.where(d < r_keep, w_obs, 0.0)
 
-    cost = w_obs * (fmax(0.0, r_keep - d)/d_safe) ** 2
+    #cost = w_obs * (fmax(0.0, r_keep - d)/d_safe) ** 2
     # Soft term: the gradient the hard term cannot give. A one-sided quadratic over an
     # influence ring of width d_infl OUTSIDE r_keep, normalised so w_soft is the cost of
     # sitting exactly on the keep-out boundary and 0 at r_keep + d_infl and beyond.
     #   - decreasing in d, so farther is genuinely cheaper (the opposite of `+ k*d`)
     #   - bounded and local, so it cannot outvote the goal far from any boundary (which an
     #     unbounded `-k*d` would, by paying the ego to run away forever)
-#   if w_soft and d_infl:
-#         margin = fmax(0.0, (r_keep + d_infl) - d)
-#         cost = cost + w_soft * margin * margin
+    if w_soft and d_infl:
+            margin = fmax(0.0, (r_keep + d_infl) - d)
+            cost = cost + w_soft * margin * margin
 
     # if not dyn:
     #     print(f"TIMESTAMP_occlussion: {t_k} -> r_grow : {r_grow}, distance from occlussion : {d}, total distance to keep : {r_keep} , current min cost: {np.min(cost_current)}, current_actions: {action[np.argmin(cost_current)]}")

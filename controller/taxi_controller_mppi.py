@@ -157,6 +157,10 @@ DYN_DBG        = None    # (n_clusters, n_tracks, n_dynamic, max_speed) from the
 DYN_LAST_STAMP = None    # ObstacleCircles.stamp of the scan last FUSED into the tracker.
                          #   Gates the Kalman correction to once per scan; see the control loop.
 DYN_CL_N       = 0       # cluster count from that scan, carried across predict-only steps
+DYN_SOURCE     = None    # measurement source feeding DYN_TRACKER: ObstacleCircles (grid
+                         #   clustering, the default) or DetectionSource (PointPillars).
+                         #   Both expose .clusters()/.stamp/.ready, so only the
+                         #   MEASUREMENT differs — tracking and cost are shared.
 DYN_PUB        = None    # DynamicClusterPublisher — feeds DynamicAgentVisualizer.cs so the
                          # Unity Scene view shows the SAME expanding circles the cost used
 VISIBILITY_COST = False   # vestigial: --visibility-cost is a documented no-op
@@ -268,6 +272,13 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     u_prev = np.zeros(2) if u_prev is None else np.asarray(u_prev, dtype=float)
 
     cost = np.zeros(K_MPPI)
+    # Same total, split by origin. cost_keep is the KEEP-OUT part only (occlusion capsules
+    # + sensed movers); cost_nom is everything else (goal, heading, control effort, static
+    # LiDAR surfaces). The feasibility test below is a statement about keep-out intrusion
+    # depth, so it must read cost_keep — the total carries a goal-distance baseline of
+    # ~(w_goal_run*H + w_goal_term)*d, which alone exceeds C_INFEAS far from the goal.
+    cost_keep = np.zeros(K_MPPI)
+    cost_nom  = np.zeros(K_MPPI)
     st   = np.tile(s0, (K_MPPI, 1)).astype(float)
 
     # Taper the speed TARGET down as the goal gets close (see GOAL_SLOWDOWN_DIST doc comment) so
@@ -366,21 +377,24 @@ def mppi(s0, mean, goal_xy, u_prev=None):
        
         _d_static = None
         if STATIC_AVOID and LIDAR_COSTMAP is not None and LIDAR_COSTMAP.ready:
-          
             _d_static = LIDAR_COSTMAP.distance(fwd, lat)
-        cost += tcost.stage_cost(
+        _c_nom = tcost.stage_cost(
             fwd, lat, th, vv, u_k, u_km1,
             goal_xy=(goal_fwd, goal_lat), v_des=v_des_eff, t_k=(k + 1) * DT,
             r_act=R_ACT, r_dact=R_DACT,
             w_goal_run=W_GOAL_RUN, w_head=W_HEAD, w_v=W_V,
             d_static=_d_static, d_safe_static=D_SAFE_HARD, w_static=W_HARD)
+        cost += _c_nom
+        cost_nom += _c_nom
 
         if occ_segs is not None:
-            cost += occlusion_stage_cost(
+            _c_occ = occlusion_stage_cost(
                 _dist_to_occ(fwd, lat), vv, (k + 1) * DT,
                 V_TARGET, D_SAFE_HARD, W_HARD, t_grow_max=OCC_T_GROW_MAX,
                 w_soft=OCC_W_SOFT, d_infl=OCC_D_INFL,
                 cost_current = cost, action = np.column_stack((fwd, lat)))
+            cost += _c_occ
+            cost_keep += _c_occ
 
         if dyn_set is not None:
             t_dyn = (k + 1) * DT
@@ -388,10 +402,16 @@ def mppi(s0, mean, goal_xy, u_prev=None):
                 d_dyn = np.hypot(fwd - c0, lat - c1)
 
                 d_base = D_SAFE_HARD + r_c
-
-                cost += occlusion_stage_cost(
+                _c_dyn = occlusion_stage_cost(
                     d_dyn, vv, t_dyn, V_TARGET, d_base, W_HARD,
+                    # Same cap the /viz bubbles are drawn with (DYN_PUB.publish below).
+                    # Uncapped, r_keep reached d_safe + r_c + v_target*H*dt = 15 + r_c + 56 m
+                    # by the end of the horizon, so every rollout was inside it — and the
+                    # enforced keep-out did not match the one RViz drew.
+                    t_grow_max=DYN_GROW_HORIZON,
                     w_sight=W_SIGHT, a_brake=A_BRAKE_SIGHT, v_floor=V_SIGHT_FLOOR,  dyn = True, cost_current = cost)
+                cost += _c_dyn
+                cost_keep += _c_dyn
 
 
 
@@ -405,24 +425,28 @@ def mppi(s0, mean, goal_xy, u_prev=None):
         keep = np.argsort(cost)[:MPPI_KEEP_ROLLOUTS]
         MPPI_ROLLOUTS, MPPI_COSTS = paths[keep], cost[keep]
 
-    # n_feasible = int((cost <= C_INFEAS).sum())
-    # if n_feasible <= INFEAS_FRAC * K_MPPI:
-    #     print(f"[MPPI] INFEASIBLE: {n_feasible}/{K_MPPI} rollouts under {C_INFEAS:.2e} "
-    #           f"(depth {INFEAS_DEPTH:.2f} m), min cost {cost.min():.3e} — braking")
-    #     u_stop = np.array([A_MIN, 0.0])                 # max decel, hold wheel straight
-    #     # Roll the braking command out over the horizon so the figure can show WHERE the
-    #     # ego still ends up while stopping — the case where it clips the keep-outs is
-    #     # exactly the one worth looking at, so this must not be left as a stale plan.
-    #     _st = np.asarray(s0, float)[None, :]
-    #     _brake = np.empty((H_MPPI, 2))
-    #     for _k in range(H_MPPI):
-    #         _st = _rollout_step(_st, u_stop[0:1], u_stop[1:2])
-    #         _brake[_k] = _st[0, :2]
-    #     OCC_PLAN = _brake
-    #     OCC_INFEASIBLE = True
-    #     return u_stop, np.zeros((H_MPPI, 2))
+    # Feasibility is about keep-out intrusion ONLY. Testing the total here made the goal
+    # baseline decide it: at ~22 m of cost per metre to the goal, every rollout is over
+    # C_INFEAS = 1e3 whenever the goal is more than ~45 m away, so the planner braked for
+    # the whole run regardless of what was actually in front of it.
+    n_feasible = int((cost_keep <= C_INFEAS).sum())
+    if n_feasible <= INFEAS_FRAC * K_MPPI:
+        print(f"[MPPI] INFEASIBLE: {n_feasible}/{K_MPPI} rollouts under {C_INFEAS:.2e} "
+              f"(depth {INFEAS_DEPTH:.2f} m), min keep-out cost {cost_keep.min():.3e} "
+              f"(nominal {cost_nom.min():.3e}, total {cost.min():.3e}) — braking")
+        u_stop = np.array([A_MIN, 0.0])                 # max decel, hold wheel straight
+        # Roll the braking command out over the horizon so the figure can show WHERE the
+        # ego still ends up while stopping — the case where it clips the keep-outs is
+        # exactly the one worth looking at, so this must not be left as a stale plan.
+        _st = np.asarray(s0, float)[None, :]
+        _brake = np.empty((H_MPPI, 2))
+        for _k in range(H_MPPI):
+            _st = _rollout_step(_st, u_stop[0:1], u_stop[1:2])
+            _brake[_k] = _st[0, :2]
+        OCC_PLAN = _brake
+        OCC_INFEASIBLE = True
+        return u_stop, np.zeros((H_MPPI, 2))
 
-    # print("FEASIBLE: ", n_feasible)
     # Leave -cost.min() to avoid underflow, softmax to compute the weights
     w   = np.exp(-(cost - cost.min()) / LAMBDA)
     w  /= w.sum()
@@ -560,6 +584,132 @@ def _save_state_plot(stem, verdict, traj, goal_xy=None, t_mark=None, solve_ts=No
     fig.tight_layout()
     fig.savefig(f"{stem}_state.png", dpi=120)
     plt.close(fig)
+
+
+def _save_rollouts_plot(stem, verdict, fr, goal_xy=None, static_boxes=None,
+                        max_frames=6):
+    """`{stem}_rollouts.png`: every recorded SAMPLED rollout of ONE solve, coloured by
+    total cost, with the chosen plan and that solve's keep-outs on top.
+
+    Same solve and same keep-out geometry as `{stem}.png` — that figure shows the one
+    plan the softmax produced, this one shows the candidate set it produced it from.
+    Only the rollouts mppi() kept are available (see --plot-rollouts), and they are the
+    CHEAPEST N, so the spread drawn is the good tail of the distribution, not all K.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    from occlusion_capsules import capsule_polygon
+    from static_obstacles import box_polygon
+
+    rollouts = fr.get("rollouts")
+    if rollouts is None or not len(rollouts):
+        return False
+    rollouts = np.asarray(rollouts, float)
+    costs = fr.get("rollout_costs")
+    costs = None if costs is None else np.asarray(costs, float)
+
+    plan = fr["plan"]
+    tk = (np.arange(len(plan)) + 1) * DT
+    segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
+            if fr.get("segs") is not None and len(fr["segs"]) else np.empty((0, 2, 2)))
+    dyn_set = _dyn_bubbles(fr.get("dyn_boxes"))
+
+    fig, ax = plt.subplots(figsize=(11, 11))
+
+    sb = (np.asarray(static_boxes, float).reshape(-1, 5)
+          if static_boxes is not None and len(static_boxes) else np.empty((0, 5)))
+    for i, (bx, by, bsx, bsy, byaw) in enumerate(sb):
+        poly = box_polygon(bx, by, bsx, bsy, byaw)
+        ax.fill(poly[:, 0], poly[:, 1], color="0.80", ec="0.30", lw=1.0, zorder=0,
+                label="static obstacles (Unity)" if i == 0 else None)
+
+    db = (np.asarray(fr["dyn_boxes"], float).reshape(-1, 5)
+          if fr.get("dyn_boxes") is not None and len(fr["dyn_boxes"]) else np.empty((0, 5)))
+    for i, (bx, by, bsx, bsy, byaw) in enumerate(db):
+        poly = box_polygon(bx, by, bsx, bsy, byaw)
+        ax.fill(poly[:, 0], poly[:, 1], color="tab:orange", alpha=0.45, ec="tab:orange",
+                lw=1.2, zorder=2,
+                label="dynamic objects at $t_k$ = 0 (Unity)" if i == 0 else None)
+
+    # The rollouts themselves, as one LineCollection — thousands of ax.plot calls would
+    # dominate the render time and the legend.
+    lc = LineCollection(rollouts, linewidths=0.7, alpha=0.55, zorder=3)
+    if costs is not None and len(costs) == len(rollouts) and np.ptp(costs) > 0:
+        # Clip the ramp at the 95th percentile: one infeasible sample at w_hard = 1e5
+        # would otherwise flatten every feasible rollout into a single colour.
+        hi = float(np.percentile(costs, 95))
+        lo = float(costs.min())
+        lc.set_array(np.clip(costs, lo, max(hi, lo + 1e-9)))
+        lc.set_cmap("viridis")
+        cb = fig.colorbar(lc, ax=ax, fraction=0.035, pad=0.02)
+        cb.set_label("rollout total cost (clipped at p95)")
+    else:
+        lc.set_color("tab:blue")
+    ax.add_collection(lc)
+    # One proxy handle so the legend names the cloud without 200 entries in it.
+    ax.plot([], [], "-", color="tab:blue", lw=1.0, alpha=0.7,
+            label=f"{len(rollouts)} sampled rollouts (cheapest kept)")
+
+    ax.plot(plan[:, 0], plan[:, 1], "-", color="k", lw=2.5, zorder=6,
+            label=("braking rollout — no feasible plan" if fr.get("infeasible") else
+                   "chosen plan (softmax of the samples)"))
+
+    # Keep-outs at t_k = 0 and at the same sampled stages as the main figure, so the two
+    # can be read side by side.
+    stage_colors = ["#00e5ff", "#ff00a0", "#ffd400", "#00ff7f",
+                    "#7c4dff", "#ff6d00", "#00b0ff", "#c6ff00"]
+    for seg in segs:
+        poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD)
+        ax.plot(poly[:, 0], poly[:, 1], "-", color="w", lw=1.8, alpha=0.95, zorder=4)
+    for c0, c1, r_c in dyn_set:
+        poly = capsule_polygon((c0, c1), (c0, c1), D_SAFE_HARD + r_c)
+        ax.plot(poly[:, 0], poly[:, 1], "--", color="w", lw=1.6, alpha=0.95, zorder=4)
+
+    stages = np.linspace(0, len(plan) - 1, min(max_frames, len(plan))).round().astype(int)
+    for si, k in enumerate(dict.fromkeys(stages.tolist())):
+        col = stage_colors[si % len(stage_colors)]
+        t_k = float(tk[k])
+        r_k = D_SAFE_HARD + V_TARGET * t_k
+        for seg in segs:
+            poly = capsule_polygon(seg[0], seg[1], r_k)
+            ax.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.5, alpha=0.9, zorder=4)
+        for c0, c1, r_c in dyn_set:
+            poly = capsule_polygon((c0, c1), (c0, c1), D_SAFE_HARD + r_c + V_TARGET * t_k)
+            ax.plot(poly[:, 0], poly[:, 1], "--", color=col, lw=1.4, alpha=0.9, zorder=4)
+
+    for seg in segs:
+        ax.plot(seg[:, 0], seg[:, 1], "-", color="k", lw=2.5, zorder=7)
+    for i, (c0, c1, _r) in enumerate(dyn_set):
+        ax.plot(c0, c1, "x", color="k", ms=7, mew=1.5, zorder=7,
+                label="dynamic object centre (bubble seed)" if i == 0 else None)
+
+    ax.plot(fr["ex"], fr["ey"], "o", mfc="w", mec="k", ms=8, mew=1.2, zorder=8,
+            label="ego at $t_k$ = 0")
+    if goal_xy is not None:
+        ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18, mec="k", zorder=8,
+                label="goal")
+
+    # Zoom on the sample cloud plus the plan: unlike the main figure there is no executed
+    # trajectory to bound, and the cloud IS the subject, so it must not be clipped.
+    allx = np.concatenate([rollouts[:, :, 0].ravel(), plan[:, 0], [fr["ex"]]])
+    ally = np.concatenate([rollouts[:, :, 1].ravel(), plan[:, 1], [fr["ey"]]])
+    margin = 0.15 * max(np.ptp(allx), np.ptp(ally), 1.0) + 5.0
+    cx, cy = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
+    half_x = 0.5 * np.ptp(allx) + margin
+    half_y = max(0.5 * np.ptp(ally) + margin, 0.25 * half_x)
+    ax.set_xlim(cx - half_x, cx + half_x); ax.set_ylim(cy - half_y, cy + half_y)
+    ax.set_aspect("equal", adjustable="box")
+    fig.set_size_inches(12.0, float(np.clip(12.0 * half_y / half_x, 4.0, 12.0)))
+    ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
+    ax.set_title(f"{verdict} — MPPI sample cloud at t = {fr['t']:.1f} s "
+                 f"({len(rollouts)} rollouts over {len(plan)} steps = "
+                 f"{len(plan) * DT:.1f} s horizon)")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.12, 1.0), fontsize=8, borderaxespad=0.0)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(f"{stem}_rollouts.png", dpi=120)
+    plt.close(fig)
+    return True
 
 
 def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=None,
@@ -753,6 +903,15 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     _save_state_plot(stem, verdict, traj, goal_xy, t_mark=fr["t"],
                      solve_ts=[f["t"] for f in frames])
 
+    # Same solve, second figure: the whole sample cloud it chose that plan from.
+    if _save_rollouts_plot(stem, verdict, fr, goal_xy=goal_xy,
+                           static_boxes=static_boxes, max_frames=max_frames):
+        print(f"[traj] saved {stem}_rollouts.png ({len(fr['rollouts'])} sampled rollouts "
+              f"at t={fr['t']:.1f}s)")
+    else:
+        print("[traj] no _rollouts.png — no sampled rollouts recorded "
+              "(pass --plot-rollouts N)")
+
     print(f"[traj] saved {stem}.csv, {stem}.png and {stem}_state.png (rollout from the solve at "
           f"t={fr['t']:.1f}s, {len(set(stages.tolist()))} sampled stages, "
           f"{len(segs)} occlusion boundaries, {len(dyn_set)} dynamic objects)")
@@ -765,11 +924,13 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         lidar_costmap=False, lidar_topic="/point_cloud", visibility_cost=False,
         occlusion_aware=False, dynamic_obstacles=False, dynamic_viz=False,
         occlusion_viz=False, save_traj=None, show_occlusion_plot=True, plot_solve_t=None,
-        rviz_viz=False, rviz_rollouts=40):
+        rviz_viz=False, rviz_rollouts=40, plot_rollouts=0,
+        detector=False, detector_topic="/detections"):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW, OCC_PUB
     global DYNAMIC_AVOID, DYN_TRACKER, DYN_NOW, DYN_DBG, DYN_PUB, DYN_LAST_STAMP, DYN_CL_N
+    global DYN_SOURCE
     global RVIZ_PUB, MPPI_KEEP_ROLLOUTS
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
@@ -831,11 +992,25 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                     DYN_PUB = DynamicClusterPublisher()
                     if not DYN_PUB.start():
                         DYN_PUB = None
+                # Measurement source. The detector replaces ONLY the clusters() call;
+                # if its node is not up, fall back to grid clustering rather than
+                # running blind — a silently empty detector topic would otherwise look
+                # exactly like an empty apron.
+                DYN_SOURCE = cm
+                if detector:
+                    from detection_source import DetectionSource
+                    ds = DetectionSource()
+                    if ds.start(topic=detector_topic):
+                        DYN_SOURCE = ds
+                    else:
+                        print("[Controller] Detector      : requested but rclpy "
+                              "unavailable — falling back to grid clustering")
             feats = [f"static(D_SAFE={D_SAFE_HARD:.1f}m, circle-cover)"]
             if OCCLUSION_AWARE:  feats.append(f"occlusion(D_SAFE={D_SAFE_HARD:.1f}m, "
                                              f"v_target={V_TARGET:.1f}m/s, sightline)")
             if DYNAMIC_AVOID:    feats.append(
-                f"dynamic(clustered, v_min={DYN_V_MIN:.1f}m/s, "
+                f"dynamic({'PointPillars' if detector else 'clustered'}, "
+                f"v_min={DYN_V_MIN:.1f}m/s, "
                 f"v_target={V_TARGET:.1f}m/s, k={K_DYN})"
                 + ("" if DYN_REQUIRE_MOTION else " [require_motion=OFF: every compact "
                                                  "cluster gets the expanding keep-out]"))
@@ -866,6 +1041,16 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
             MPPI_KEEP_ROLLOUTS = max(int(rviz_rollouts), 0)
             print(f"[Controller] RViz feed    : ON  (/viz/*, {MPPI_KEEP_ROLLOUTS} rollouts "
                   f"drawn per solve)")
+
+    # The _rollouts.png figure needs mppi() to keep its samples. Shares the RViz switch —
+    # take the larger request, so the two flags do not fight over one global.
+    if save_traj is not None and plot_rollouts > 0:
+        MPPI_KEEP_ROLLOUTS = max(MPPI_KEEP_ROLLOUTS, int(plot_rollouts))
+        print(f"[Controller] Rollout plot : ON  ({MPPI_KEEP_ROLLOUTS} cheapest rollouts "
+              f"recorded per solve)")
+    elif plot_rollouts > 0:
+        print("[Controller] --plot-rollouts needs --save-traj (there is nowhere to write "
+              "the figure) — DISABLED")
 
     # Static-obstacle footprints from Unity. Plot-only, so it is started only when a
     # trajectory is being saved and its absence never affects control.
@@ -966,13 +1151,14 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
             else:
                 OCC_SEGS_NOW = None
 
-            if DYNAMIC_AVOID and DYN_TRACKER is not None and LIDAR_COSTMAP.ready:
+            _src = DYN_SOURCE if DYN_SOURCE is not None else LIDAR_COSTMAP
+            if DYNAMIC_AVOID and DYN_TRACKER is not None and _src.ready:
                 _now = time.monotonic()
-                _stamp = LIDAR_COSTMAP.stamp
+                _stamp = _src.stamp
                 if _stamp != DYN_LAST_STAMP:
                     DYN_LAST_STAMP = _stamp
-                    _cl = LIDAR_COSTMAP.clusters(cell=DYN_CELL, min_points=DYN_MIN_POINTS,
-                                                 max_radius=DYN_MAX_RADIUS)
+                    _cl = _src.clusters(cell=DYN_CELL, min_points=DYN_MIN_POINTS,
+                                        max_radius=DYN_MAX_RADIUS)
                     DYN_TRACKER.update(_cl, _now)
                     DYN_CL_N = 0 if _cl is None else len(_cl)
                 else:
@@ -1023,6 +1209,13 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                                         if _segs is not None and len(_segs) else None),
                                # Ground-truth movers as of THIS solve.
                                "dyn_boxes": (None if dyn_obs is None else dyn_obs.boxes()),
+                               # The sampled rollouts the softmax weighted at this solve,
+                               # for the _rollouts.png figure. float32 because this is the
+                               # one per-solve record whose size scales with K (N*H*2).
+                               "rollouts": (None if MPPI_ROLLOUTS is None
+                                            else MPPI_ROLLOUTS.astype(np.float32)),
+                               "rollout_costs": (None if MPPI_COSTS is None
+                                                 else MPPI_COSTS.astype(np.float32)),
                                "infeasible": bool(OCC_INFEASIBLE)})
 
         u_cmd      = u_nom
@@ -1150,6 +1343,16 @@ if __name__ == "__main__":
                         "Needs ROS 2 sourced (rclpy) and the ros_tcp_endpoint running.")
     p.add_argument("--lidar-topic",    default="/point_cloud",
                    help="PointCloud2 topic for the LiDAR map. Default: /point_cloud.")
+    p.add_argument("--detector", action="store_true",
+                   help="Take dynamic obstacles from lidar_detector_node.py "
+                        "(PointPillars) instead of the grid clustering in "
+                        "dynamic_clusters.py. Only the MEASUREMENT changes: the same "
+                        "Kalman tracker, static/dynamic test and keep-out cost run in "
+                        "both modes. Requires --dynamic-obstacles and the detector node "
+                        "publishing on --detector-topic; falls back to clustering if it "
+                        "is not up.")
+    p.add_argument("--detector-topic", default="/detections",
+                   help="Float32MultiArray topic from lidar_detector_node.py.")
     p.add_argument("--visibility-cost", action="store_true",
                    help="DEPRECATED / no-op: the active-perception visibility term relied on the "
                         "removed persistent occupancy grid and is ignored.")
@@ -1194,6 +1397,11 @@ if __name__ == "__main__":
                         "solve. 0 draws only the executed plan.")
     p.add_argument("--save-traj", default=None, metavar="DIR",
                    help="Save the run's ego trajectory as CSV + a top-down PNG plot into DIR.")
+    p.add_argument("--plot-rollouts", type=int, default=0, metavar="N",
+                   help="Also write traj_rollouts.png: the N cheapest sampled MPPI "
+                        "rollouts of the plotted solve, coloured by cost. Needs "
+                        "--save-traj. 0 = off. Costs N*horizon*2 float32 per solve of "
+                        "memory, so keep it in the low hundreds.")
     p.add_argument("--plot-solve-t", type=float, default=None, metavar="SEC",
                    help="Episode time [s] of the solve whose rollout the plot draws: the "
                         "t_k = 0 point and the sampled future timestamps hang off it. "
@@ -1224,5 +1432,8 @@ if __name__ == "__main__":
         show_occlusion_plot=not args.no_occlusion_plot,
         save_traj=args.save_traj,
         plot_solve_t=args.plot_solve_t,
+        plot_rollouts=args.plot_rollouts,
         rviz_viz=args.rviz_viz,
-        rviz_rollouts=args.rviz_rollouts)
+        rviz_rollouts=args.rviz_rollouts,
+        detector=args.detector,
+        detector_topic=args.detector_topic)

@@ -75,6 +75,17 @@ Visualization Manager:
       Namespaces:
         {}
     - Class: rviz_default_plugins/MarkerArray
+      Name: Detected boxes
+      Enabled: true
+      Topic:
+        Value: /viz/detections
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Namespaces:
+        {}
+    - Class: rviz_default_plugins/MarkerArray
       Name: Ego and goal
       Enabled: true
       Topic:

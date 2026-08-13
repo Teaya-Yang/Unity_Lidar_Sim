@@ -100,9 +100,9 @@ def stage_cost(px, py, th, v, uk, u_km1, *, goal_xy, v_des, t_k,
     # Control effort and rate. The STEERING channel of r_act/r_dact is what bounds how wide
     # the ego swerves around an obstacle — a control-smoothness objective, NOT a goal-bearing
     # one, so it cannot fight the keep-out or make standing still cheaper than driving.
-    # du = uk - u_km1
-    # cost = cost + (np.asarray(r_act) * uk * uk).sum(axis=1)
-    # cost = cost + (np.asarray(r_dact) * du * du).sum(axis=1)
+    du = uk - u_km1
+    cost = cost + (np.asarray(r_act) * uk * uk).sum(axis=1)
+    cost = cost + (np.asarray(r_dact) * du * du).sum(axis=1)
 
     # Static surfaces (LiDAR OCC), same shape as the obstacle terms.
     if d_static is not None:
