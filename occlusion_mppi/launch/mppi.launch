@@ -145,11 +145,14 @@
              entirely; leaving it on costs one frontier snapshot per recorded
              solve, which is the only unbounded state in this node.
              plot_solve_t pins WHICH solve is drawn (episode seconds); unset,
-             the figure picks the solve whose plan came closest to its own
-             expanding keep-out. -->
+             the figure draws the MINIMUM-COST solve of the run.
+             plot_video also writes traj.mp4 (traj.gif without ffmpeg), one
+             frame per recorded solve; set false if shutdown is too slow. -->
         <param name="save_dir" value="$(env HOME)/rog_ws/runs"/>
         <param name="plot_stride" value="5"/>
         <param name="plot_max_frames" value="6"/>
         <param name="plot_solve_t" value=""/>
+        <param name="plot_video" value="true"/>
+        <param name="plot_video_fps" value="6"/>
     </node>
 </launch>

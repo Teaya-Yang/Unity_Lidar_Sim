@@ -52,9 +52,40 @@ def _frame_boundaries(fr):
                        query_z=fr.get("query_z"))
 
 
+STAGE_COLORS = ["#00e5ff", "#ff00a0", "#ffd400", "#00ff7f",
+                "#7c4dff", "#ff6d00", "#00b0ff", "#c6ff00"]
+
+
+def _window(traj, goal, extra_xy, margin):
+    """The XY window every drawing in this module uses: the ego's own extent
+    plus whatever `extra_xy` (a plan, or every plan) adds, padded. The wall and
+    the outer keep-out contours are deliberately left out of the bounds -- a
+    saturated keep-out ring is d_safe + v_target*t_grow_max across and would
+    zoom the ego down to a few pixels. Anything outside simply gets clipped."""
+    allx = np.concatenate([traj[:, 1], extra_xy[:, 0], [goal[0]]])
+    ally = np.concatenate([traj[:, 2], extra_xy[:, 1], [goal[1]]])
+    cx, cy = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
+    half_x = 0.5 * (allx.max() - allx.min()) + margin
+    half_y = 0.5 * (ally.max() - ally.min()) + margin
+    # Clamp the window's aspect both ways. A straight run at the wall is ~15 m
+    # of y over ~1 m of x, and with equal aspect that window is a pencil: the
+    # keep-out contours -- the point of the figure -- leave the frame within a
+    # centimetre of the path. Widening the SHORT axis keeps metres square.
+    return cx, cy, max(half_x, 0.5 * half_y), max(half_y, 0.5 * half_x)
+
+
+def _frame_cost(fr):
+    """Cost of the rollout this frame's `plan` IS -- min over the batch, since
+    the recorded plan is `info["best"]` (mppi.plan). None on a frame recorded
+    before the node started storing it."""
+    c = fr.get("cost")
+    return None if c is None or not np.isfinite(c) else float(c)
+
+
 def save_run(out_dir, verdict, goal, traj, frames, cfg, dim=3,
              solve_t=None, max_frames=6, margin=6.0, grid=320,
-             occ_band=0.6, **_ignored):
+             occ_band=0.6, video=True, video_fps=6, video_grid=200,
+             video_stages=None, **_ignored):
     """Write <out_dir>/traj.csv and <out_dir>/traj.png.
 
     traj   : (T, 1+2*dim) rows of [t, pos..., vel...] -- the EXECUTED run.
@@ -63,9 +94,14 @@ def save_run(out_dir, verdict, goal, traj, frames, cfg, dim=3,
     cfg    : the MPPIConfig the run used; d_safe/v_target/t_grow_max are read
              from it so the drawn radii cannot drift from the enforced ones.
     solve_t: [s] pin WHICH solve is drawn -- the recorded one closest in episode
-             time. Left None, the solve drawn is the one whose plan came closest
-             to (or inside) its expanding keep-out; with no boundaries anywhere
-             it falls back to the solve whose plan bent hardest.
+             time. Left None, the solve drawn is the MINIMUM-COST one: each
+             frame's plan is that solve's best rollout (info["best"]), so the
+             lowest of those costs is the best-scoring plan of the whole run.
+             Frames recorded without a cost fall back to the old rule -- the
+             plan that came closest to (or inside) its expanding keep-out, and
+             failing that the one that bent hardest.
+    video  : also write <out_dir>/traj.mp4 (or .gif if ffmpeg is missing): one
+             animation frame per recorded solve, same geometry as the figure.
 
     cfg.use_occlusion selects the two presentations. False (the ~use_occlusion
     baseline) still draws everything -- the node records the frontier either way
@@ -120,12 +156,21 @@ def save_run(out_dir, verdict, goal, traj, frames, cfg, dim=3,
         return float(np.max(r - d))
 
     with_bnd = [f for f in frames if f.get("bnd") is not None and len(f["bnd"])]
+    with_cost = [f for f in frames if _frame_cost(f) is not None]
     if solve_t is not None:
         fr = min(frames, key=lambda f: abs(f["t"] - solve_t))
         if abs(fr["t"] - solve_t) > cfg.dt:
             print(f"[traj] no solve recorded at t={solve_t:.1f}s -- using the "
                   f"nearest, t={fr['t']:.1f}s (recorded "
                   f"{frames[0]['t']:.1f}..{frames[-1]['t']:.1f}s)")
+    elif with_cost:
+        # The recorded plan is the batch's argmin under selection="best", so
+        # comparing those costs across solves ranks the run's plans directly --
+        # including the occlusion term, which `_tightest` only proxies for.
+        fr = min(with_cost, key=_frame_cost)
+        print(f"[traj] drawn solve chosen by minimum rollout cost: "
+              f"t={fr['t']:.1f}s, J={_frame_cost(fr):.3f} "
+              f"(over {len(with_cost)}/{len(frames)} solves with a cost)")
     elif with_bnd:
         fr = max(with_bnd, key=_tightest)
     else:
@@ -148,21 +193,8 @@ def save_run(out_dir, verdict, goal, traj, frames, cfg, dim=3,
                                      "~boundary_topic and ~boundary_z_min)"))
 
     # ---- window ----------------------------------------------------------
-    # Zoom on the EGO's own extent (start -> end) plus the plan it is
-    # executing. The wall and the outer keep-out contours are deliberately left
-    # out of the bounds: a saturated keep-out ring is d_safe + v_target *
-    # t_grow_max across and would zoom the ego down to a few pixels. Anything
-    # outside the window simply gets clipped.
-    allx = np.concatenate([x, plan[:, 0], [goal[0]]])
-    ally = np.concatenate([y, plan[:, 1], [goal[1]]])
-    cx, cy = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
-    half_x = 0.5 * (allx.max() - allx.min()) + margin
-    half_y = 0.5 * (ally.max() - ally.min()) + margin
-    # Clamp the window's aspect both ways. A straight run at the wall is ~15 m
-    # of y over ~1 m of x, and with equal aspect that window is a pencil: the
-    # keep-out contours -- the point of the figure -- leave the frame within a
-    # centimetre of the path. Widening the SHORT axis keeps metres square.
-    half_x, half_y = max(half_x, 0.5 * half_y), max(half_y, 0.5 * half_x)
+    # Zoom on the EGO's own extent (start -> end) plus the plan it is executing.
+    cx, cy, half_x, half_y = _window(traj, goal, plan[:, :2], margin)
 
     # The altitude panel is gated on z actually MOVING, not on dim == 3. The
     # normal wall-scene config is dim=3 with lock_altitude=true and
@@ -217,8 +249,7 @@ def save_run(out_dir, verdict, goal, traj, frames, cfg, dim=3,
     else:
         D = None
 
-    stage_colors = ["#00e5ff", "#ff00a0", "#ffd400", "#00ff7f",
-                    "#7c4dff", "#ff6d00", "#00b0ff", "#c6ff00"]
+    stage_colors = STAGE_COLORS
 
     # t_k = 0: the ego pose at this solve, with the un-expanded keep-out. Drawn
     # dashed dark rather than in the stage palette: it is the t=0 reference every
@@ -354,4 +385,160 @@ def save_run(out_dir, verdict, goal, traj, frames, cfg, dim=3,
           f"voxels, {len(occ)} banded occupied voxels)")
     if breach_txt:
         print(f"[traj] {breach_txt}")
+
+    if video:
+        try:
+            _save_video(stem, verdict, goal, traj, frames, cfg, dim=dim,
+                        fps=video_fps, grid=video_grid, margin=margin,
+                        occ_band=occ_band,
+                        # Same number of sampled t_k as the still by default,
+                        # so a video frame and the figure read identically.
+                        n_stages=max_frames if video_stages is None
+                        else video_stages)
+        except Exception as e:      # noqa: BLE001 -- the figure is the deliverable
+            print(f"[traj] video not written: {e}")
     return stem
+
+
+def _save_video(stem, verdict, goal, traj, frames, cfg, dim=3, fps=6,
+                grid=200, margin=6.0, occ_band=0.6, n_stages=6):
+    """One animation frame per recorded solve: the same geometry, the same
+    sampled t_k markers and the same legend as the still figure, swept over the
+    run.
+
+    Everything that must not move between frames is fixed up front rather than
+    recomputed per frame: the window (the executed path plus EVERY recorded
+    plan), the metre-square aspect, the axes box and the legend. A video whose
+    axes rescale per frame turns the ego's motion into the frame's motion and
+    makes two frames impossible to compare by eye -- which is the only reason
+    to watch this rather than flip through stills.
+
+    Deliberately cheaper than the still in one respect only: the keep-out is
+    rasterised per frame (the frontier changes every tick, so the distance
+    field cannot be cached across frames), which is the whole cost of this, so
+    it runs on a coarser `grid`.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib import animation
+
+    # mp4 when ffmpeg is installed, animated gif otherwise. Neither is a hard
+    # dependency of the node, so failing over beats writing nothing.
+    if animation.writers.is_available("ffmpeg"):
+        path, writer = f"{stem}.mp4", animation.FFMpegWriter(
+            fps=fps, bitrate=2400)
+    elif animation.writers.is_available("pillow"):
+        path, writer = f"{stem}.gif", animation.PillowWriter(fps=fps)
+    else:
+        raise RuntimeError("no ffmpeg and no pillow writer available")
+
+    on = bool(cfg.use_occlusion)
+    all_plans = np.concatenate(
+        [np.asarray(f["plan"], float)[:, :2] for f in frames])
+    cx, cy, half_x, half_y = _window(traj, goal, all_plans, margin)
+    gx = np.linspace(cx - half_x, cx + half_x, grid)
+    gy = np.linspace(cy - half_y, cy + half_y, grid)
+    GX, GY = np.meshgrid(gx, gy)
+    q = np.column_stack([GX.ravel(), GY.ravel()])
+
+    # The sampled horizon stages are the same INDICES every frame -- every plan
+    # is H long -- so the k-th marker means the same t_k and keeps the same
+    # colour for the whole video, exactly as it does on the still.
+    H = min(len(np.asarray(f["plan"])) for f in frames)
+    stages = np.linspace(0, H - 1, min(n_stages, H)).round().astype(int)
+    stages = list(dict.fromkeys(stages.tolist()))
+    tk = (np.arange(H) + 1) * cfg.dt
+
+    fig, ax = plt.subplots(figsize=(12, 12.0 * half_y / half_x))
+    # Fixed axes box, leaving room for the legend on the right. tight_layout
+    # per frame would resize the axes whenever the title's width changed, so
+    # the metre scale would breathe from frame to frame.
+    fig.subplots_adjust(left=0.08, right=0.72, bottom=0.08, top=0.90)
+    with writer.saving(fig, path, dpi=110):
+        for fr in frames:
+            ax.clear()
+            plan = np.asarray(fr["plan"], float)
+            bset = _frame_boundaries(fr)
+            ez = float(fr["ex"][2]) if dim == 3 else float(
+                fr.get("query_z", 1.0))
+
+            occ = np.asarray(fr.get("occ", np.empty((0, 3))),
+                             float).reshape(-1, 3)
+            if len(occ):
+                occ = occ[np.abs(occ[:, 2] - ez) <= occ_band]
+            if len(occ):
+                ax.scatter(occ[:, 0], occ[:, 1], s=3, c="0.45", marker="s",
+                           zorder=0,
+                           label=f"occupied voxels (inf_occ, |z-ego| < "
+                                 f"{occ_band} m)")
+
+            # The whole run in faint grey, the part already flown solid: the
+            # frame is then readable as "where in the run am I" without a
+            # separate progress axis.
+            ax.plot(traj[:, 1], traj[:, 2], "-", color="0.85", lw=1.0, zorder=1,
+                    label="executed trajectory (whole run)")
+            flown = traj[traj[:, 0] <= fr["t"]]
+            if len(flown):
+                ax.plot(flown[:, 1], flown[:, 2], "-", color="0.45", lw=1.4,
+                        zorder=1, label="flown so far")
+            ax.plot(traj[0, 1], traj[0, 2], "o", color="tab:green", ms=8,
+                    zorder=3, label="start")
+            ax.plot(goal[0], goal[1], "*", color="gold", ms=16, mec="k",
+                    zorder=3, label="goal")
+
+            # One distance field per frame, contoured at every sampled r_k: the
+            # field does not depend on t_k, only the level does.
+            D = bset.distance(q).reshape(GX.shape) if (len(bset) and on) else None
+            if D is not None:
+                ax.contour(GX, GY, D, levels=[cfg.d_safe], colors="0.15",
+                           linestyles="--", linewidths=1.4, zorder=1)
+            if len(bset):
+                b = bset.points
+                ax.plot(b[:, 0], b[:, 1], ".", color="crimson", ms=1.2,
+                        zorder=6, label="occlusion frontier")
+
+            ax.plot(plan[:, 0], plan[:, 1], "-", color="k", lw=2.0, zorder=4,
+                    label=("braking rollout -- all rollouts collided"
+                           if fr.get("infeasible") else "predicted rollout"))
+
+            # t_k = 0: the ego at this solve, with the un-expanded keep-out.
+            ax.plot(fr["ex"][0], fr["ex"][1], "o", mfc="w", mec="k", ms=7,
+                    mew=1.0, zorder=5,
+                    label="$t_k$ = 0.0 s" + (f"   r = {cfg.d_safe:.1f} m"
+                                             if on else ""))
+            for si, k in enumerate(stages):
+                col = STAGE_COLORS[si % len(STAGE_COLORS)]
+                t_k = float(tk[k])
+                r_k = _r_keep(cfg, t_k)
+                if D is not None:
+                    ax.contour(GX, GY, D, levels=[r_k], colors=[col],
+                               linewidths=1.6, zorder=1)
+                ax.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=6,
+                        mew=0.9, zorder=5,
+                        label=f"$t_k$ = {t_k:.1f} s"
+                              + (f"   r = {r_k:.1f} m" if on else ""))
+
+            ax.set_xlim(cx - half_x, cx + half_x)
+            ax.set_ylim(cy - half_y, cy + half_y)
+            # Metres square, and the SAME metres in x and y on every frame: the
+            # window above is fixed, so a datalim-driven aspect never kicks in.
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlabel("x [m]")
+            ax.set_ylabel("y [m]")
+            ax.grid(True, alpha=0.3)
+            j = _frame_cost(fr)
+            ax.set_title(
+                f"{verdict} -- t = {fr['t']:.1f} s"
+                + ("" if j is None else f",  best-rollout cost J = {j:.3f}")
+                + ("" if on else "   [BASELINE: occlusion term OFF]")
+                + (f"\nz = {ez:.2f} m" if dim == 3 else "\n")
+                + ("   ALL ROLLOUTS COLLIDED -- braking"
+                   if fr.get("infeasible") else ""),
+                color="k" if on else "tab:red", fontsize=11)
+            # Same placement as the still: outside the axes, upper left. The
+            # window is tight around the ego, so "best" lands it on the rollout.
+            ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8,
+                      borderaxespad=0.0)
+            writer.grab_frame()
+    plt.close(fig)
+    print(f"[traj] saved {path} ({len(frames)} frames at {fps} fps)")
+    return path

@@ -250,6 +250,11 @@ class MPPINode(object):
         self.plot_max_records = int(rospy.get_param("~plot_max_records", 400))
         # Subsample of inf_occ kept per frame, for the figure's map backdrop.
         self.plot_occ_max = int(rospy.get_param("~plot_occ_max", 6000))
+        # traj.mp4 (traj.gif without ffmpeg): one animation frame per recorded
+        # solve. Rasterises a distance field per frame, so it is the slow part
+        # of shutdown -- seconds on a long run, on a coarser grid than the still.
+        self.plot_video = bool(rospy.get_param("~plot_video", True))
+        self.plot_video_fps = int(rospy.get_param("~plot_video_fps", 6))
         self._traj = []
         self._frames = []
         self._solve_count = -1
@@ -471,6 +476,9 @@ class MPPINode(object):
             "planar": self.boundaries.planar,
             "query_z": self.boundaries.query_z,
             "occ": occ.copy(),
+            # Cost of THAT plan -- the batch minimum, since info["best"] is the
+            # argmin rollout. plot_run ranks solves by it to pick the drawn one.
+            "cost": float(np.min(info["cost"])),
             "infeasible": info["frac_collide"] > 0.99,
         })
         if len(self._frames) > self.plot_max_records:
@@ -487,7 +495,8 @@ class MPPINode(object):
             save_run(self.save_dir, verdict, self.goal, np.array(self._traj),
                      self._frames, self.cfg, dim=self.dim,
                      solve_t=self.plot_solve_t,
-                     max_frames=self.plot_max_frames)
+                     max_frames=self.plot_max_frames,
+                     video=self.plot_video, video_fps=self.plot_video_fps)
         except Exception as e:      # noqa: BLE001 -- diagnostics, never fatal
             rospy.logerr("[mppi] could not save the run figure: %s", e)
 
