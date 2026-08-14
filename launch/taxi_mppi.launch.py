@@ -59,6 +59,10 @@ def _controller(context, *_a, **_kw):
         cmd.append("--occlusion-aware")
     if cfg("dynamic_obstacles").lower() == "true":
         cmd.append("--dynamic-obstacles")
+    if cfg("traj_video").lower() == "true":
+        cmd += ["--traj-video",
+                "--video-fps", cfg("video_fps"),
+                "--video-stride", cfg("video_stride")]
     for flag, arg in (("--exec", "unity_exec"), ("--save-traj", "save_traj"),
                       ("--config", "config")):
         if cfg(arg):
@@ -88,12 +92,20 @@ def generate_launch_description():
                              description="Unity build to run headless. Empty = attach to "
                                          "the Editor."),
         DeclareLaunchArgument("lidar_topic", default_value="/point_cloud"),
-        DeclareLaunchArgument("occlusion_aware", default_value="false"),
+        DeclareLaunchArgument("occlusion_aware", default_value="true"),
         DeclareLaunchArgument("dynamic_obstacles", default_value="true"),
         DeclareLaunchArgument("rviz_rollouts", default_value="100",
                              description="Sampled rollouts drawn per solve (0 = plan only)."),
         DeclareLaunchArgument("save_traj", default_value="",
                              description="Directory for the trajectory CSV + PNGs."),
+        DeclareLaunchArgument("traj_video", default_value="false",
+                             description="Also write traj.mp4 (traj.gif without ffmpeg): "
+                                         "the map figure replayed over every solve. "
+                                         "Needs save_traj."),
+        DeclareLaunchArgument("video_fps", default_value="10",
+                             description="Frame rate of traj_video."),
+        DeclareLaunchArgument("video_stride", default_value="1",
+                             description="Draw only every Nth solve in traj_video."),
         DeclareLaunchArgument("config", default_value="",
                              description="Tuning YAML (default: controller/config.yaml)."),
     ]

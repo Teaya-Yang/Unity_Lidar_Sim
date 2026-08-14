@@ -123,6 +123,11 @@ MPPI_ROLLOUTS   = None   # (n,H,2) sampled rollout paths from the LAST solve, ke
                          # every sample's path costs K*H*2 floats per step otherwise.
 MPPI_COSTS      = None   # (n,) their total costs, for the colour ramp
 MPPI_KEEP_ROLLOUTS = 0   # how many sampled paths mppi() records (0 = off)
+MPPI_BEST       = None   # (path, cost) of the CHEAPEST sample of the LAST solve — the
+                         # rollout the video draws. Recorded separately from MPPI_ROLLOUTS
+                         # so it is available without --plot-rollouts, and exactly: it is
+                         # the argmin over all K samples, not over a kept subset.
+MPPI_TRACK_BEST = False  # set by --traj-video: costs one (K,H,2) scratch buffer
 DYN_CELL       = CFG["dynamic_clusters"]["cell"]
 DYN_MIN_POINTS = CFG["dynamic_clusters"]["min_points"]
 DYN_MAX_RADIUS = CFG["dynamic_clusters"]["max_radius"]
@@ -253,7 +258,7 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     Returns (u_nom, new_mean).
     """
     global OCC_USED_N, OCC_GATE_DBG, OCC_RANGE_DBG, OCC_SEGS_USED, OCC_PLAN, DYN_USED
-    global OCC_INFEASIBLE, MPPI_ROLLOUTS, MPPI_COSTS
+    global OCC_INFEASIBLE, MPPI_ROLLOUTS, MPPI_COSTS, MPPI_BEST
     # Nominal MPPI weights / limits. The frontal-threat "go-around" gate (in_corridor / aimed_at_us)
     # has been removed to keep the planner simple: plain lane-following + obstacle rings, and the
     # LiDAR visibility term is what drives any deliberate off-lane motion.
@@ -362,8 +367,9 @@ def mppi(s0, mean, goal_xy, u_prev=None):
 
     # Sampled rollout paths for the RViz overlay. Filled in the loop below so the drawn
     # lines are the SAMPLES the softmax weighted, not a re-simulation of them.
-    MPPI_ROLLOUTS = MPPI_COSTS = None
-    paths = (np.empty((K_MPPI, H_MPPI, 2)) if MPPI_KEEP_ROLLOUTS > 0 else None)
+    MPPI_ROLLOUTS = MPPI_COSTS = MPPI_BEST = None
+    paths = (np.empty((K_MPPI, H_MPPI, 2))
+             if (MPPI_KEEP_ROLLOUTS > 0 or MPPI_TRACK_BEST) else None)
 
     for k in range(H_MPPI):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
@@ -415,21 +421,28 @@ def mppi(s0, mean, goal_xy, u_prev=None):
 
 
 
-    # print("MIN_cost_trajectory: ", cost.min())
-    # print("MAX_cost_trajectory: ", cost.max())
+    print("MIN_cost_trajectory: ", cost.min())
+    print("MAX_cost_trajectory: ", cost.max())
 
     cost += tcost.terminal_cost(st[:, 0], st[:, 1],
                                 goal_xy=(goal_fwd, goal_lat), w_goal_term=W_GOAL_TERM)
 
-    if paths is not None:
+    if paths is not None and MPPI_KEEP_ROLLOUTS > 0:
         keep = np.argsort(cost)[:MPPI_KEEP_ROLLOUTS]
         MPPI_ROLLOUTS, MPPI_COSTS = paths[keep], cost[keep]
+
+    if paths is not None and MPPI_TRACK_BEST:
+        # Cheapest sample on the TOTAL cost (terminal included — the same number the
+        # softmax weights). Recorded even on an infeasible solve, which is returned from
+        # below: that is the case where seeing the best available option matters most.
+        _i_lo = int(np.argmin(cost))
+        MPPI_BEST = (paths[_i_lo].copy(), float(cost[_i_lo]))
 
     # Feasibility is about keep-out intrusion ONLY. Testing the total here made the goal
     # baseline decide it: at ~22 m of cost per metre to the goal, every rollout is over
     # C_INFEAS = 1e3 whenever the goal is more than ~45 m away, so the planner braked for
     # the whole run regardless of what was actually in front of it.
-    n_feasible = int((cost_keep <= C_INFEAS).sum())
+    n_feasible = int((cost_keep < C_INFEAS).sum())
     if n_feasible <= INFEAS_FRAC * K_MPPI:
         print(f"[MPPI] INFEASIBLE: {n_feasible}/{K_MPPI} rollouts under {C_INFEAS:.2e} "
               f"(depth {INFEAS_DEPTH:.2f} m), min keep-out cost {cost_keep.min():.3e} "
@@ -498,6 +511,12 @@ def identify_bicycle_model(env, behavior_name, n_steps=200):
 
 # ── Main control loop ─────────────────────────────────────────────────────────
 
+# Colour per sampled horizon stage t_k, shared by the still figure, the rollout figure
+# and the video so the same t_k is the same colour everywhere.
+STAGE_COLORS = ["#00e5ff", "#ff00a0", "#ffd400", "#00ff7f",
+                "#7c4dff", "#ff6d00", "#00b0ff", "#c6ff00"]
+
+
 def _dyn_bubbles(boxes):
     """(N,3) [c0, c1, r] keep-out seeds from the ground-truth mover boxes published on
     /dynamic_obstacles: the box centre and the half-diagonal, so the disc encloses the
@@ -508,6 +527,91 @@ def _dyn_bubbles(boxes):
         return np.empty((0, 3))
     r = 0.5 * np.hypot(b[:, 2], b[:, 3])
     return np.column_stack([b[:, 0], b[:, 1], r])
+
+
+# How far a sensed track may sit from a ground-truth box and still be called the same
+# object. Generous on purpose: the whole point of the comparison is to SHOW localisation
+# error, so the threshold must not be so tight that a badly-but-genuinely tracked object
+# is reported as lost. Scaled by the box's own size, floored for small objects.
+TRACK_MATCH_R = 15.0   # [m]
+
+
+def _match_tracked(fr):
+    """(boxes (M,5), tracked (M,) bool, sensed (M,2) matched centre or nan).
+
+    Greedy nearest-neighbour between the GROUND-TRUTH movers of one solve and the SENSED
+    tracks it constrained against. `tracked=False` means Unity says an object is there and
+    the planner has no keep-out for it — it is invisible to the cost, whatever the reason
+    (never confirmed as moving, occluded, out of query_r, or crowded out of the k_dyn
+    slots). That is the state this exists to make visible.
+    """
+    b = (np.asarray(fr.get("dyn_boxes"), float).reshape(-1, 5)
+         if fr.get("dyn_boxes") is not None and len(fr["dyn_boxes"]) else np.empty((0, 5)))
+    d = fr.get("dyn_set")
+    s = (np.asarray(d, float).reshape(-1, 4)[:, :2]
+         if d is not None and len(d) else np.empty((0, 2)))
+    tracked = np.zeros(len(b), dtype=bool)
+    matched = np.full((len(b), 2), np.nan)
+    if not len(b) or not len(s):
+        return b, tracked, matched
+
+    free = list(range(len(s)))
+    for i, (bx, by, sx, sy, _yaw) in enumerate(b):
+        if not free:
+            break
+        r_gate = max(TRACK_MATCH_R, 0.5 * float(np.hypot(sx, sy)))
+        dist = [float(np.hypot(s[j, 0] - bx, s[j, 1] - by)) for j in free]
+        j_min = int(np.argmin(dist))
+        if dist[j_min] <= r_gate:
+            tracked[i] = True
+            matched[i] = s[free[j_min]]
+            free.pop(j_min)
+    return b, tracked, matched
+
+
+def _dyn_seeds(fr):
+    """(N,3) [c0, c1, r] the keep-out circles of one solve expand from.
+
+    The SENSED tracks — LiDAR clusters, Kalman-filtered and predicted forward to the solve
+    time — because that is where the planner believes the traffic is and therefore what it
+    actually constrained against. The ground-truth boxes are drawn too, as filled
+    rectangles, so the offset between a box and its circle reads directly as the
+    localisation error.
+
+    A solve that tracked NOTHING returns nothing — no circles are drawn, because none were
+    enforced. Distinguishing that from "this recording has no sensed field at all" is the
+    reason the test is on the KEY and not on the value: falling back to ground truth when
+    the tracker simply lost everything would draw keep-outs the planner never had, which
+    is the exact confusion these figures exist to remove.
+    """
+    if "dyn_set" in fr:
+        d = fr["dyn_set"]
+        if d is None or not len(d):
+            return np.empty((0, 3))
+        return np.asarray(d, float).reshape(-1, 4)[:, :3]
+    return _dyn_bubbles(fr.get("dyn_boxes"))
+
+
+def _dyn_keepout_polys(fr, t_k):
+    """Closed keep-out outlines at horizon time t_k, one per mover the solve constrained
+    against — the same circles the cost enforces:
+
+        r = D_SAFE_HARD + r_cluster + V_TARGET * min(t_k, DYN_GROW_HORIZON)
+
+    The min() is the growth cap the dynamic term applies (and the occlusion term does not,
+    its cap being longer than the horizon), so the outermost stages coincide once t_k
+    passes it. That is the cap being visible, not a drawing bug.
+    """
+    from occlusion_capsules import capsule_polygon
+
+    t_eff = t_k
+    return [capsule_polygon((c0, c1), (c0, c1), D_SAFE_HARD + r_c + V_TARGET * t_eff)
+            for c0, c1, r_c in _dyn_seeds(fr)]
+
+
+def _dyn_markers(fr):
+    """Centres (N,2) of the drawn keep-outs — the sensed track positions."""
+    return _dyn_seeds(fr)[:, :2]
 
 
 def _save_state_plot(stem, verdict, traj, goal_xy=None, t_mark=None, solve_ts=None):
@@ -612,7 +716,7 @@ def _save_rollouts_plot(stem, verdict, fr, goal_xy=None, static_boxes=None,
     tk = (np.arange(len(plan)) + 1) * DT
     segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
             if fr.get("segs") is not None and len(fr["segs"]) else np.empty((0, 2, 2)))
-    dyn_set = _dyn_bubbles(fr.get("dyn_boxes"))
+    dyn_c = _dyn_markers(fr)
 
     fig, ax = plt.subplots(figsize=(11, 11))
 
@@ -629,7 +733,7 @@ def _save_rollouts_plot(stem, verdict, fr, goal_xy=None, static_boxes=None,
         poly = box_polygon(bx, by, bsx, bsy, byaw)
         ax.fill(poly[:, 0], poly[:, 1], color="tab:orange", alpha=0.45, ec="tab:orange",
                 lw=1.2, zorder=2,
-                label="dynamic objects at $t_k$ = 0 (Unity)" if i == 0 else None)
+                label="dynamic objects, ground truth (Unity)" if i == 0 else None)
 
     # The rollouts themselves, as one LineCollection — thousands of ax.plot calls would
     # dominate the render time and the legend.
@@ -656,32 +760,28 @@ def _save_rollouts_plot(stem, verdict, fr, goal_xy=None, static_boxes=None,
 
     # Keep-outs at t_k = 0 and at the same sampled stages as the main figure, so the two
     # can be read side by side.
-    stage_colors = ["#00e5ff", "#ff00a0", "#ffd400", "#00ff7f",
-                    "#7c4dff", "#ff6d00", "#00b0ff", "#c6ff00"]
     for seg in segs:
         poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD)
         ax.plot(poly[:, 0], poly[:, 1], "-", color="w", lw=1.8, alpha=0.95, zorder=4)
-    for c0, c1, r_c in dyn_set:
-        poly = capsule_polygon((c0, c1), (c0, c1), D_SAFE_HARD + r_c)
+    for poly in _dyn_keepout_polys(fr, 0.0):
         ax.plot(poly[:, 0], poly[:, 1], "--", color="w", lw=1.6, alpha=0.95, zorder=4)
 
     stages = np.linspace(0, len(plan) - 1, min(max_frames, len(plan))).round().astype(int)
     for si, k in enumerate(dict.fromkeys(stages.tolist())):
-        col = stage_colors[si % len(stage_colors)]
+        col = STAGE_COLORS[si % len(STAGE_COLORS)]
         t_k = float(tk[k])
         r_k = D_SAFE_HARD + V_TARGET * t_k
         for seg in segs:
             poly = capsule_polygon(seg[0], seg[1], r_k)
             ax.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.5, alpha=0.9, zorder=4)
-        for c0, c1, r_c in dyn_set:
-            poly = capsule_polygon((c0, c1), (c0, c1), D_SAFE_HARD + r_c + V_TARGET * t_k)
+        for poly in _dyn_keepout_polys(fr, t_k):
             ax.plot(poly[:, 0], poly[:, 1], "--", color=col, lw=1.4, alpha=0.9, zorder=4)
 
     for seg in segs:
         ax.plot(seg[:, 0], seg[:, 1], "-", color="k", lw=2.5, zorder=7)
-    for i, (c0, c1, _r) in enumerate(dyn_set):
+    for i, (c0, c1) in enumerate(dyn_c):
         ax.plot(c0, c1, "x", color="k", ms=7, mew=1.5, zorder=7,
-                label="dynamic object centre (bubble seed)" if i == 0 else None)
+                label="sensed mover centre (keep-out seed)" if i == 0 else None)
 
     ax.plot(fr["ex"], fr["ey"], "o", mfc="w", mec="k", ms=8, mew=1.2, zorder=8,
             label="ego at $t_k$ = 0")
@@ -712,9 +812,481 @@ def _save_rollouts_plot(stem, verdict, fr, goal_xy=None, static_boxes=None,
     return True
 
 
+def _draw_solve_map(ax, fr, verdict, traj, goal_xy=None, static_boxes=None,
+                    max_frames=6, t_now=None):
+    """Draw ONE solve on `ax`: the executed trajectory, that solve's predicted rollout,
+    and the expanding keep-out (occlusion capsules + swept mover tubes) at a handful of
+    sampled horizon timestamps t_k.
+
+    Shared by the single-frame figure and the video, so both show exactly the same
+    geometry. `t_now` [s], when given (video), clips the executed trajectory to what had
+    already been driven at this solve instead of drawing the whole run.
+
+    Returns (segs, dyn_c, stages) for the caller's summary line. The caller owns the axis
+    limits, aspect and legend — the video needs those fixed across frames.
+    """
+    from occlusion_capsules import capsule_polygon
+    from static_obstacles import box_polygon
+
+    x, y = traj[:, 1], traj[:, 2]
+    if t_now is not None:
+        n = max(int(np.searchsorted(traj[:, 0], t_now, side="right")), 1)
+        x, y = x[:n], y[:n]
+
+    plan = fr["plan"]
+    tk = (np.arange(len(plan)) + 1) * DT
+    segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
+            if fr.get("segs") is not None and len(fr["segs"]) else np.empty((0, 2, 2)))
+    # Movers as Unity publishes them on /dynamic_obstacles, at THIS solve. Each seeds an
+    # expanding CIRCLE of radius D_SAFE_HARD + r_obj + V_TARGET*t_k — the same growth law
+    # as the occlusion capsules, so they are drawn at the same sampled t_k, same colour.
+    dyn_c = _dyn_markers(fr)
+
+    # Static obstacles as Unity reports them (StaticObstaclePublisher.cs).
+    sb = (np.asarray(static_boxes, float).reshape(-1, 5)
+          if static_boxes is not None and len(static_boxes) else np.empty((0, 5)))
+    for i, (bx, by, bsx, bsy, byaw) in enumerate(sb):
+        poly = box_polygon(bx, by, bsx, bsy, byaw)
+        ax.fill(poly[:, 0], poly[:, 1], color="0.80", ec="0.30", lw=1.0, zorder=0,
+                label="static obstacles (Unity)" if i == 0 else None)
+
+    # Ground-truth movers where they were AT the drawn solve (t_k = 0), not at the end.
+    # An object with no sensed track behind it is outlined in red: Unity says it is there
+    # and the planner is carrying no keep-out for it.
+    db, tracked, matched = _match_tracked(fr)
+    _seen_lbl = {True: False, False: False}
+    for i, (bx, by, bsx, bsy, byaw) in enumerate(db):
+        poly = box_polygon(bx, by, bsx, bsy, byaw)
+        ok = bool(tracked[i])
+        lbl = None
+        if not _seen_lbl[ok]:
+            lbl = ("dynamic objects, ground truth (Unity)")
+            _seen_lbl[ok] = True
+        ax.fill(poly[:, 0], poly[:, 1], color="tab:orange", alpha=0.45,
+                ec=("tab:orange" if ok else "red"), lw=(1.2 if ok else 2.2), zorder=2,
+                label=lbl)
+        # Truth → estimate: the length of this tie IS the localisation error.
+        if ok:
+            ax.plot([bx, matched[i, 0]], [by, matched[i, 1]], "-", color="0.35", lw=0.9,
+                    zorder=2)
+
+    ax.plot(x, y, "-", color="0.65", lw=1.2, zorder=1,
+            label="executed trajectory" + (" (so far)" if t_now is not None else ""))
+    ax.plot(x[0], y[0], "o", color="tab:green", ms=9, zorder=3, label="start")
+    if t_now is None:
+        ax.plot(x[-1], y[-1], "s", color="tab:red", ms=9, zorder=3, label="end")
+    if goal_xy is not None:
+        ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18, mec="k", zorder=3,
+                label="goal")
+
+    ax.plot(plan[:, 0], plan[:, 1], "-", color="k", lw=2.0, zorder=4,
+            label=("braking rollout — no feasible plan "
+                   f"(solve at t = {fr['t']:.1f} s)" if fr.get("infeasible") else
+                   f"predicted rollout (solve at t = {fr['t']:.1f} s)"))
+
+    # Sampled predicted timestamps along that rollout.
+    # t_k = 0: the ego pose at this solve, with the un-expanded keep-out.
+    for seg in segs:
+        poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD)
+        ax.plot(poly[:, 0], poly[:, 1], "-", color="w", lw=1.8, alpha=0.95, zorder=1)
+    for poly in _dyn_keepout_polys(fr, 0.0):
+        ax.plot(poly[:, 0], poly[:, 1], "--", color="w", lw=1.6, alpha=0.95, zorder=1)
+    ax.plot(fr["ex"], fr["ey"], "o", mfc="w", mec="k", ms=6, mew=0.9, zorder=5,
+            label=f"$t_k$ = 0.0 s   r = {D_SAFE_HARD:.0f} m")
+
+    stages = np.linspace(0, len(plan) - 1, min(max_frames, len(plan))).round().astype(int)
+    for si, k in enumerate(dict.fromkeys(stages.tolist())):
+        col = STAGE_COLORS[si % len(STAGE_COLORS)]
+        t_k = float(tk[k])
+        # The occlusion keep-out AT THIS STAGE: a worst-case hidden agent leaving the
+        # boundary at t=0 at V_TARGET can be anywhere within D_SAFE_HARD + V_TARGET·t_k,
+        # so each sampled timestamp gets its own, larger, capsule.
+        r_k = D_SAFE_HARD + V_TARGET * t_k
+        for seg in segs:
+            poly = capsule_polygon(seg[0], seg[1], r_k)
+            ax.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.8, alpha=0.95, zorder=1)
+        # Same t_k, same colour, dashed: the mover keep-out grows from the object's own
+        # radius, so r = D_SAFE_HARD + r_obj + V_TARGET·t_k.
+        for poly in _dyn_keepout_polys(fr, t_k):
+            ax.plot(poly[:, 0], poly[:, 1], "--", color=col, lw=1.6, alpha=0.95, zorder=1)
+        ax.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=6, mew=0.9, zorder=5,
+                label=f"$t_k$ = {t_k:.1f} s   r = {r_k:.0f} m")
+
+    for seg in segs:
+        ax.plot(seg[:, 0], seg[:, 1], "-", color="k", lw=2.5, zorder=6)
+        ax.plot(seg[0, 0], seg[0, 1], ".", color="k", ms=8, zorder=6)
+
+    for i, (c0, c1) in enumerate(dyn_c):
+        ax.plot(c0, c1, "x", color="k", ms=7, mew=1.5, zorder=6,
+                label="sensed mover centre (keep-out seed)" if i == 0 else None)
+
+    ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
+    _what = " + ".join((["occlusion"] if len(segs) else []) +
+                       (["dynamic-obstacle"] if len(dyn_c) else []))
+    ax.set_title(f"{verdict} — predicted rollout at t = {fr['t']:.1f} s with the "
+                 f"expanding {_what} keep-out per sampled $t_k$"
+                 if (len(segs) or len(dyn_c)) else
+                 f"{verdict} — executed trajectory + predicted rollout at "
+                 f"t = {fr['t']:.1f} s")
+    ax.grid(True, alpha=0.3)
+    return segs, dyn_c, stages
+
+
+def _save_tracking_plot(stem, verdict, frames, traj, static_boxes=None):
+    """`{stem}_tracking.png`: WHERE and WHEN the ego loses each mover.
+
+    Two panels sharing the run:
+
+    TOP, map — each ground-truth mover's true path, drawn green where a sensed track was
+    behind it at that solve and red where none was, with a marker at every transition. A
+    red stretch is a stretch of the run in which Unity had an object on the map and the
+    planner was carrying no keep-out for it. The matched sensed positions are dotted on
+    top, so the gap between the two paths is the localisation error along the way.
+
+    BOTTOM, timeline — the same tracked/untracked state against episode time, over the
+    ground-truth distance from the ego. Reading the two together answers why a track was
+    lost: a loss at ~query_r is a gating drop, a loss at close range with the ego behind a
+    wall is an occlusion drop, and a loss while the object is stationary is the
+    require_motion test.
+
+    Movers are identified by their index in the /dynamic_obstacles message, which Unity
+    publishes in a stable order; the sensed side has no ids, so truth and estimate are
+    associated per solve by nearest neighbour (_match_tracked).
+    """
+    import matplotlib.pyplot as plt
+    from static_obstacles import box_polygon
+
+    fr_dyn = [f for f in frames
+              if f.get("dyn_boxes") is not None and len(f["dyn_boxes"])]
+    if not fr_dyn:
+        return False
+
+    n_mov = max(len(np.asarray(f["dyn_boxes"], float).reshape(-1, 5)) for f in fr_dyn)
+    t = np.array([f["t"] for f in fr_dyn])
+    # Per mover: true xy, matched sensed xy, tracked flag, distance from the ego. NaN
+    # wherever that mover was absent from the message at that solve.
+    gt = np.full((n_mov, len(fr_dyn), 2), np.nan)
+    est = np.full((n_mov, len(fr_dyn), 2), np.nan)
+    trk = np.zeros((n_mov, len(fr_dyn)), dtype=bool)
+    d_ego = np.full((n_mov, len(fr_dyn)), np.nan)
+    for j, f in enumerate(fr_dyn):
+        b, tracked, matched = _match_tracked(f)
+        for i in range(len(b)):
+            gt[i, j] = b[i, :2]
+            est[i, j] = matched[i]
+            trk[i, j] = tracked[i]
+            d_ego[i, j] = np.hypot(b[i, 0] - f["ex"], b[i, 1] - f["ey"])
+
+    fig, (ax, ax_t) = plt.subplots(
+        2, 1, figsize=(13, 11), gridspec_kw={"height_ratios": [2.4, 1.0]})
+
+    sb = (np.asarray(static_boxes, float).reshape(-1, 5)
+          if static_boxes is not None and len(static_boxes) else np.empty((0, 5)))
+    for i, b in enumerate(sb):
+        poly = box_polygon(*b)
+        ax.fill(poly[:, 0], poly[:, 1], color="0.85", ec="0.60", lw=0.8, zorder=0,
+                label="static obstacles (Unity)" if i == 0 else None)
+    ax.plot(traj[:, 1], traj[:, 2], "-", color="0.55", lw=1.2, zorder=1,
+            label="ego trajectory")
+    ax.plot(traj[0, 1], traj[0, 2], "o", color="tab:green", ms=8, zorder=3)
+
+    n_lost = 0
+    for i in range(n_mov):
+        ok = np.isfinite(gt[i, :, 0])
+        if not ok.any():
+            continue
+        # Colour the TRUE path by tracking state, segment by segment: this is the "where".
+        for j in range(len(fr_dyn) - 1):
+            if not (ok[j] and ok[j + 1]):
+                continue
+            ax.plot(gt[i, j:j + 2, 0], gt[i, j:j + 2, 1], "-",
+                    color=("tab:green" if trk[i, j] else "red"), lw=2.0, zorder=2)
+        ax.plot(est[i, :, 0], est[i, :, 1], ":", color="tab:blue", lw=1.0, zorder=2)
+        # Transitions. A tracked -> untracked edge is the moment of the loss.
+        edges = np.flatnonzero(np.diff(trk[i].astype(int)) != 0)
+        for e in edges:
+            lost = trk[i, e] and not trk[i, e + 1]
+            n_lost += int(lost)
+            ax.plot(gt[i, e + 1, 0], gt[i, e + 1, 1], "x" if lost else "+",
+                    color=("red" if lost else "tab:green"), ms=13, mew=2.5, zorder=5)
+            if lost:
+                ax.annotate(f"lost t={t[e + 1]:.1f}s\nd={d_ego[i, e + 1]:.0f}m",
+                            xy=(gt[i, e + 1, 0], gt[i, e + 1, 1]),
+                            xytext=(8, 8), textcoords="offset points", fontsize=8,
+                            color="red")
+        ax.annotate(f"#{i}", xy=(gt[i, ok.argmax(), 0], gt[i, ok.argmax(), 1]),
+                    xytext=(4, -12), textcoords="offset points", fontsize=9, color="0.2")
+
+    ax.plot([], [], "-", color="tab:green", lw=2.0, label="mover, TRACKED")
+    ax.plot([], [], "-", color="red", lw=2.0, label="mover, not tracked")
+    ax.plot([], [], ":", color="tab:blue", lw=1.2, label="sensed (estimated) position")
+    ax.plot([], [], "x", color="red", ms=11, mew=2.5, label="track lost here")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
+    ax.set_title(f"{verdict} — mover tracking: where the ego stops seeing each object "
+                 f"({n_lost} loss event{'s' if n_lost != 1 else ''})")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8, borderaxespad=0.0)
+    ax.grid(True, alpha=0.3)
+
+    for i in range(n_mov):
+        ok = np.isfinite(d_ego[i])
+        if not ok.any():
+            continue
+        ax_t.plot(t[ok], d_ego[i][ok], "-", color="0.75", lw=1.0, zorder=1)
+        for state, col in ((True, "tab:green"), (False, "red")):
+            m = ok & (trk[i] == state)
+            ax_t.plot(t[m], d_ego[i][m], ".", color=col, ms=4, zorder=2)
+    ax_t.axhline(DYN_QUERY_R, ls="--", color="tab:purple", lw=1.2,
+                 label=f"query_r = {DYN_QUERY_R:.0f} m (gating range)")
+    ax_t.set_xlabel("episode time t [s]")
+    ax_t.set_ylabel("ground-truth distance\nfrom ego [m]")
+    ax_t.set_title("green = a keep-out was enforced for it, red = none", fontsize=10)
+    ax_t.grid(True, alpha=0.3)
+    ax_t.legend(loc="upper right", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(f"{stem}_tracking.png", dpi=120)
+    plt.close(fig)
+    return True
+
+
+def _ffmpeg_exe():
+    """Path to an ffmpeg binary, or None. PATH first, then the static one imageio-ffmpeg
+    ships — a venv install is enough to get mp4 out without root."""
+    import shutil
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_boxes=None,
+                           max_frames=6, fps=10, stride=1):
+    """`{stem}.mp4` (or `.gif` without ffmpeg): the map figure replayed over every
+    recorded solve, so the keep-outs can be watched expanding and being dodged as the run
+    progresses. Returns (path, n_frames) or None.
+
+    The window is fixed over the whole run — a per-frame window would make the keep-outs
+    appear to breathe when it is the zoom moving, not them.
+
+    WHY THIS DOES NOT JUST LOOP OVER `_draw_solve_map`. That is what a frame costs when
+    the whole figure is rebuilt and re-rasterised per frame:
+
+        ax.clear + redraw   ~80 ms      savefig (full canvas)  ~130 ms
+
+    i.e. ~70 s for a 30 s run, nearly all of it re-rendering scenery that never moves.
+    Instead everything static (obstacles, the full route, grid, legend) is drawn ONCE and
+    cached as a pixel background; each frame restores that background, redraws only the
+    ~9 artists that actually change, and pipes the raw RGBA buffer straight to ffmpeg —
+    bypassing savefig, which would re-render the whole figure and undo the saving.
+    ~10 ms/frame, a 20x speed-up.
+
+    The cost of the split is that the artists here are built by hand rather than by
+    `_draw_solve_map`, so the two could drift apart cosmetically. They cannot drift
+    GEOMETRICALLY: both take the drawn shapes from the same _dyn_keepout_polys /
+    capsule_polygon / _dyn_bubbles helpers and the same STAGE_COLORS.
+    """
+    import subprocess
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection, PolyCollection
+    from occlusion_capsules import capsule_polygon
+    from static_obstacles import box_polygon
+
+    frames = frames[::max(1, int(stride))]
+    if not frames:
+        return None
+
+    # Fixed window: the ego's whole executed extent plus every plan drawn in the video.
+    allx = np.concatenate([traj[:, 1]] + [f["plan"][:, 0] for f in frames])
+    ally = np.concatenate([traj[:, 2]] + [f["plan"][:, 1] for f in frames])
+    cx, cy = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
+    half_x = 0.5 * np.ptp(allx) + 100.0
+    half_y = max(0.5 * np.ptp(ally) + 100.0, 0.25 * half_x)
+
+    fig, ax = plt.subplots(figsize=(12.0, float(np.clip(12.0 * half_y / half_x,
+                                                        4.0, 12.0))))
+    # subplots_adjust, not tight_layout: the canvas size must be identical for every
+    # frame — ffmpeg is fed a fixed frame geometry.
+    fig.subplots_adjust(left=0.07, right=0.72, top=0.88, bottom=0.09)
+    ax.set_xlim(cx - half_x, cx + half_x)
+    ax.set_ylim(cy - half_y, cy + half_y)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
+    ax.grid(True, alpha=0.3)
+
+    # ── static layer: rasterised once into the cached background ──────────────
+    sb = (np.asarray(static_boxes, float).reshape(-1, 5)
+          if static_boxes is not None and len(static_boxes) else np.empty((0, 5)))
+    if len(sb):
+        # One PolyCollection, not N ax.fill calls: with a few hundred boxes the per-artist
+        # overhead alone is ~200 ms, and it would be paid on every background rebuild.
+        ax.add_collection(PolyCollection([box_polygon(*b) for b in sb],
+                                         facecolors="0.80", edgecolors="0.30", lw=1.0,
+                                         zorder=0, label="static obstacles (Unity)"))
+    ax.plot(traj[:, 1], traj[:, 2], "-", color="0.85", lw=1.0, zorder=1,
+            label="full route")
+    ax.plot(traj[0, 1], traj[0, 2], "o", color="tab:green", ms=9, zorder=3, label="start")
+    if goal_xy is not None:
+        ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18, mec="k", zorder=3,
+                label="goal")
+
+    # ── dynamic artists: the only things redrawn per frame ────────────────────
+    ln_driven, = ax.plot([], [], "-", color="0.55", lw=1.6, zorder=1, animated=True,
+                         label="driven so far")
+    pc_movers = PolyCollection([], facecolors="tab:orange", alpha=0.45,
+                               edgecolors="tab:orange", lw=1.2, zorder=2, animated=True,
+                               label="dynamic objects, ground truth (Unity)")
+    ax.add_collection(pc_movers)
+    # Proxy: the untracked state is an edge colour on pc_movers, which cannot carry a
+    # second legend entry of its own.
+    ax.plot([], [], "s", mfc="tab:orange", mec="red", mew=2.0, ms=9, alpha=0.7,
+            label="ground truth, NOT TRACKED (no keep-out)")
+    lc_occ = LineCollection([], linewidths=1.8, alpha=0.95, zorder=1, animated=True)
+    lc_dyn = LineCollection([], linewidths=1.6, alpha=0.95, linestyles="--", zorder=1,
+                            animated=True)
+    lc_axes = LineCollection([], linewidths=2.5, colors="k", zorder=6, animated=True)
+    for lc in (lc_occ, lc_dyn, lc_axes):
+        ax.add_collection(lc)
+    ln_plan, = ax.plot([], [], "-", color="k", lw=2.0, zorder=4, animated=True,
+                       label="predicted rollout (cheapest sample)")
+    ln_ego, = ax.plot([], [], "o", mfc="w", mec="k", ms=6, mew=0.9, zorder=5,
+                      animated=True, label=f"$t_k$ = 0.0 s   r = {D_SAFE_HARD:.0f} m")
+    ln_mover, = ax.plot([], [], "x", color="k", ms=7, mew=1.5, zorder=6, animated=True,
+                        label="sensed mover centre (keep-out seed)")
+    sc_stage = ax.scatter([], [], s=36, marker="o", edgecolors="k", linewidths=0.9,
+                          zorder=5, animated=True)
+
+    # Stage legend entries, from the first frame: the sampled t_k and their radii are a
+    # function of the horizon, which is fixed for the run, so they do not change per frame.
+    _p0 = frames[0]["plan"]
+    _tk0 = (np.arange(len(_p0)) + 1) * DT
+    _stages0 = np.linspace(0, len(_p0) - 1, min(max_frames, len(_p0))).round().astype(int)
+    for si, k in enumerate(dict.fromkeys(_stages0.tolist())):
+        t_k = float(_tk0[k])
+        ax.plot([], [], "o", mfc=STAGE_COLORS[si % len(STAGE_COLORS)], mec="k", ms=6,
+                mew=0.9, label=f"$t_k$ = {t_k:.1f} s   r = "
+                               f"{D_SAFE_HARD + V_TARGET * t_k:.0f} m")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8, borderaxespad=0.0)
+
+    title = ax.set_title("", animated=True, fontsize=11)
+    fig.canvas.draw()
+    bg = fig.canvas.copy_from_bbox(fig.bbox)
+    w, h = fig.canvas.get_width_height()
+
+    exe = _ffmpeg_exe()
+    path = f"{stem}.mp4" if exe else f"{stem}.gif"
+    proc = gif_frames = None
+    if exe:
+        proc = subprocess.Popen(
+            [exe, "-loglevel", "error", "-y",
+             "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}", "-r", str(fps),
+             "-i", "-", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             # yuv420p (for players that cannot read 4:4:4) needs even dimensions.
+             "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p", path],
+            stdin=subprocess.PIPE)
+    else:
+        gif_frames = []
+
+    for f in frames:
+        # The CHEAPEST sampled rollout is the drawn one — the sampled timestamps and their
+        # keep-outs hang off it. Falls back to the executed plan (the softmax mean) only
+        # for recordings made without the extremes, since those carry no sample.
+        plan = f.get("best")
+        plan = np.asarray(f["plan"] if plan is None or not len(plan) else plan, float)
+        tk = (np.arange(len(plan)) + 1) * DT
+        segs = (np.asarray(f["segs"], float).reshape(-1, 2, 2)
+                if f.get("segs") is not None and len(f["segs"]) else np.empty((0, 2, 2)))
+
+        # t_k = 0 in white, then one colour per sampled stage — same law, same colours and
+        # same helpers as the still figure.
+        occ_polys, occ_cols, dyn_polys, dyn_cols = [], [], [], []
+        for seg in segs:
+            occ_polys.append(capsule_polygon(seg[0], seg[1], D_SAFE_HARD))
+            occ_cols.append("w")
+        for poly in _dyn_keepout_polys(f, 0.0):
+            dyn_polys.append(poly); dyn_cols.append("w")
+
+        stages = np.linspace(0, len(plan) - 1,
+                             min(max_frames, len(plan))).round().astype(int)
+        stage_pts, stage_cols = [], []
+        for si, k in enumerate(dict.fromkeys(stages.tolist())):
+            col = STAGE_COLORS[si % len(STAGE_COLORS)]
+            t_k = float(tk[k])
+            for seg in segs:
+                occ_polys.append(capsule_polygon(seg[0], seg[1],
+                                                 D_SAFE_HARD + V_TARGET * t_k))
+                occ_cols.append(col)
+            for poly in _dyn_keepout_polys(f, t_k):
+                dyn_polys.append(poly); dyn_cols.append(col)
+            stage_pts.append(plan[k]); stage_cols.append(col)
+
+        lc_occ.set_segments(occ_polys); lc_occ.set_color(occ_cols)
+        lc_dyn.set_segments(dyn_polys); lc_dyn.set_color(dyn_cols)
+        lc_axes.set_segments(list(segs))
+
+        db, tracked, _matched = _match_tracked(f)
+        pc_movers.set_verts([box_polygon(*b) for b in db])
+        # Red outline the moment the track behind an object disappears — the frame where
+        # that happens is where the ego stopped seeing it.
+        pc_movers.set_edgecolor(["tab:orange" if ok else "red" for ok in tracked])
+        pc_movers.set_linewidth([1.2 if ok else 2.4 for ok in tracked])
+        dyn_c = _dyn_markers(f)
+        ln_mover.set_data(dyn_c[:, 0], dyn_c[:, 1])
+
+        n = max(int(np.searchsorted(traj[:, 0], f["t"], side="right")), 1)
+        ln_driven.set_data(traj[:n, 1], traj[:n, 2])
+        ln_plan.set_data(plan[:, 0], plan[:, 1])
+        ln_ego.set_data([f["ex"]], [f["ey"]])
+        sc_stage.set_offsets(np.asarray(stage_pts, float).reshape(-1, 2))
+        sc_stage.set_facecolor(stage_cols)
+
+        # Two lines: the axes are narrow (the legend sits outside them), so a single-line
+        # title with the cost appended runs off the canvas.
+        _what = " + ".join((["occlusion"] if len(segs) else []) +
+                           (["dynamic-obstacle"] if len(dyn_c) else []))
+        _l2 = (f"expanding {_what} keep-out per sampled $t_k$" if _what else "")
+        _c_lo = f.get("best_cost")
+        if _c_lo is not None:
+            _l2 += ("   |   " if _l2 else "") + f"cheapest sample cost {_c_lo:.3g}"
+        if f.get("infeasible"):
+            # The ego BRAKED at this solve; the cheapest sample is drawn all the same,
+            # so the line on screen is not the one that was executed.
+            _l2 += ("   |   " if _l2 else "") + "INFEASIBLE — ego braked"
+        title.set_text(f"{verdict} — solve at t = {f['t']:.1f} s"
+                       + (f"\n{_l2}" if _l2 else ""))
+
+        fig.canvas.restore_region(bg)
+        for a in (ln_driven, pc_movers, lc_occ, lc_dyn, lc_axes,
+                  ln_plan, ln_ego, ln_mover, sc_stage, title):
+            ax.draw_artist(a)
+        fig.canvas.blit(fig.bbox)
+
+        buf = np.asarray(fig.canvas.buffer_rgba())
+        if proc is not None:
+            proc.stdin.write(buf.tobytes())
+        else:
+            from PIL import Image
+            gif_frames.append(Image.fromarray(buf.copy()).convert("P", palette=1))
+
+    if proc is not None:
+        proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError(f"ffmpeg exited with {proc.returncode}")
+    else:
+        gif_frames[0].save(path, save_all=True, append_images=gif_frames[1:],
+                           duration=int(1000 / fps), loop=0)
+    plt.close(fig)
+    return path, len(frames)
+
+
 def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=None,
                      occ_frames=None, capsule_horizon=None, max_frames=6,
-                     show_occlusion=True, static_boxes=None, solve_t=None, **_ignored):
+                     show_occlusion=True, static_boxes=None, solve_t=None,
+                     video=False, video_fps=10, video_stride=1, **_ignored):
     """CSV of the executed run + ONE figure: the executed trajectory and the predicted
     rollout of a SINGLE solve with a handful of sampled horizon timestamps on it — each
     timestamp drawn together with the expanding occlusion keep-out that applied at it.
@@ -742,9 +1314,6 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
         print(f"[traj] saved {stem}.csv (matplotlib missing — no plot)")
         return
 
-    from occlusion_capsules import capsule_polygon
-    from static_obstacles import box_polygon
-
     TRAJ_MARGIN = 100.0   # [m] padding around the ego extent — the plot's zoom level
 
     x, y = traj[:, 1], traj[:, 2]
@@ -765,22 +1334,25 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     def _tightest(fr):
         """max over the horizon of (keep-out radius − distance to the boundary): how
         close this plan came to the expanding keep-out set (occlusion capsules and/or
-        sensed movers). Positive ⇒ inside it."""
+        movers). Positive ⇒ inside it. Measured against the DRAWN geometry, so the solve
+        picked as tightest is the tightest one in the figure that gets written."""
         plan = fr["plan"]
         t = (np.arange(len(plan)) + 1) * DT
         best = -np.inf
         if fr.get("segs") is not None and len(fr["segs"]):
             d = point_segments_min_distance(plan[:, 0], plan[:, 1], fr["segs"])
             best = max(best, float(np.max((D_SAFE_HARD + V_TARGET * t) - d)))
-        for c0, c1, r_c in _dyn_bubbles(fr.get("dyn_boxes")):
+        t_dyn = t if not DYN_GROW_HORIZON else np.minimum(t, DYN_GROW_HORIZON)
+        for c0, c1, r_c in _dyn_seeds(fr):
             d = np.hypot(plan[:, 0] - c0, plan[:, 1] - c1)
-            best = max(best, float(np.max((D_SAFE_HARD + r_c + V_TARGET * t) - d)))
+            best = max(best, float(np.max((D_SAFE_HARD + r_c + V_TARGET * t_dyn) - d)))
         return best
 
     # Prefer a solve that actually had a keep-out set — a frame without one has nothing
     # expanding to show. Among those, the tightest one.
     occ_ok = [f for f in frames
               if (f.get("segs") is not None and len(f["segs"]))
+              or (f.get("dyn_set") is not None and len(f["dyn_set"]))
               or (f.get("dyn_boxes") is not None and len(f["dyn_boxes"]))]
     if solve_t is not None:
         fr = min(frames, key=lambda f: abs(f["t"] - solve_t))
@@ -790,84 +1362,11 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     else:
         fr = max(occ_ok, key=_tightest) if occ_ok else max(frames, key=_curvature)
     plan = fr["plan"]
-    tk = (np.arange(len(plan)) + 1) * DT
-    segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
-            if fr.get("segs") is not None and len(fr["segs"]) else np.empty((0, 2, 2)))
-    # Movers as Unity publishes them on /dynamic_obstacles, at THIS solve. Each seeds an
-    # expanding CIRCLE of radius D_SAFE_HARD + r_obj + V_TARGET*t_k — the same growth law
-    # as the occlusion capsules, so they are drawn at the same sampled t_k, same colour.
-    dyn_set = _dyn_bubbles(fr.get("dyn_boxes"))
 
     fig, ax = plt.subplots(figsize=(11, 11))
-
-    # Static obstacles as Unity reports them (StaticObstaclePublisher.cs).
-    sb = (np.asarray(static_boxes, float).reshape(-1, 5)
-          if static_boxes is not None and len(static_boxes) else np.empty((0, 5)))
-    for i, (bx, by, bsx, bsy, byaw) in enumerate(sb):
-        poly = box_polygon(bx, by, bsx, bsy, byaw)
-        ax.fill(poly[:, 0], poly[:, 1], color="0.80", ec="0.30", lw=1.0, zorder=0,
-                label="static obstacles (Unity)" if i == 0 else None)
-
-    # Ground-truth movers where they were AT the drawn solve (t_k = 0), not at the end.
-    db = (np.asarray(fr["dyn_boxes"], float).reshape(-1, 5)
-          if fr.get("dyn_boxes") is not None and len(fr["dyn_boxes"]) else np.empty((0, 5)))
-    for i, (bx, by, bsx, bsy, byaw) in enumerate(db):
-        poly = box_polygon(bx, by, bsx, bsy, byaw)
-        ax.fill(poly[:, 0], poly[:, 1], color="tab:orange", alpha=0.45, ec="tab:orange",
-                lw=1.2, zorder=2,
-                label="dynamic objects at $t_k$ = 0 (Unity)" if i == 0 else None)
-
-    ax.plot(x, y, "-", color="0.65", lw=1.2, zorder=1, label="executed trajectory")
-    ax.plot(x[0], y[0], "o", color="tab:green", ms=9, zorder=3, label="start")
-    ax.plot(x[-1], y[-1], "s", color="tab:red", ms=9, zorder=3, label="end")
-    if goal_xy is not None:
-        ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18, mec="k", zorder=3,
-                label="goal")
-
-    ax.plot(plan[:, 0], plan[:, 1], "-", color="k", lw=2.0, zorder=4,
-            label=("braking rollout — no feasible plan "
-                   f"(solve at t = {fr['t']:.1f} s)" if fr.get("infeasible") else
-                   f"predicted rollout (solve at t = {fr['t']:.1f} s)"))
-
-    # Sampled predicted timestamps along that rollout.
-    stage_colors = ["#00e5ff", "#ff00a0", "#ffd400", "#00ff7f",
-                    "#7c4dff", "#ff6d00", "#00b0ff", "#c6ff00"]
-    # t_k = 0: the ego pose at this solve, with the un-expanded keep-out.
-    for seg in segs:
-        poly = capsule_polygon(seg[0], seg[1], D_SAFE_HARD)
-        ax.plot(poly[:, 0], poly[:, 1], "-", color="w", lw=1.8, alpha=0.95, zorder=1)
-    for c0, c1, r_c in dyn_set:
-        poly = capsule_polygon((c0, c1), (c0, c1), D_SAFE_HARD + r_c)
-        ax.plot(poly[:, 0], poly[:, 1], "--", color="w", lw=1.6, alpha=0.95, zorder=1)
-    ax.plot(fr["ex"], fr["ey"], "o", mfc="w", mec="k", ms=6, mew=0.9, zorder=5,
-            label=f"$t_k$ = 0.0 s   r = {D_SAFE_HARD:.0f} m")
-
-    stages = np.linspace(0, len(plan) - 1, min(max_frames, len(plan))).round().astype(int)
-    for si, k in enumerate(dict.fromkeys(stages.tolist())):
-        col = stage_colors[si % len(stage_colors)]
-        t_k = float(tk[k])
-        # The occlusion keep-out AT THIS STAGE: a worst-case hidden agent leaving the
-        # boundary at t=0 at V_TARGET can be anywhere within D_SAFE_HARD + V_TARGET·t_k,
-        # so each sampled timestamp gets its own, larger, capsule.
-        r_k = D_SAFE_HARD + V_TARGET * t_k
-        for seg in segs:
-            poly = capsule_polygon(seg[0], seg[1], r_k)
-            ax.plot(poly[:, 0], poly[:, 1], "-", color=col, lw=1.8, alpha=0.95, zorder=1)
-        # Same t_k, same colour, dashed: the mover keep-out grows from the object's own
-        # radius, so r = D_SAFE_HARD + r_obj + V_TARGET·t_k.
-        for c0, c1, r_c in dyn_set:
-            poly = capsule_polygon((c0, c1), (c0, c1), D_SAFE_HARD + r_c + V_TARGET * t_k)
-            ax.plot(poly[:, 0], poly[:, 1], "--", color=col, lw=1.6, alpha=0.95, zorder=1)
-        ax.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=6, mew=0.9, zorder=5,
-                label=f"$t_k$ = {t_k:.1f} s   r = {r_k:.0f} m")
-
-    for seg in segs:
-        ax.plot(seg[:, 0], seg[:, 1], "-", color="k", lw=2.5, zorder=6)
-        ax.plot(seg[0, 0], seg[0, 1], ".", color="k", ms=8, zorder=6)
-
-    for i, (c0, c1, _r) in enumerate(dyn_set):
-        ax.plot(c0, c1, "x", color="k", ms=7, mew=1.5, zorder=6,
-                label="dynamic object centre (bubble seed)" if i == 0 else None)
+    segs, dyn_c, stages = _draw_solve_map(ax, fr, verdict, traj, goal_xy=goal_xy,
+                                          static_boxes=static_boxes,
+                                          max_frames=max_frames)
 
     # Zoom on the EGO's own extent (start → end) plus the plan it is executing. Static
     # obstacles and the outer keep-out capsules are deliberately left out of the bounds:
@@ -884,24 +1383,19 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
     # while the window stays tight around the ego.
     ax.set_aspect("equal", adjustable="box")
     fig.set_size_inches(12.0, float(np.clip(12.0 * half_y / half_x, 4.0, 12.0)))
-    ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
-    _what = " + ".join(([ "occlusion"] if len(segs) else []) +
-                       (["dynamic-obstacle"] if len(dyn_set) else []))
-    ax.set_title(f"{verdict} — predicted rollout at t = {fr['t']:.1f} s with the "
-                 f"expanding {_what} keep-out per sampled $t_k$"
-                 if (len(segs) or len(dyn_set)) else
-                 f"{verdict} — executed trajectory + predicted rollout at "
-                 f"t = {fr['t']:.1f} s")
     # Legend OUTSIDE the axes: the zoomed window is short, so "best" placement lands it
     # on top of the rollout every time.
     ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8, borderaxespad=0.0)
-    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(f"{stem}.png", dpi=120)
     plt.close(fig)
 
     _save_state_plot(stem, verdict, traj, goal_xy, t_mark=fr["t"],
                      solve_ts=[f["t"] for f in frames])
+
+    if _save_tracking_plot(stem, verdict, frames, traj, static_boxes=static_boxes):
+        print(f"[traj] saved {stem}_tracking.png (ground-truth vs sensed mover positions, "
+              f"and where each track was lost)")
 
     # Same solve, second figure: the whole sample cloud it chose that plan from.
     if _save_rollouts_plot(stem, verdict, fr, goal_xy=goal_xy,
@@ -914,7 +1408,23 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
 
     print(f"[traj] saved {stem}.csv, {stem}.png and {stem}_state.png (rollout from the solve at "
           f"t={fr['t']:.1f}s, {len(set(stages.tolist()))} sampled stages, "
-          f"{len(segs)} occlusion boundaries, {len(dyn_set)} dynamic objects)")
+          f"{len(segs)} occlusion boundaries, {len(dyn_c)} dynamic objects)")
+
+    # Same figure, every solve: the run as a video. The PNG above stays as the single
+    # frame of the solve worth freezing.
+    if video:
+        try:
+            out = _save_trajectory_video(stem, verdict, frames, traj, goal_xy=goal_xy,
+                                         static_boxes=static_boxes,
+                                         max_frames=max_frames, fps=video_fps,
+                                         stride=video_stride)
+        except Exception as e:
+            print(f"[traj] video failed: {e}")
+        else:
+            if out is not None:
+                path, n = out
+                print(f"[traj] saved {path} ({n} solves @ {video_fps} fps"
+                      f"{'' if video_stride == 1 else f', every {video_stride}th solve'})")
 
 
 def run(unity_exec_path=None, port=5004, run_sysid=True,
@@ -925,13 +1435,14 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         occlusion_aware=False, dynamic_obstacles=False, dynamic_viz=False,
         occlusion_viz=False, save_traj=None, show_occlusion_plot=True, plot_solve_t=None,
         rviz_viz=False, rviz_rollouts=40, plot_rollouts=0,
+        traj_video=False, video_fps=10, video_stride=1,
         detector=False, detector_topic="/detections"):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW, OCC_PUB
     global DYNAMIC_AVOID, DYN_TRACKER, DYN_NOW, DYN_DBG, DYN_PUB, DYN_LAST_STAMP, DYN_CL_N
     global DYN_SOURCE
-    global RVIZ_PUB, MPPI_KEEP_ROLLOUTS
+    global RVIZ_PUB, MPPI_KEEP_ROLLOUTS, MPPI_TRACK_BEST
     DETECTION_RANGE = detect_range
     UNCERTAINTY     = uncertainty
     N_SCEN          = n_scenarios
@@ -1048,7 +1559,19 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         MPPI_KEEP_ROLLOUTS = max(MPPI_KEEP_ROLLOUTS, int(plot_rollouts))
         print(f"[Controller] Rollout plot : ON  ({MPPI_KEEP_ROLLOUTS} cheapest rollouts "
               f"recorded per solve)")
-    elif plot_rollouts > 0:
+    if traj_video and save_traj is None:
+        print("[Controller] --traj-video needs --save-traj (there is nowhere to write "
+              "the video) — ignored.")
+        traj_video = False
+    elif traj_video:
+        # The video draws the CHEAPEST sample per solve, which needs mppi() to keep every
+        # sampled path for the length of one solve (one reused (K,H,2) buffer, not a
+        # per-step allocation).
+        MPPI_TRACK_BEST = True
+        print(f"[Controller] Trajectory video: ON  ({video_fps} fps, every "
+              f"{video_stride} solve(s), drawing the cheapest sample per solve)")
+
+    if plot_rollouts > 0 and save_traj is None:
         print("[Controller] --plot-rollouts needs --save-traj (there is nowhere to write "
               "the figure) — DISABLED")
 
@@ -1169,7 +1692,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                 DYN_DBG = (DYN_CL_N, DYN_TRACKER.n_tracks,
                            0 if DYN_NOW is None else len(DYN_NOW),
                            max(_sp) if _sp else 0.0)
-  
+
             else:
                 DYN_NOW = None
         u_nom, mean = mppi(s, mean, goal_xy, u_prev)
@@ -1207,8 +1730,16 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                                # keep-outs are the enforced ones.
                                "segs": (np.array(_segs, dtype=float)
                                         if _segs is not None and len(_segs) else None),
-                               # Ground-truth movers as of THIS solve.
+                               # Ground-truth movers as of THIS solve. Drawn as filled
+                               # boxes only — the gap between one of these and its keep-out
+                               # centre IS the localisation error.
                                "dyn_boxes": (None if dyn_obs is None else dyn_obs.boxes()),
+                               # The SENSED movers this solve constrained against:
+                               # (K,4) [c0, c1, r_cluster, age]. The figures expand their
+                               # bubbles around THESE, because this is where the planner
+                               # believes the traffic is.
+                               "dyn_set": (None if DYN_USED is None or not len(DYN_USED)
+                                           else np.asarray(DYN_USED, float).copy()),
                                # The sampled rollouts the softmax weighted at this solve,
                                # for the _rollouts.png figure. float32 because this is the
                                # one per-solve record whose size scales with K (N*H*2).
@@ -1216,6 +1747,12 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                                             else MPPI_ROLLOUTS.astype(np.float32)),
                                "rollout_costs": (None if MPPI_COSTS is None
                                                  else MPPI_COSTS.astype(np.float32)),
+                               # Cheapest SAMPLE of this solve — the rollout the video
+                               # draws, and what its sampled t_k hang off.
+                               "best": (None if MPPI_BEST is None
+                                        else MPPI_BEST[0].astype(np.float32)),
+                               "best_cost": (None if MPPI_BEST is None
+                                             else MPPI_BEST[1]),
                                "infeasible": bool(OCC_INFEASIBLE)})
 
         u_cmd      = u_nom
@@ -1293,7 +1830,9 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
                          None, occ_frames=occ_frames,
                          static_boxes=(None if static_obs is None
                                        else static_obs.boxes()),
-                         show_occlusion=show_occlusion_plot, solve_t=plot_solve_t)
+                         show_occlusion=show_occlusion_plot, solve_t=plot_solve_t,
+                         video=traj_video, video_fps=video_fps,
+                         video_stride=video_stride)
 
     if static_obs is not None:
         static_obs.shutdown()
@@ -1402,6 +1941,17 @@ if __name__ == "__main__":
                         "rollouts of the plotted solve, coloured by cost. Needs "
                         "--save-traj. 0 = off. Costs N*horizon*2 float32 per solve of "
                         "memory, so keep it in the low hundreds.")
+    p.add_argument("--traj-video", action="store_true",
+                   help="Also write traj.mp4 (traj.gif without ffmpeg): the same map "
+                        "figure replayed over EVERY recorded solve, so the expanding "
+                        "occlusion capsules and mover tubes can be watched growing and "
+                        "being dodged. traj.png stays as the single frozen frame. "
+                        "Needs --save-traj.")
+    p.add_argument("--video-fps", type=int, default=10, metavar="FPS",
+                   help="Frame rate of --traj-video. Default 10.")
+    p.add_argument("--video-stride", type=int, default=1, metavar="N",
+                   help="Draw only every Nth solve in --traj-video — the cheap way to "
+                        "shorten a long run's video. Default 1 (every solve).")
     p.add_argument("--plot-solve-t", type=float, default=None, metavar="SEC",
                    help="Episode time [s] of the solve whose rollout the plot draws: the "
                         "t_k = 0 point and the sampled future timestamps hang off it. "
@@ -1433,6 +1983,9 @@ if __name__ == "__main__":
         save_traj=args.save_traj,
         plot_solve_t=args.plot_solve_t,
         plot_rollouts=args.plot_rollouts,
+        traj_video=args.traj_video,
+        video_fps=args.video_fps,
+        video_stride=args.video_stride,
         rviz_viz=args.rviz_viz,
         rviz_rollouts=args.rviz_rollouts,
         detector=args.detector,

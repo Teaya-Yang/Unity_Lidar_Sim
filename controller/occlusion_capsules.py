@@ -616,14 +616,17 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
     w_sight  : RSS sightline weight, or None to skip that term (a_brake/v_floor then unused)
     t_grow_max : cap [s] on the expansion time, or None for the (freezing) uncapped growth
     w_soft   : weight of the soft influence ring outside r_keep, or None/0 to skip it
-    d_infl   : width [m] of that ring. Cost is w_soft at d = r_keep, 0 at r_keep + d_infl
+    d_infl   : width [m] of that ring. Cost is w_soft * d_infl^2 at d = r_keep, falling
+               to 0 at r_keep + d_infl. NOTE d_infl enters QUADRATICALLY: it sets the
+               ring's peak as well as its width, so doubling it quadruples the cost of
+               sitting on the boundary. Retune w_soft whenever d_infl changes.
     Returns the scalar/array stage cost contribution.
     """
     import numpy as _np
     fmax = _np.maximum if fmax is None else fmax
     sqrt = _np.sqrt if sqrt is None else sqrt
 
-    t_eff  = t_k if t_grow_max is None else min(t_k, t_grow_max)
+    t_eff  = t_k
     r_grow = v_target * t_eff
     r_keep = r_grow + d_safe
 
@@ -632,8 +635,9 @@ def occlusion_stage_cost(d, v, t_k, v_target, d_safe, w_obs, fmax=None, sqrt=Non
 
     #cost = w_obs * (fmax(0.0, r_keep - d)/d_safe) ** 2
     # Soft term: the gradient the hard term cannot give. A one-sided quadratic over an
-    # influence ring of width d_infl OUTSIDE r_keep, normalised so w_soft is the cost of
-    # sitting exactly on the keep-out boundary and 0 at r_keep + d_infl and beyond.
+    # influence ring of width d_infl OUTSIDE r_keep: w_soft * d_infl^2 on the boundary
+    # itself, 0 at r_keep + d_infl and beyond. NOT normalised by d_infl^2 — see the
+    # docstring; w_soft alone is not the boundary cost.
     #   - decreasing in d, so farther is genuinely cheaper (the opposite of `+ k*d`)
     #   - bounded and local, so it cannot outvote the goal far from any boundary (which an
     #     unbounded `-k*d` would, by paying the ego to run away forever)
