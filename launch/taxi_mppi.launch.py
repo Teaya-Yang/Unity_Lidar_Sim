@@ -92,13 +92,13 @@ def generate_launch_description():
                              description="Unity build to run headless. Empty = attach to "
                                          "the Editor."),
         DeclareLaunchArgument("lidar_topic", default_value="/point_cloud"),
-        DeclareLaunchArgument("occlusion_aware", default_value="true"),
+        DeclareLaunchArgument("occlusion_aware", default_value="false"),
         DeclareLaunchArgument("dynamic_obstacles", default_value="true"),
         DeclareLaunchArgument("rviz_rollouts", default_value="100",
                              description="Sampled rollouts drawn per solve (0 = plan only)."),
         DeclareLaunchArgument("save_traj", default_value="",
                              description="Directory for the trajectory CSV + PNGs."),
-        DeclareLaunchArgument("traj_video", default_value="false",
+        DeclareLaunchArgument("traj_video", default_value="true",
                              description="Also write traj.mp4 (traj.gif without ffmpeg): "
                                          "the map figure replayed over every solve. "
                                          "Needs save_traj."),
