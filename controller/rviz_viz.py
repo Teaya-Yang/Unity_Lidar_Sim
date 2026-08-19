@@ -61,8 +61,15 @@ def _rgba(r, g, b, a=1.0) -> "ColorRGBA":
 
 
 def _polyline(pts, z=0.0):
-    """(N,2) world polyline -> the LINE_STRIP point list."""
-    return [_pt(p[0], p[1], z) for p in np.asarray(pts, float).reshape(-1, 2)]
+    """(N,2) or (N,3) world polyline -> the LINE_STRIP point list.
+
+    Tolerates a third column because OCC_PLAN carries [x, y, theta] (the heading the
+    figures need to place the sensor). Only the first two are positions — a blind
+    reshape(-1, 2) would fold the heading in as a coordinate and scramble the line.
+    """
+    a = np.asarray(pts, float)
+    a = a.reshape(-1, a.shape[-1]) if a.ndim > 1 else a.reshape(-1, 2)
+    return [_pt(q[0], q[1], z) for q in a[:, :2]]
 
 
 # Colour ramp for the sampled rollouts: cheap (green) -> expensive (red).

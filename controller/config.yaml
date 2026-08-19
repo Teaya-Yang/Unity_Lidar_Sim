@@ -7,6 +7,16 @@ vehicle:
   max_steer_rate: 0.6       # [rad/s] nose-wheel steering rate limit
   steer_rolloff_spd: 15.0   # [m/s] speed at which steering authority starts rolling off
   steer_rolloff_min: 0.25   # minimum steering authority fraction at high speed
+  # Ego PLANFORM, for the trajectory figure only — nothing in the cost knows the ego has
+  # a shape (it is a point against d_safe_hard). Measured, not guessed: these are the
+  # vertex bounds of Polyeler/Simple Aircraft Pack/Meshes/Passenger Aircraft V3.fbx
+  # multiplied by the prefab's 1.5 local scale, in the ego BODY frame whose origin is the
+  # root transform the planner integrates. The nose lands at +16.37 m and laser_link at
+  # +14.42 m, i.e. 1.95 m behind it — a nose mount, which is the cross-check that these
+  # numbers and scan.sensor_fwd describe the same aircraft.
+  ego_length: 36.53         # [m] nose to tail
+  ego_span: 39.39           # [m] wingtip to wingtip
+  ego_nose_fwd: 16.37       # [m] nose ahead of the ego root (tail is at this minus length)
 
 
 limits:
@@ -285,7 +295,34 @@ scan:
   fov_v: 45.0               # [deg]
   res_h: 1.0                # [deg]
   res_v: 1.0                # [deg]
-  max_range: 1000.0         # [m]
+  max_range: 1000.0         # [m] the SENTINEL the range-jump test compares against, not
+                            #   the sensor's reach — see sensor_range below.
+  sensor_range: 250.0       # [m] the LiDAR's actual reach: PointCloudPublisher's
+                            #   RangeMetersMax Inspector field, 250 in every scene. Drawn
+                            #   on the trajectory figure as a ring around the sensor, so
+                            #   what is outside the ring is visibly unknown to the planner
+                            #   rather than silently empty. Keep the two equal by hand —
+                            #   nothing at runtime can read a serialised scene value.
+  # Where the LiDAR actually is on the airframe, in the EGO BODY frame: the local
+  # position of the `laser_link` GameObject under the ego root (Occlusion_1.unity has
+  # (-0.07, 3.45, 14.42), local +z forward, +x right — the y = 3.45 height is the
+  # `sensor_height` ObstacleCircles already knows about, only the two ground-plane
+  # components are needed here).
+  #
+  # WHY IT EXISTS. The planner's state is the EGO ROOT transform (TaxiAgent publishes
+  # transform.position.z/.x, and TaxiAgent.ApplyBicycleDynamics rotates about that
+  # origin, so it is the model's reference point) while the point cloud is placed in the
+  # world from /laser_scan_pose, i.e. from the sensor. The two are ~14 m apart along the
+  # fuselage and nothing used to reconcile them, so every ego-to-obstacle distance in the
+  # trajectory figure was measured from a point 14 m behind the sensor that produced the
+  # obstacle. These offsets are what the plot uses to draw the ego where the LiDAR is.
+  #
+  # PLOTTING ONLY, for now. The cost functions and the MPPI rollout still run on the ego
+  # root; moving those needs the offset carried through the rollout (a point ahead of the
+  # rotation centre does not follow the same curve) and changes what the controller
+  # enforces, which is a separate decision from what the figure shows.
+  sensor_fwd: 14.42         # [m] along the ego's forward axis (+ = toward the nose)
+  sensor_lat: -0.07         # [m] along the ego's right axis (+ = starboard)
 
 mppi:
   horizon: 40               # planning steps (x vehicle.dt seconds)

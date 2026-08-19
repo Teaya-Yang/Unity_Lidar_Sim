@@ -36,6 +36,7 @@ SCHEMA: Dict[str, Dict[str, str]] = {
         "dt": "float", "wheelbase": "float", "v_des": "float",
         "drag_coeff": "float", "accel_tau": "float", "max_steer_rate": "float",
         "steer_rolloff_spd": "float", "steer_rolloff_min": "float",
+        "ego_length": "float", "ego_span": "float", "ego_nose_fwd": "float",
     },
     "limits": {"a_min": "float", "a_max": "float", "delta_lim": "float"},
     "goal": {"slowdown_dist": "float", "min_speed": "float", "stop_dist": "float"},
@@ -74,7 +75,8 @@ SCHEMA: Dict[str, Dict[str, str]] = {
     },
     "scan": {
         "fov_h": "float", "fov_v": "float", "res_h": "float", "res_v": "float",
-        "max_range": "float",
+        "max_range": "float", "sensor_fwd": "float", "sensor_lat": "float",
+        "sensor_range": "float",
     },
     "mppi": {
         "horizon": "int", "samples": "int", "lambda": "float",

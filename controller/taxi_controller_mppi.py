@@ -41,6 +41,11 @@ ACCEL_TAU         = _veh["accel_tau"]
 MAX_STEER_RATE    = _veh["max_steer_rate"]
 STEER_ROLLOFF_SPD = _veh["steer_rolloff_spd"]
 STEER_ROLLOFF_MIN = _veh["steer_rolloff_min"]
+# Ego planform — PLOTTING ONLY. No cost term knows the ego has an extent; it is a point
+# against d_safe_hard, and drawing the airframe is what makes that assumption visible.
+EGO_LENGTH   = _veh["ego_length"]
+EGO_SPAN     = _veh["ego_span"]
+EGO_NOSE_FWD = _veh["ego_nose_fwd"]
 
 H_MPPI    = _mppi["horizon"]    # planning horizon (steps)
 K_MPPI    = _mppi["samples"]    # rollout samples
@@ -86,6 +91,8 @@ STALL_V        = _keep["stall_v"]
 SCAN_FOV_H, SCAN_FOV_V = _scan["fov_h"], _scan["fov_v"]
 SCAN_RES_H, SCAN_RES_V = _scan["res_h"], _scan["res_v"]
 SCAN_MAX_RANGE         = _scan["max_range"]
+SENSOR_FWD, SENSOR_LAT = _scan["sensor_fwd"], _scan["sensor_lat"]
+SENSOR_RANGE           = _scan["sensor_range"]
 OCC_FWD_HALF_ANGLE     = _occ["fwd_half_angle"]
 OCC_TRACK_ASSOC = _trk["assoc_radius"]
 OCC_TRACK_ALPHA = _trk["alpha"]
@@ -101,7 +108,7 @@ OCC_RANGE_DBG   = None   # (min_ego_dist, corner_x, corner_y, ego_x, ego_y) for 
                          # is right to reject it.
 OCC_GATE_DBG    = None   # (n_in, n_after_goal_drop, r_goal, min_goal_dist) from the LAST
                          # solve — lets the [DEBUG occ] trace name the gate that emptied the set.
-OCC_PLAN        = None   # (H,2) the PLANNED future path from the last solve, in world
+OCC_PLAN        = None   # (H,3) [x, y, theta] the PLANNED future path from the last solve, in world
                          # (a0,a1). Stage k of this array is the pose the occlusion cost
                          # checked against radius r(t_k) — the pairing the plan figure draws.
 OCC_INFEASIBLE  = False  # the LAST solve found no feasible rollout and braked. OCC_PLAN is
@@ -118,7 +125,9 @@ OCC_USED_N      = 0      # boundaries that actually entered the LAST solve's cos
 OCCLUSION_AWARE = False
 
 RVIZ_PUB        = None   # RvizVisualizer — /viz/* MarkerArrays for RViz2
-MPPI_ROLLOUTS   = None   # (n,H,2) sampled rollout paths from the LAST solve, kept only
+MPPI_ROLLOUTS   = None   # (n,H,3) sampled rollout paths [x, y, theta] from the LAST
+                         # solve — the heading so the figures can place the SENSOR on each
+                         # sample, not just the ego root. Kept only
                          # when --rviz-viz is on: it is pure visualisation, and holding
                          # every sample's path costs K*H*2 floats per step otherwise.
 MPPI_COSTS      = None   # (n,) their total costs, for the colour ramp
@@ -200,6 +209,37 @@ def obs_to_state(obs: np.ndarray, prev_delta: float = 0.0, prev_accel: float = 0
 
     s = np.array([ego0, ego1, ego2, v, prev_delta, prev_accel])
     return s, goal_xy
+
+
+def sensor_xy(x, y, theta):
+    """Ego-root world position + heading -> LIDAR world position, same (a0, a1) axes.
+
+    The planner's state is the ego ROOT (see scan.sensor_fwd in config.yaml); the point
+    cloud, the occlusion boundaries and the cluster centroids are all placed in the world
+    from the SENSOR. This is the conversion between them, and it needs the heading: the
+    offset is a body-frame vector, so it rotates with the aircraft.
+
+    Axes: (a0, a1) = (Unity Z, Unity X) and theta is the Unity yaw, so body forward is
+    (cos t, sin t) and body right is (-sin t, cos t) — consistent with _rollout_step,
+    which integrates x along cos(theta) and y along sin(theta).
+    """
+    x = np.asarray(x, float); y = np.asarray(y, float); theta = np.asarray(theta, float)
+    c, s = np.cos(theta), np.sin(theta)
+    return (x + SENSOR_FWD * c - SENSOR_LAT * s,
+            y + SENSOR_FWD * s + SENSOR_LAT * c)
+
+
+def sensor_horizon(cx, cy, n=180):
+    """Closed (n+1,2) circle of radius scan.sensor_range around the LIDAR at (cx, cy).
+
+    The edge of what the sensor can report. Outside it the figure is not empty because the
+    apron is clear, it is empty because nothing was measured — a distinction the keep-outs
+    and the cluster markers cannot make on their own, and the one that decides whether a
+    gap in the drawing is information.
+    """
+    a = np.linspace(0.0, 2.0 * np.pi, n + 1)
+    return np.column_stack([cx + SENSOR_RANGE * np.cos(a),
+                            cy + SENSOR_RANGE * np.sin(a)])
 
 
 def _rollout_step(st, a_cmd, delta_cmd):
@@ -368,14 +408,14 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     # Sampled rollout paths for the RViz overlay. Filled in the loop below so the drawn
     # lines are the SAMPLES the softmax weighted, not a re-simulation of them.
     MPPI_ROLLOUTS = MPPI_COSTS = MPPI_BEST = None
-    paths = (np.empty((K_MPPI, H_MPPI, 2))
+    paths = (np.empty((K_MPPI, H_MPPI, 3))
              if (MPPI_KEEP_ROLLOUTS > 0 or MPPI_TRACK_BEST) else None)
 
     for k in range(H_MPPI):
         st = _rollout_step(st, na[:, k, 0], na[:, k, 1])
         fwd, lat, th, vv = st[:, 0], st[:, 1], st[:, 2], st[:, 3]
         if paths is not None:
-            paths[:, k, 0], paths[:, k, 1] = fwd, lat
+            paths[:, k, 0], paths[:, k, 1], paths[:, k, 2] = fwd, lat, th
 
         u_k   = na[:, k, :]                                  # (K, 2)
         u_km1 = u_prev[None, :] if k == 0 else na[:, k - 1, :]
@@ -452,10 +492,14 @@ def mppi(s0, mean, goal_xy, u_prev=None):
         # ego still ends up while stopping — the case where it clips the keep-outs is
         # exactly the one worth looking at, so this must not be left as a stale plan.
         _st = np.asarray(s0, float)[None, :]
-        _brake = np.empty((H_MPPI, 2))
+        # (H,3) [x, y, theta]: the heading is carried so the figure can place the SENSOR
+        # at each sampled stage. Taking it from the state is exact; differencing the
+        # positions is not, because a stage's position was integrated with the PREVIOUS
+        # stage's heading.
+        _brake = np.empty((H_MPPI, 3))
         for _k in range(H_MPPI):
             _st = _rollout_step(_st, u_stop[0:1], u_stop[1:2])
-            _brake[_k] = _st[0, :2]
+            _brake[_k] = _st[0, :3]
         OCC_PLAN = _brake
         OCC_INFEASIBLE = True
         return u_stop, np.zeros((H_MPPI, 2))
@@ -469,10 +513,10 @@ def mppi(s0, mean, goal_xy, u_prev=None):
     new_mean = np.vstack([opt[1:], opt[-1]])
 
     _st = np.tile(np.asarray(s0, float)[None, :], (1, 1))
-    _plan = np.empty((H_MPPI, 2))
+    _plan = np.empty((H_MPPI, 3))            # [x, y, theta] — see the braking branch
     for _k in range(H_MPPI):
         _st = _rollout_step(_st, opt[_k:_k + 1, 0], opt[_k:_k + 1, 1])
-        _plan[_k] = _st[0, :2]
+        _plan[_k] = _st[0, :3]
     OCC_PLAN = _plan
     return u_nom, new_mean
 
@@ -699,20 +743,34 @@ def _save_rollouts_plot(stem, verdict, fr, goal_xy=None, static_boxes=None,
     plan the softmax produced, this one shows the candidate set it produced it from.
     Only the rollouts mppi() kept are available (see --plot-rollouts), and they are the
     CHEAPEST N, so the spread drawn is the good tail of the distribution, not all K.
+
+    LIKE THE MAP FIGURE, every ego-side thing here is the LIDAR — the cloud included.
+    mppi() records each sample as [x, y, theta], so the same body-frame offset can be
+    rotated onto every sample at every stage; the cloud is therefore the set of paths the
+    SENSOR would trace, which is the set that can be read against keep-outs seeded by
+    sensor data. On a turning sample the converted path is not a shifted copy of the root
+    path — it bows outward — which is real and is the reason this is worth doing properly.
     """
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
     from occlusion_capsules import capsule_polygon
-    from static_obstacles import box_polygon
+    from static_obstacles import box_polygon, aircraft_polygon
 
     rollouts = fr.get("rollouts")
     if rollouts is None or not len(rollouts):
         return False
     rollouts = np.asarray(rollouts, float)
+    if rollouts.shape[-1] >= 3:
+        # (n,H,3) [x, y, theta] -> the sensor path of every sample.
+        _rx, _ry = sensor_xy(rollouts[:, :, 0], rollouts[:, :, 1], rollouts[:, :, 2])
+        rollouts = np.stack([_rx, _ry], axis=-1)
+    # else: a recording from before the heading was carried — left at the ego root, which
+    # is visibly ~14 m off the markers rather than silently wrong.
     costs = fr.get("rollout_costs")
     costs = None if costs is None else np.asarray(costs, float)
 
-    plan = fr["plan"]
+    plan = fr["plan"]                                   # (H,3) ego-root [x, y, theta]
+    plan_x, plan_y = sensor_xy(plan[:, 0], plan[:, 1], plan[:, 2])
     tk = (np.arange(len(plan)) + 1) * DT
     segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
             if fr.get("segs") is not None and len(fr["segs"]) else np.empty((0, 2, 2)))
@@ -754,7 +812,7 @@ def _save_rollouts_plot(stem, verdict, fr, goal_xy=None, static_boxes=None,
     ax.plot([], [], "-", color="tab:blue", lw=1.0, alpha=0.7,
             label=f"{len(rollouts)} sampled rollouts (cheapest kept)")
 
-    ax.plot(plan[:, 0], plan[:, 1], "-", color="k", lw=2.5, zorder=6,
+    ax.plot(plan_x, plan_y, "-", color="k", lw=2.5, zorder=6,
             label=("braking rollout — no feasible plan" if fr.get("infeasible") else
                    "chosen plan (softmax of the samples)"))
 
@@ -783,16 +841,21 @@ def _save_rollouts_plot(stem, verdict, fr, goal_xy=None, static_boxes=None,
         ax.plot(c0, c1, "x", color="k", ms=7, mew=1.5, zorder=7,
                 label="sensed mover centre (keep-out seed)" if i == 0 else None)
 
-    ax.plot(fr["ex"], fr["ey"], "o", mfc="w", mec="k", ms=8, mew=1.2, zorder=8,
-            label="ego at $t_k$ = 0")
+    _hull = aircraft_polygon(fr["ex"], fr["ey"], fr["eth"],
+                             EGO_LENGTH, EGO_SPAN, EGO_NOSE_FWD)
+    ax.fill(_hull[:, 0], _hull[:, 1], facecolor="w", alpha=0.55, edgecolor="k",
+            lw=1.0, zorder=7, label="ego airframe")
+    _e0x, _e0y = sensor_xy(fr["ex"], fr["ey"], fr["eth"])
+    ax.plot(_e0x, _e0y, "o", mfc="w", mec="k", ms=8, mew=1.2, zorder=8,
+            label="ego (LiDAR) at $t_k$ = 0")
     if goal_xy is not None:
         ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18, mec="k", zorder=8,
                 label="goal")
 
     # Zoom on the sample cloud plus the plan: unlike the main figure there is no executed
     # trajectory to bound, and the cloud IS the subject, so it must not be clipped.
-    allx = np.concatenate([rollouts[:, :, 0].ravel(), plan[:, 0], [fr["ex"]]])
-    ally = np.concatenate([rollouts[:, :, 1].ravel(), plan[:, 1], [fr["ey"]]])
+    allx = np.concatenate([rollouts[:, :, 0].ravel(), plan_x, [_e0x]])
+    ally = np.concatenate([rollouts[:, :, 1].ravel(), plan_y, [_e0y]])
     margin = 0.15 * max(np.ptp(allx), np.ptp(ally), 1.0) + 5.0
     cx, cy = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
     half_x = 0.5 * np.ptp(allx) + margin
@@ -818,6 +881,16 @@ def _draw_solve_map(ax, fr, verdict, traj, goal_xy=None, static_boxes=None,
     and the expanding keep-out (occlusion capsules + swept mover tubes) at a handful of
     sampled horizon timestamps t_k.
 
+    THE EGO IS DRAWN AT THE LIDAR, not at the ego root the planner integrates, and the
+    airframe outline is drawn around it. Everything the ego is compared against here comes
+    from the sensor (the occlusion boundaries and the mover centroids are world-placed
+    from /laser_scan_pose), so plotting the root put every apparent clearance
+    scan.sensor_fwd ~ 14 m out along the fuselage. The keep-outs are still the ones the
+    COST enforced, and the cost enforces them against the ROOT — so the sensor marker can
+    sit inside a capsule on a solve the planner called feasible. That is the real state of
+    affairs (the nose was inside it all along) and showing it is the point; the fix is to
+    carry the offset into the cost, which is a controller change, not a plotting one.
+
     Shared by the single-frame figure and the video, so both show exactly the same
     geometry. `t_now` [s], when given (video), clips the executed trajectory to what had
     already been driven at this solve instead of drawing the whole run.
@@ -826,14 +899,22 @@ def _draw_solve_map(ax, fr, verdict, traj, goal_xy=None, static_boxes=None,
     limits, aspect and legend — the video needs those fixed across frames.
     """
     from occlusion_capsules import capsule_polygon
-    from static_obstacles import box_polygon
+    from static_obstacles import box_polygon, aircraft_polygon
 
-    x, y = traj[:, 1], traj[:, 2]
+    def _ego_outline(ex, ey, eth):
+        """Planform at an EGO-ROOT pose — the frame the dimensions are measured in."""
+        return aircraft_polygon(ex, ey, eth, EGO_LENGTH, EGO_SPAN, EGO_NOSE_FWD)
+
+    # traj columns are t,x,y,theta,... so column 3 is the heading that rotates the offset.
+    x, y = sensor_xy(traj[:, 1], traj[:, 2], traj[:, 3])
     if t_now is not None:
         n = max(int(np.searchsorted(traj[:, 0], t_now, side="right")), 1)
         x, y = x[:n], y[:n]
 
-    plan = fr["plan"]
+    plan = fr["plan"]                                   # (H,3) ego-root [x, y, theta]
+    # The same rollout expressed at the SENSOR. Not a rigid shift of the root path: the
+    # offset rotates with the aircraft, so on a turn the sensor traces a WIDER arc.
+    plan_x, plan_y = sensor_xy(plan[:, 0], plan[:, 1], plan[:, 2])
     tk = (np.arange(len(plan)) + 1) * DT
     segs = (np.asarray(fr["segs"], float).reshape(-1, 2, 2)
             if fr.get("segs") is not None and len(fr["segs"]) else np.empty((0, 2, 2)))
@@ -871,7 +952,8 @@ def _draw_solve_map(ax, fr, verdict, traj, goal_xy=None, static_boxes=None,
                     zorder=2)
 
     ax.plot(x, y, "-", color="0.65", lw=1.2, zorder=1,
-            label="executed trajectory" + (" (so far)" if t_now is not None else ""))
+            label="executed trajectory, LiDAR"
+                  + (" (so far)" if t_now is not None else ""))
     ax.plot(x[0], y[0], "o", color="tab:green", ms=9, zorder=3, label="start")
     if t_now is None:
         ax.plot(x[-1], y[-1], "s", color="tab:red", ms=9, zorder=3, label="end")
@@ -879,10 +961,10 @@ def _draw_solve_map(ax, fr, verdict, traj, goal_xy=None, static_boxes=None,
         ax.plot(goal_xy[0], goal_xy[1], "*", color="gold", ms=18, mec="k", zorder=3,
                 label="goal")
 
-    ax.plot(plan[:, 0], plan[:, 1], "-", color="k", lw=2.0, zorder=4,
-            label=("braking rollout — no feasible plan "
+    ax.plot(plan_x, plan_y, "-", color="k", lw=2.0, zorder=4,
+            label=("braking rollout, LiDAR — no feasible plan "
                    f"(solve at t = {fr['t']:.1f} s)" if fr.get("infeasible") else
-                   f"predicted rollout (solve at t = {fr['t']:.1f} s)"))
+                   f"predicted rollout, LiDAR (solve at t = {fr['t']:.1f} s)"))
 
     # Sampled predicted timestamps along that rollout.
     # t_k = 0: the ego pose at this solve, with the un-expanded keep-out.
@@ -891,7 +973,17 @@ def _draw_solve_map(ax, fr, verdict, traj, goal_xy=None, static_boxes=None,
         ax.plot(poly[:, 0], poly[:, 1], "-", color="w", lw=1.8, alpha=0.95, zorder=1)
     for poly in _dyn_keepout_polys(fr, 0.0):
         ax.plot(poly[:, 0], poly[:, 1], "--", color="w", lw=1.6, alpha=0.95, zorder=1)
-    ax.plot(fr["ex"], fr["ey"], "o", mfc="w", mec="k", ms=6, mew=0.9, zorder=5,
+    _e0x, _e0y = sensor_xy(fr["ex"], fr["ey"], fr["eth"])
+    # Sensor horizon, centred on the LIDAR (not the ego root) because that is what it is
+    # measured from. Drawn under everything and left out of the zoom bounds — it is 250 m
+    # across and would shrink the ego to a few pixels if the window had to contain it.
+    _hz = sensor_horizon(_e0x, _e0y)
+    ax.plot(_hz[:, 0], _hz[:, 1], "-", color="0.55", lw=1.0, alpha=0.7, zorder=0,
+            label=f"LiDAR range ({SENSOR_RANGE:.0f} m)")
+    _hull = _ego_outline(fr["ex"], fr["ey"], fr["eth"])
+    ax.fill(_hull[:, 0], _hull[:, 1], facecolor="w", alpha=0.55, edgecolor="k",
+            lw=1.0, zorder=4, label="ego airframe")
+    ax.plot(_e0x, _e0y, "o", mfc="w", mec="k", ms=6, mew=0.9, zorder=5,
             label=f"$t_k$ = 0.0 s   r = {D_SAFE_HARD:.0f} m")
 
     stages = np.linspace(0, len(plan) - 1, min(max_frames, len(plan))).round().astype(int)
@@ -909,7 +1001,11 @@ def _draw_solve_map(ax, fr, verdict, traj, goal_xy=None, static_boxes=None,
         # radius, so r = D_SAFE_HARD + r_obj + V_TARGET·t_k.
         for poly in _dyn_keepout_polys(fr, t_k):
             ax.plot(poly[:, 0], poly[:, 1], "--", color=col, lw=1.6, alpha=0.95, zorder=1)
-        ax.plot(plan[k, 0], plan[k, 1], "o", mfc=col, mec="k", ms=6, mew=0.9, zorder=5,
+        # The airframe as it will be oriented at this stage — outline only, so stages
+        # further down the horizon overlap without hiding each other or the keep-outs.
+        hull = _ego_outline(plan[k, 0], plan[k, 1], plan[k, 2])
+        ax.plot(hull[:, 0], hull[:, 1], "-", color=col, lw=1.0, alpha=0.85, zorder=4)
+        ax.plot(plan_x[k], plan_y[k], "o", mfc=col, mec="k", ms=6, mew=0.9, zorder=5,
                 label=f"$t_k$ = {t_k:.1f} s   r = {r_k:.0f} m")
 
     for seg in segs:
@@ -921,6 +1017,12 @@ def _draw_solve_map(ax, fr, verdict, traj, goal_xy=None, static_boxes=None,
                 label="sensed mover centre (keep-out seed)" if i == 0 else None)
 
     ax.set_xlabel("x  (Unity Z) [m]"); ax.set_ylabel("y  (Unity X) [m]")
+    # State the reference point ON the figure: the keep-outs are enforced at the ego root
+    # while the markers are the sensor, and a reader cannot tell that from the geometry.
+    ax.text(0.01, 0.01,
+            f"ego markers = LiDAR (laser_link, {SENSOR_FWD:+.2f} m fwd / "
+            f"{SENSOR_LAT:+.2f} m lat of the ego root);  keep-outs enforced at the ego root",
+            transform=ax.transAxes, fontsize=7, color="0.35", va="bottom", zorder=7)
     _what = " + ".join((["occlusion"] if len(segs) else []) +
                        (["dynamic-obstacle"] if len(dyn_c) else []))
     ax.set_title(f"{verdict} — predicted rollout at t = {fr['t']:.1f} s with the "
@@ -1094,15 +1196,31 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection, PolyCollection
     from occlusion_capsules import capsule_polygon
-    from static_obstacles import box_polygon
+    from static_obstacles import box_polygon, aircraft_polygon
 
     frames = frames[::max(1, int(stride))]
     if not frames:
         return None
 
     # Fixed window: the ego's whole executed extent plus every plan drawn in the video.
-    allx = np.concatenate([traj[:, 1]] + [f["plan"][:, 0] for f in frames])
-    ally = np.concatenate([traj[:, 2]] + [f["plan"][:, 1] for f in frames])
+    # Bound the SENSOR paths, since that is what the frames draw — and bound the rollout
+    # the frames actually show, which is the cheapest SAMPLE ("best") where one was
+    # recorded, not the softmax mean.
+    _tx, _ty = sensor_xy(traj[:, 1], traj[:, 2], traj[:, 3])
+    def _drawn(f):
+        p = f.get("best")
+        p = np.asarray(f["plan"] if p is None or not len(p) else p, float)
+        return (sensor_xy(p[:, 0], p[:, 1], p[:, 2]) if p.shape[-1] >= 3
+                else (p[:, 0], p[:, 1]))
+    _px = [_drawn(f) for f in frames]
+    # The horizon ring moves with the ego and the window is fixed for the whole video, so
+    # it has to bound the ring at every solve — the ego track inflated by the sensor range.
+    _hx = np.array([sensor_xy(f["ex"], f["ey"], f["eth"])[0] for f in frames])
+    _hy = np.array([sensor_xy(f["ex"], f["ey"], f["eth"])[1] for f in frames])
+    allx = np.concatenate([_tx] + [p[0] for p in _px]
+                          + [_hx - SENSOR_RANGE, _hx + SENSOR_RANGE])
+    ally = np.concatenate([_ty] + [p[1] for p in _px]
+                          + [_hy - SENSOR_RANGE, _hy + SENSOR_RANGE])
     cx, cy = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
     half_x = 0.5 * np.ptp(allx) + 100.0
     half_y = max(0.5 * np.ptp(ally) + 100.0, 0.25 * half_x)
@@ -1149,10 +1267,19 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
     lc_dyn = LineCollection([], linewidths=1.6, alpha=0.95, linestyles="--", zorder=1,
                             animated=True)
     lc_axes = LineCollection([], linewidths=2.5, colors="k", zorder=6, animated=True)
-    for lc in (lc_occ, lc_dyn, lc_axes):
+    # Ego planform at t_k = 0 and at every sampled stage. A LineCollection rather than a
+    # patch per frame: the video redraws by blitting a FIXED set of artists, so the hulls
+    # have to live in one artist whose segment list is swapped per frame.
+    lc_hull = LineCollection([], linewidths=1.0, alpha=0.85, zorder=4, animated=True)
+    # Sensor horizon: it follows the LiDAR, so it is redrawn per frame like the rest.
+    lc_horizon = LineCollection([], linewidths=1.0, colors="0.55", alpha=0.7, zorder=0,
+                                animated=True)
+    for lc in (lc_occ, lc_dyn, lc_axes, lc_hull, lc_horizon):
         ax.add_collection(lc)
+    ax.plot([], [], "-", color="0.55", lw=1.0, alpha=0.7,
+            label=f"LiDAR range ({SENSOR_RANGE:.0f} m)")
     ln_plan, = ax.plot([], [], "-", color="k", lw=2.0, zorder=4, animated=True,
-                       label="predicted rollout (cheapest sample)")
+                       label="predicted rollout, LiDAR (cheapest sample)")
     ln_ego, = ax.plot([], [], "o", mfc="w", mec="k", ms=6, mew=0.9, zorder=5,
                       animated=True, label=f"$t_k$ = 0.0 s   r = {D_SAFE_HARD:.0f} m")
     ln_mover, = ax.plot([], [], "x", color="k", ms=7, mew=1.5, zorder=6, animated=True,
@@ -1197,6 +1324,12 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
         # for recordings made without the extremes, since those carry no sample.
         plan = f.get("best")
         plan = np.asarray(f["plan"] if plan is None or not len(plan) else plan, float)
+        # Ego-root [x, y, theta] -> the SENSOR path, matching the still figure. The third
+        # column is what makes this possible; a recording without it stays at the root.
+        if plan.shape[-1] >= 3:
+            plan_x, plan_y = sensor_xy(plan[:, 0], plan[:, 1], plan[:, 2])
+        else:
+            plan_x, plan_y = plan[:, 0], plan[:, 1]
         tk = (np.arange(len(plan)) + 1) * DT
         segs = (np.asarray(f["segs"], float).reshape(-1, 2, 2)
                 if f.get("segs") is not None and len(f["segs"]) else np.empty((0, 2, 2)))
@@ -1213,6 +1346,13 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
         stages = np.linspace(0, len(plan) - 1,
                              min(max_frames, len(plan))).round().astype(int)
         stage_pts, stage_cols = [], []
+        hulls, hull_cols = [], []
+        if plan.shape[-1] >= 3:
+            hulls.append(aircraft_polygon(f["ex"], f["ey"], f["eth"],
+                                          EGO_LENGTH, EGO_SPAN, EGO_NOSE_FWD))
+            # Black, not the white the t_k = 0 keep-out uses: this collection is outline
+            # only (no fill to sit on), so white would be invisible on the white canvas.
+            hull_cols.append("k")
         for si, k in enumerate(dict.fromkeys(stages.tolist())):
             col = STAGE_COLORS[si % len(STAGE_COLORS)]
             t_k = float(tk[k])
@@ -1222,11 +1362,16 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
                 occ_cols.append(col)
             for poly in _dyn_keepout_polys(f, t_k):
                 dyn_polys.append(poly); dyn_cols.append(col)
-            stage_pts.append(plan[k]); stage_cols.append(col)
+            stage_pts.append((plan_x[k], plan_y[k])); stage_cols.append(col)
+            if plan.shape[-1] >= 3:
+                hulls.append(aircraft_polygon(plan[k, 0], plan[k, 1], plan[k, 2],
+                                              EGO_LENGTH, EGO_SPAN, EGO_NOSE_FWD))
+                hull_cols.append(col)
 
         lc_occ.set_segments(occ_polys); lc_occ.set_color(occ_cols)
         lc_dyn.set_segments(dyn_polys); lc_dyn.set_color(dyn_cols)
         lc_axes.set_segments(list(segs))
+        lc_hull.set_segments(hulls); lc_hull.set_color(hull_cols)
 
         db, tracked, _matched = _match_tracked(f)
         pc_movers.set_verts([box_polygon(*b) for b in db])
@@ -1238,9 +1383,12 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
         ln_mover.set_data(dyn_c[:, 0], dyn_c[:, 1])
 
         n = max(int(np.searchsorted(traj[:, 0], f["t"], side="right")), 1)
-        ln_driven.set_data(traj[:n, 1], traj[:n, 2])
-        ln_plan.set_data(plan[:, 0], plan[:, 1])
-        ln_ego.set_data([f["ex"]], [f["ey"]])
+        _dx, _dy = sensor_xy(traj[:n, 1], traj[:n, 2], traj[:n, 3])
+        ln_driven.set_data(_dx, _dy)
+        ln_plan.set_data(plan_x, plan_y)
+        _ex, _ey = sensor_xy(f["ex"], f["ey"], f["eth"])
+        ln_ego.set_data([_ex], [_ey])
+        lc_horizon.set_segments([sensor_horizon(_ex, _ey)])
         sc_stage.set_offsets(np.asarray(stage_pts, float).reshape(-1, 2))
         sc_stage.set_facecolor(stage_cols)
 
@@ -1260,7 +1408,7 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
                        + (f"\n{_l2}" if _l2 else ""))
 
         fig.canvas.restore_region(bg)
-        for a in (ln_driven, pc_movers, lc_occ, lc_dyn, lc_axes,
+        for a in (ln_driven, pc_movers, lc_occ, lc_dyn, lc_axes, lc_hull, lc_horizon,
                   ln_plan, ln_ego, ln_mover, sc_stage, title):
             ax.draw_artist(a)
         fig.canvas.blit(fig.bbox)
@@ -1316,7 +1464,8 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
 
     TRAJ_MARGIN = 100.0   # [m] padding around the ego extent — the plot's zoom level
 
-    x, y = traj[:, 1], traj[:, 2]
+    # Sensor track, matching what _draw_solve_map draws; used only for the window.
+    x, y = sensor_xy(traj[:, 1], traj[:, 2], traj[:, 3])
 
     frames = [f for f in (occ_frames or []) if f.get("plan") is not None and len(f["plan"]) > 1]
     if not frames:
@@ -1368,15 +1517,22 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
                                           static_boxes=static_boxes,
                                           max_frames=max_frames)
 
-    # Zoom on the EGO's own extent (start → end) plus the plan it is executing. Static
-    # obstacles and the outer keep-out capsules are deliberately left out of the bounds:
-    # a 700 m-away wall or a 40 m radius ring would zoom the ego down to a few pixels.
-    # Anything outside the window simply gets clipped.
-    allx = np.concatenate([x, plan[:, 0]])
-    ally = np.concatenate([y, plan[:, 1]])
+    # Zoom on the EGO's own extent (start → end), the plan it is executing, AND the sensor
+    # horizon of the drawn solve — the ring is the whole point of drawing it, so a window
+    # that clips it shows a legend entry for something invisible. Static obstacles and the
+    # keep-out capsules are still left out: a 700 m-away wall would zoom the ego to a dot.
+    _px, _py = sensor_xy(plan[:, 0], plan[:, 1], plan[:, 2])
+    allx = np.concatenate([x, _px])
+    ally = np.concatenate([y, _py])
     cx, cy = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
     half_x = 0.5 * (allx.max() - allx.min()) + TRAJ_MARGIN
     half_y = max(0.5 * (ally.max() - ally.min()) + TRAJ_MARGIN, 0.25 * half_x)
+    # Then grow — if needed — to fit the horizon ring, with NO further margin: the ring is
+    # already 250 m of slack in every direction, and stacking TRAJ_MARGIN on top of it just
+    # shrinks the ego for nothing.
+    _hx, _hy = sensor_xy(fr["ex"], fr["ey"], fr["eth"])
+    half_x = max(half_x, abs(_hx - cx) + SENSOR_RANGE)
+    half_y = max(half_y, abs(_hy - cy) + SENSOR_RANGE)
     ax.set_xlim(cx - half_x, cx + half_x); ax.set_ylim(cy - half_y, cy + half_y)
     # Equal aspect on a SQUARE canvas would force the y window out to the x window's
     # size, undoing the zoom. Match the canvas to the data instead: metres stay square
@@ -1723,7 +1879,10 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         if save_traj is not None and OCC_PLAN is not None:
             _segs = OCC_SEGS_USED
             occ_frames.append({"t": ep_steps * DT,
+                               # Ego ROOT pose. The figures convert it to the sensor
+                               # position with sensor_xy(), which needs the heading.
                                "ex": float(s[0]), "ey": float(s[1]),
+                               "eth": float(s[2]),
                                "plan": OCC_PLAN.copy(),
                                # The occlusion boundaries this solve actually constrained
                                # against (post-gating) — what the cost saw, so the drawn

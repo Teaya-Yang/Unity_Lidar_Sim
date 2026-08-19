@@ -118,6 +118,49 @@ def _parse(payload: str) -> Optional[np.ndarray]:
     return np.asarray(rows, float).reshape(-1, 5) if rows else None
 
 
+def aircraft_polygon(cx: float, cy: float, yaw: float,
+                     length: float, span: float, nose_fwd: float) -> np.ndarray:
+    """Closed (N,2) planform silhouette of the ego aircraft, for plotting.
+
+    (cx, cy, yaw) is the ego ROOT pose — the point the planner integrates and the origin
+    the body-frame dimensions are measured from — so the outline lands around the LiDAR
+    marker rather than centred on it, which is the whole reason it is worth drawing.
+
+    Only length, span and the nose position are real (config.yaml vehicle.ego_*, taken
+    from the mesh bounds). The fuselage width, wing sweep and stabiliser size below are
+    PROPORTIONS chosen to read as an airliner at plot scale, not measurements — the
+    silhouette is here to show extent and orientation against the keep-outs, so its
+    outer envelope is right and its details are decoration.
+    """
+    n = float(nose_fwd)                 # nose, in body coords (+u forward)
+    t = n - float(length)               # tail (negative)
+    L = float(length)
+    hs = 0.5 * float(span)
+    hw = 0.075 * float(span)            # fuselage half-width
+
+    # Right half, nose -> tail. Mirrored below, so every u here appears twice.
+    right = [
+        (n, 0.0),                       # nose tip
+        (n - 0.06 * L, 0.55 * hw),
+        (n - 0.13 * L, hw),
+        (n - 0.40 * L, hw),             # wing leading edge, root
+        (n - 0.60 * L, hs),             # swept to the tip
+        (n - 0.68 * L, hs),
+        (n - 0.60 * L, hw),             # wing trailing edge, back to the fuselage
+        (n - 0.84 * L, hw),             # stabiliser leading edge, root
+        (n - 0.94 * L, 0.36 * hs),      # stabiliser tip
+        (n - 0.98 * L, 0.36 * hs),
+        (n - 0.95 * L, 0.55 * hw),      # stabiliser trailing edge
+        (t, 0.30 * hw),                 # tail cone
+    ]
+    body = np.array(right + [(u, -w) for u, w in reversed(right)] + [right[0]], float)
+
+    c, s = np.cos(yaw), np.sin(yaw)
+    # Body (u forward, w right) -> world (a0, a1): forward = (cos, sin), right = (-sin, cos).
+    return np.column_stack([cx + body[:, 0] * c - body[:, 1] * s,
+                            cy + body[:, 0] * s + body[:, 1] * c])
+
+
 def box_polygon(cx: float, cy: float, sx: float, sy: float, yaw: float = 0.0) -> np.ndarray:
     """Closed (5,2) outline of one footprint, for plotting."""
     hx, hy = 0.5 * sx, 0.5 * sy
