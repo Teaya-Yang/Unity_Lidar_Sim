@@ -190,7 +190,7 @@ public class LaserSensor3D
     public PointCloud2Msg getScanMsg()
     {
 
-        float startTime = Time.realtimeSinceStartup;
+        // float startTime = Time.realtimeSinceStartup;
 
         Transform sensor_transform = laser_sensor_link.transform;
 
@@ -311,14 +311,8 @@ public class LaserSensor3D
             is_dense = false,
         };
 
-        // float endTime = Time.realtimeSinceStartup;
-        // float elapsedTime = 1000*(endTime - startTime);
-
-        // float total_time = (total_counts*avg_time + elapsedTime);
-        // total_counts = total_counts + 1;
-        // avg_time = total_time/total_counts;
-
-        // Debug.Log("getScanMsg() Execution Time (curr, avg): (" + elapsedTime.ToString("F4") +", "+ avg_time.ToString("F4")+ ") ms");
+        // float elapsedTime = 1000*(Time.realtimeSinceStartup - startTime);
+        // Debug.Log("getScanMsg() Execution Time: " + elapsedTime.ToString("F4") + " ms");
 
         return msg;
     }

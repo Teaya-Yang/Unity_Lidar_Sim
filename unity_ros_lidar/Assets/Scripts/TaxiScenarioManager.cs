@@ -19,6 +19,20 @@ public enum ScenarioType
     Converging      = 5,   // agents spawn FAR on a ring and home in toward the ego from multiple bearings (long-range planning)
 }
 
+// How the ego is oriented when it is placed at the start of an episode.
+public enum EgoSpawnHeading
+{
+    // Each spawn site's historical behaviour, which is NOT the same everywhere: the network
+    // scenarios (map / runway incursion) face down the taxiway tangent, while the two-point and
+    // free-goal marker spawns face world +Z. Kept as the default so this setting is opt-in.
+    Auto = 0,
+    WorldForward,       // identity rotation, nose down world +Z
+    TravelDirection,    // along the route: the taxiway tangent, or the bearing to the goal off-network
+    TowardGoal,         // straight at the goal marker, whatever the taxiway does
+    StartMarker,        // whatever egoStartMarker is rotated to in the editor
+    FixedYaw,           // egoSpawnYawDeg about world up
+}
+
 /// <summary>
 /// Centralized per-episode scenario configurator.
 ///
@@ -44,10 +58,23 @@ public class TaxiScenarioManager : MonoBehaviour
              "down its taxiway toward Ego Goal Marker, and drives there under the MPPI cost. Drop two " +
              "empty GameObjects on the (always-drawn) taxiways for the two markers.")]
     public bool manualTwoPointMode = false;
-    [Tooltip("EGO START: the plane spawns here, on the nearest taxiway, facing toward the goal.")]
+    [Tooltip("EGO START: the plane spawns here, on the nearest taxiway. Which way it faces is " +
+             "set by Ego Spawn Heading below.")]
     public Transform egoStartMarker;
     [Tooltip("GOAL: where the ego taxis to (projected onto the ego's start taxiway).")]
     public Transform egoGoalMarker;
+
+    [Header("Ego spawn orientation")]
+    [Tooltip("Which way the ego faces at spawn. Auto keeps each mode's existing behaviour: " +
+             "the taxiway tangent in the network scenarios, world +Z at the two-point / " +
+             "free-goal markers. Everything else applies to all modes alike.")]
+    public EgoSpawnHeading egoSpawnHeading = EgoSpawnHeading.Auto;
+    [Tooltip("Yaw [deg] used by egoSpawnHeading = FixedYaw. 0 = world +Z, positive = clockwise " +
+             "seen from above (Unity's left-handed Y rotation).")]
+    public float egoSpawnYawDeg = 0f;
+    [Tooltip("Extra yaw [deg] added on top of whatever egoSpawnHeading resolved to. Use it to " +
+             "start the episode with the nose deliberately off the travel direction.")]
+    public float egoSpawnYawOffsetDeg = 0f;
 
     [System.Serializable]
     public struct ManualObstacle
@@ -210,9 +237,13 @@ public class TaxiScenarioManager : MonoBehaviour
     // Orients the lane tangent to the travel direction toward the goal: +1 with the taxiway's
     // stored waypoint order, -1 against it. Always +1 in scenario mode (goal at higher arc).
     public float   EgoPathSign  { get; private set; } = 1f;
-    public bool    EgoHasSpawn  { get; private set; }        // teleport ego to EgoSpawnPos/EgoTravelDir?
+    public bool    EgoHasSpawn  { get; private set; }        // teleport ego to EgoSpawnPos/EgoSpawnRot?
     public Vector3 EgoSpawnPos  { get; private set; }
     public Vector3 EgoTravelDir { get; private set; } = Vector3.forward;
+    // The rotation TaxiAgent applies at spawn, resolved from egoSpawnHeading. Kept separate
+    // from EgoTravelDir: the direction the ego must TRAVEL is route geometry and drives the
+    // Frenet sign, while this is only which way the nose starts out pointing.
+    public Quaternion EgoSpawnRot { get; private set; } = Quaternion.identity;
 
     // ── internal ───────────────────────────────────────────────────────────────
     readonly List<IncursionAgentController> _pool   = new List<IncursionAgentController>();
@@ -463,12 +494,14 @@ public class TaxiScenarioManager : MonoBehaviour
         var egoWps = EgoPath.Waypoints;
         if (egoWps.Count > 0)
         {
-            aircraftTransform.position    = egoWps[0];
+            aircraftTransform.position = egoWps[0];
             Vector3 initDir = egoWps.Count > 1
                 ? (egoWps[1] - egoWps[0]).normalized
                 : Vector3.forward;
-            if (initDir.sqrMagnitude > 1e-6f)
-                aircraftTransform.rotation = Quaternion.LookRotation(initDir, Vector3.up);
+            // Auto = the first leg's direction, as before.
+            EgoSpawnRot = ResolveEgoSpawnRot(initDir, egoWps[0],
+                                             YawTo(initDir, aircraftTransform.rotation));
+            aircraftTransform.rotation = EgoSpawnRot;
         }
 
         // Converging: the ego is now on a navigable taxiway; spawn homing agents on a ring around
@@ -844,9 +877,64 @@ public class TaxiScenarioManager : MonoBehaviour
     void PlaceEgoOnPath(Transform ego, TaxiwayPath path, float arc)
     {
         ego.position = ArcToWorldPosition(path, arc);
-        Vector3 tan = network.GetRelativeState(ego.position, Vector3.forward, path).tangent;
-        if (tan.sqrMagnitude > 1e-6f)
-            ego.rotation = Quaternion.LookRotation(tan, Vector3.up);
+        Vector3 tan  = network.GetRelativeState(ego.position, Vector3.forward, path).tangent;
+        // Auto here is the tangent, which is what this did unconditionally before.
+        EgoSpawnRot  = ResolveEgoSpawnRot(tan, ego.position, YawTo(tan, ego.rotation));
+        ego.rotation = EgoSpawnRot;
+    }
+
+    // The spawn rotation egoSpawnHeading asks for. `travelDir` is the direction the route
+    // wants (taxiway tangent, or the bearing to the goal off-network) and `spawnPos` is where
+    // the ego is being placed — TowardGoal is measured from there, not from the marker, since
+    // the two differ once the start is projected onto a taxiway. Degenerate inputs (no route
+    // direction, goal on top of the spawn, marker unassigned) fall back to WorldForward rather
+    // than to a NaN LookRotation. egoSpawnYawOffsetDeg is applied to every mode.
+    //
+    // `autoRot` is what this site did before the setting existed and is what Auto returns —
+    // the tangent on the taxiway network, identity at the two-point / free-goal markers.
+    Quaternion ResolveEgoSpawnRot(Vector3 travelDir, Vector3 spawnPos, Quaternion autoRot)
+    {
+        Quaternion baseRot = Quaternion.identity;
+
+        switch (egoSpawnHeading)
+        {
+            case EgoSpawnHeading.Auto:
+                baseRot = autoRot;
+                break;
+
+            case EgoSpawnHeading.TravelDirection:
+                baseRot = YawTo(travelDir, baseRot);
+                break;
+
+            case EgoSpawnHeading.TowardGoal:
+                if (egoGoalMarker != null)
+                    baseRot = YawTo(egoGoalMarker.position - spawnPos, baseRot);
+                break;
+
+            case EgoSpawnHeading.StartMarker:
+                if (egoStartMarker != null) baseRot = egoStartMarker.rotation;
+                break;
+
+            case EgoSpawnHeading.FixedYaw:
+                baseRot = Quaternion.Euler(0f, egoSpawnYawDeg, 0f);
+                break;
+
+            case EgoSpawnHeading.WorldForward:
+            default:
+                break;
+        }
+
+        return Quaternion.Euler(0f, egoSpawnYawOffsetDeg, 0f) * baseRot;
+    }
+
+    // Yaw-only LookRotation: the ego taxis, so any pitch/roll in `dir` is noise from a
+    // marker placed off the ground plane and must not tip the airframe.
+    static Quaternion YawTo(Vector3 dir, Quaternion fallback)
+    {
+        dir.y = 0f;
+        return dir.sqrMagnitude > 1e-6f
+            ? Quaternion.LookRotation(dir.normalized, Vector3.up)
+            : fallback;
     }
 
     // ── Intersection-first ego path selection ─────────────────────────────────
@@ -1038,9 +1126,12 @@ public class TaxiScenarioManager : MonoBehaviour
                              "spawning with default forward heading.");
         }
         EgoTravelDir = dir;
+        // Auto = identity: TaxiAgent spawned free-goal/two-point runs facing world +Z.
+        EgoSpawnRot  = ResolveEgoSpawnRot(dir, EgoSpawnPos, Quaternion.identity);
         EgoHasSpawn  = true;
 
-        Debug.Log($"[TaxiScenarioManager] freeGoalMode: spawn={EgoSpawnPos:F1} facing={EgoTravelDir:F2}" +
+        Debug.Log($"[TaxiScenarioManager] freeGoalMode: spawn={EgoSpawnPos:F1} travel={EgoTravelDir:F2} " +
+                  $"heading={egoSpawnHeading} yaw={EgoSpawnRot.eulerAngles.y:F1}deg" +
                   (egoGoalMarker != null
                       ? $"  goal={egoGoalMarker.position:F1}  dist={Vector3.Distance(EgoSpawnPos, egoGoalMarker.position):F1} m"
                       : ""));
@@ -1048,10 +1139,11 @@ public class TaxiScenarioManager : MonoBehaviour
 
     // ── Two-point sandbox ───────────────────────────────────────────────────────
 
-    // Place the ego at the start marker facing down its taxiway toward the goal, and set the
-    // goal arc-length. No scenario agents. The travel direction is derived from where the goal
-    // sits along the lane (its arc-length vs the start's), so it never depends on how the plane
-    // was rotated in the editor — TaxiAgent applies EgoSpawnPos/EgoTravelDir directly.
+    // Place the ego at the start marker and set the goal arc-length. No scenario agents. The
+    // travel direction is derived from where the goal sits along the lane (its arc-length vs
+    // the start's), so it never depends on how the plane was rotated in the editor. Which way
+    // the NOSE points is a separate choice — egoSpawnHeading — resolved into EgoSpawnRot, which
+    // TaxiAgent applies along with EgoSpawnPos.
     void SetupTwoPoint(Transform aircraftTransform)
     {
         EgoPath     = null;
@@ -1107,11 +1199,13 @@ public class TaxiScenarioManager : MonoBehaviour
         if (egoStartMarker != null)
         {
             EgoSpawnPos = egoStartMarker.position;
+            EgoSpawnRot = ResolveEgoSpawnRot(EgoTravelDir, EgoSpawnPos, Quaternion.identity);
             EgoHasSpawn = true;
         }
 
         Debug.Log($"[TaxiScenarioManager] two-point: startS={startPs.s:F1}  startD={startPs.d:F1}  " +
-                  $"sign={EgoPathSign:F0}  goalS={EgoGoalS:F1}  remaining={Mathf.Abs(EgoGoalS - startPs.s):F1} m");
+                  $"sign={EgoPathSign:F0}  goalS={EgoGoalS:F1}  remaining={Mathf.Abs(EgoGoalS - startPs.s):F1} m  " +
+                  $"heading={egoSpawnHeading} yaw={EgoSpawnRot.eulerAngles.y:F1}deg");
     }
 
     // Taxiway whose centreline is nearest world point p (by cross-track distance).
@@ -1165,6 +1259,14 @@ public class TaxiScenarioManager : MonoBehaviour
             Vector3 to   = from + EgoTravelDir.normalized * 10f;
             Gizmos.DrawLine(from, to);
             Gizmos.DrawSphere(to, 0.6f); // arrowhead marks travel direction
+
+            // Cyan: where the NOSE will point, which is egoSpawnHeading's doing and only
+            // coincides with the green travel arrow on TravelDirection. Seeing them diverge is
+            // the point — a spawn heading 90 deg off the route is otherwise a Play-mode surprise.
+            Gizmos.color = Color.cyan;
+            Vector3 nose = from + (EgoSpawnRot * Vector3.forward) * 8f;
+            Gizmos.DrawLine(from, nose);
+            Gizmos.DrawWireSphere(nose, 0.6f);
         }
     }
 }

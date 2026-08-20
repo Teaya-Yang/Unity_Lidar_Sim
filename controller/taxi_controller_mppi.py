@@ -1167,13 +1167,17 @@ def _ffmpeg_exe():
 
 
 def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_boxes=None,
-                           max_frames=6, fps=10, stride=1):
-    """`{stem}.mp4` (or `.gif` without ffmpeg): the map figure replayed over every
-    recorded solve, so the keep-outs can be watched expanding and being dodged as the run
-    progresses. Returns (path, n_frames) or None.
+                           max_frames=6, fps=10, stride=1, show_horizon=True,
+                           force_gif=False):
+    """`{stem}.mp4` (or `.gif` without ffmpeg, or with `force_gif`): the map figure
+    replayed over every recorded solve, so the keep-outs can be watched expanding and
+    being dodged as the run progresses. Returns (path, n_frames) or None.
 
     The window is fixed over the whole run — a per-frame window would make the keep-outs
-    appear to breathe when it is the zoom moving, not them.
+    appear to breathe when it is the zoom moving, not them. `show_horizon=False` drops the
+    LiDAR range ring — both the drawn circle and the ±SENSOR_RANGE inflation the fixed
+    window needs to contain it. Same figure otherwise; the window is just no longer sized
+    by a 250 m circle around every solve.
 
     WHY THIS DOES NOT JUST LOOP OVER `_draw_solve_map`. That is what a frame costs when
     the whole figure is rebuilt and re-rasterised per frame:
@@ -1217,10 +1221,10 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
     # it has to bound the ring at every solve — the ego track inflated by the sensor range.
     _hx = np.array([sensor_xy(f["ex"], f["ey"], f["eth"])[0] for f in frames])
     _hy = np.array([sensor_xy(f["ex"], f["ey"], f["eth"])[1] for f in frames])
-    allx = np.concatenate([_tx] + [p[0] for p in _px]
-                          + [_hx - SENSOR_RANGE, _hx + SENSOR_RANGE])
-    ally = np.concatenate([_ty] + [p[1] for p in _px]
-                          + [_hy - SENSOR_RANGE, _hy + SENSOR_RANGE])
+    _ring = ([_hx - SENSOR_RANGE, _hx + SENSOR_RANGE],
+             [_hy - SENSOR_RANGE, _hy + SENSOR_RANGE]) if show_horizon else ([_hx], [_hy])
+    allx = np.concatenate([_tx] + [p[0] for p in _px] + _ring[0])
+    ally = np.concatenate([_ty] + [p[1] for p in _px] + _ring[1])
     cx, cy = 0.5 * (allx.min() + allx.max()), 0.5 * (ally.min() + ally.max())
     half_x = 0.5 * np.ptp(allx) + 100.0
     half_y = max(0.5 * np.ptp(ally) + 100.0, 0.25 * half_x)
@@ -1274,10 +1278,11 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
     # Sensor horizon: it follows the LiDAR, so it is redrawn per frame like the rest.
     lc_horizon = LineCollection([], linewidths=1.0, colors="0.55", alpha=0.7, zorder=0,
                                 animated=True)
-    for lc in (lc_occ, lc_dyn, lc_axes, lc_hull, lc_horizon):
+    for lc in (lc_occ, lc_dyn, lc_axes, lc_hull) + ((lc_horizon,) if show_horizon else ()):
         ax.add_collection(lc)
-    ax.plot([], [], "-", color="0.55", lw=1.0, alpha=0.7,
-            label=f"LiDAR range ({SENSOR_RANGE:.0f} m)")
+    if show_horizon:
+        ax.plot([], [], "-", color="0.55", lw=1.0, alpha=0.7,
+                label=f"LiDAR range ({SENSOR_RANGE:.0f} m)")
     ln_plan, = ax.plot([], [], "-", color="k", lw=2.0, zorder=4, animated=True,
                        label="predicted rollout, LiDAR (cheapest sample)")
     ln_ego, = ax.plot([], [], "o", mfc="w", mec="k", ms=6, mew=0.9, zorder=5,
@@ -1304,7 +1309,12 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
     bg = fig.canvas.copy_from_bbox(fig.bbox)
     w, h = fig.canvas.get_width_height()
 
-    exe = _ffmpeg_exe()
+    _animated = [ln_driven, pc_movers, lc_occ, lc_dyn, lc_axes, lc_hull,
+                 ln_plan, ln_ego, ln_mover, sc_stage, title]
+    if show_horizon:
+        _animated.insert(6, lc_horizon)
+
+    exe = None if force_gif else _ffmpeg_exe()
     path = f"{stem}.mp4" if exe else f"{stem}.gif"
     proc = gif_frames = None
     if exe:
@@ -1388,7 +1398,8 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
         ln_plan.set_data(plan_x, plan_y)
         _ex, _ey = sensor_xy(f["ex"], f["ey"], f["eth"])
         ln_ego.set_data([_ex], [_ey])
-        lc_horizon.set_segments([sensor_horizon(_ex, _ey)])
+        if show_horizon:
+            lc_horizon.set_segments([sensor_horizon(_ex, _ey)])
         sc_stage.set_offsets(np.asarray(stage_pts, float).reshape(-1, 2))
         sc_stage.set_facecolor(stage_cols)
 
@@ -1408,8 +1419,7 @@ def _save_trajectory_video(stem, verdict, frames, traj, goal_xy=None, static_box
                        + (f"\n{_l2}" if _l2 else ""))
 
         fig.canvas.restore_region(bg)
-        for a in (ln_driven, pc_movers, lc_occ, lc_dyn, lc_axes, lc_hull, lc_horizon,
-                  ln_plan, ln_ego, ln_mover, sc_stage, title):
+        for a in _animated:
             ax.draw_artist(a)
         fig.canvas.blit(fig.bbox)
 
@@ -1581,6 +1591,22 @@ def _save_trajectory(out_dir, verdict, goal_xy, traj, obs_track=None, occ_pts=No
                 path, n = out
                 print(f"[traj] saved {path} ({n} solves @ {video_fps} fps"
                       f"{'' if video_stride == 1 else f', every {video_stride}th solve'})")
+
+        # The same replay as a GIF, with the LiDAR range ring left off — it is only a
+        # delimiter, and the fixed window has to be big enough to hold it at every solve.
+        try:
+            out = _save_trajectory_video(f"{stem}_noring", verdict, frames, traj,
+                                         goal_xy=goal_xy, static_boxes=static_boxes,
+                                         max_frames=max_frames, fps=video_fps,
+                                         stride=video_stride, show_horizon=False,
+                                         force_gif=True)
+        except Exception as e:
+            print(f"[traj] ring-free gif failed: {e}")
+        else:
+            if out is not None:
+                path, n = out
+                print(f"[traj] saved {path} ({n} solves @ {video_fps} fps, "
+                      f"LiDAR range ring omitted)")
 
 
 def run(unity_exec_path=None, port=5004, run_sysid=True,
@@ -2101,7 +2127,9 @@ if __name__ == "__main__":
                         "--save-traj. 0 = off. Costs N*horizon*2 float32 per solve of "
                         "memory, so keep it in the low hundreds.")
     p.add_argument("--traj-video", action="store_true",
-                   help="Also write traj.mp4 (traj.gif without ffmpeg): the same map "
+                   help="Also write traj.mp4 (traj.gif without ffmpeg) plus "
+                        "traj_noring.gif, the same replay with the LiDAR range ring left "
+                        "off: the same map "
                         "figure replayed over EVERY recorded solve, so the expanding "
                         "occlusion capsules and mover tubes can be watched growing and "
                         "being dodged. traj.png stays as the single frozen frame. "

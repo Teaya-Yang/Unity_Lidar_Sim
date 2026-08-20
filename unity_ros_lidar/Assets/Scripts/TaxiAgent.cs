@@ -235,12 +235,13 @@ public class TaxiAgent : Unity.MLAgents.Agent
                 transform, incursionDt, ambulanceSpeed,
                 conflictZOffset, crossDirSign, scenarioType, headOnProb);
 
-            // Two-point sandbox: place the plane at the start marker with NO rotation applied
-            // (identity heading, facing world +Z). It no longer auto-faces the goal/lane tangent.
+            // Two-point sandbox: place the plane at the start marker, oriented however the
+            // manager's egoSpawnHeading resolved (WorldForward reproduces the old identity
+            // heading, so this is only a behaviour change once that field is moved off default).
             if (scenarioManager.EgoHasSpawn)
                 transform.SetPositionAndRotation(
                     scenarioManager.EgoSpawnPos,
-                    Quaternion.identity);
+                    scenarioManager.EgoSpawnRot);
         }
         // ── Legacy single-agent path ──────────────────────────────────────────
         else if (incursionController != null && conflictPoint != null)
