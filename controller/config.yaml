@@ -67,7 +67,7 @@ dynamic_obstacles:
   w_half: 10.0              # [m] taxiway half-width
 
 keepout:
-  d_safe_hard: 10.0         # [m] ~1 aircraft width
+  d_safe_hard: 20.0         # [m] ~1 aircraft width
   w_hard: 1.0e+5            # "infinite" hard-constraint weight. See the CAVEAT above: the
                             #   residual violation is |grad(other terms)| / (2*w_hard), so this
                             #   is the knob that decides whether the keep-out EXISTS, not how

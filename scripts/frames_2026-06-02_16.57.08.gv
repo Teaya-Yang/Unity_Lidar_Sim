@@ -1,9 +1,0 @@
-digraph G {
-"odom" -> "Airplane (1)"[label=" Broadcaster: default_authority\nAverage rate: 19.926\nBuffer length: 5.019\nMost recent transform: 85.417334\nOldest transform: 80.398812\n"];
-"map" -> "odom"[label=" Broadcaster: default_authority\nAverage rate: 19.926\nBuffer length: 5.019\nMost recent transform: 85.417334\nOldest transform: 80.398812\n"];
-"Airplane (1)" -> "laser_link"[label=" Broadcaster: default_authority\nAverage rate: 19.926\nBuffer length: 5.019\nMost recent transform: 85.417334\nOldest transform: 80.398812\n"];
-edge [style=invis];
- subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
-"Recorded at time: 1780444628.4439027"[ shape=plaintext ] ;
-}->"map";
-}
