@@ -3,6 +3,7 @@ using UnityEngine;
 using RosMessageTypes.Geometry;
 using RosMessageTypes.Sensor;
 
+using Unity.MLAgents;
 using Unity.Robotics.ROSTCPConnector;
 
 public class PointCloudPublisher : MonoBehaviour
@@ -24,6 +25,16 @@ public class PointCloudPublisher : MonoBehaviour
     public string frameIdOverride = "";
 
     public double m_PublishRateHz = 10.0;
+
+    [Header("Backend")]
+    [Tooltip("Raycast the scan on the GPU with the Robotec GPU Lidar plugin instead of " +
+             "Physics.Raycast on the main thread. Both backends publish a byte-identical " +
+             "PointCloud2, so the controller cannot tell them apart. Python overrides this " +
+             "per-run via the 'use_gpu' environment parameter (launch arg use_gpu:=true).")]
+    public bool useGpuLidar = false;
+    [Tooltip("Ignore the 'use_gpu' side-channel parameter and always honour the checkbox above. " +
+             "For working in the Editor without the controller attached.")]
+    public bool ignoreSideChannel = false;
 
     [Header("Debug visualization")]
     [Tooltip("Draw scan rays in the Scene view (green = hit, red = no return).")]
@@ -56,9 +67,18 @@ public class PointCloudPublisher : MonoBehaviour
 
     ROSConnection ros;
     LaserSensor3D laser_sensor_3d;
+    GpuLaserSensor3D gpu_sensor_3d;
 
-    /// <summary>The sensor instance, for debug viewers (PhantomAgentVisualizer). Null before Start().</summary>
+    /// <summary>
+    /// The CPU sensor instance, for debug viewers (PhantomAgentVisualizer, the occlusion
+    /// gizmos). NULL on the GPU backend — those viewers read LaserSensor3D's Unity-side
+    /// occlusion pass, which has no GPU equivalent; the controller does its own occlusion
+    /// detection from the cloud and is unaffected. Viewers must null-check.
+    /// </summary>
     public LaserSensor3D Sensor => laser_sensor_3d;
+
+    /// <summary>Which backend actually came up. May differ from useGpuLidar if RGL failed.</summary>
+    public bool UsingGpu => gpu_sensor_3d != null;
 
     double m_LastPublishTimeSeconds;
     double PublishPeriodSeconds => 1.0 / m_PublishRateHz;
@@ -77,6 +97,38 @@ public class PointCloudPublisher : MonoBehaviour
         ros = ROSConnection.GetOrCreateInstance();
         ros.RegisterPublisher<PointCloud2Msg>(point_cloud_topic);
         ros.RegisterPublisher<PoseMsg>(pose_topic);
+
+        m_LastPublishTimeSeconds = Time.timeAsDouble - PublishPeriodSeconds;
+    }
+
+    // Backend selection is DEFERRED to the first Update, not done in Start(). Start() runs as
+    // soon as Unity connects, which is before Python's first env.reset() — so the side-channel
+    // value has not arrived yet and reading it here would always see the Inspector default.
+    bool backendReady;
+
+    void EnsureBackend()
+    {
+        backendReady = true;
+
+        // The side channel wins over the Inspector when the controller is driving, so a run is
+        // reproducible from the launch command alone. Read once: the RGL ray set is built from
+        // the FOV at construction, so switching mid-run would mean tearing the sensor down and
+        // is not worth it for a per-run choice.
+        if (!ignoreSideChannel && Academy.IsInitialized)
+        {
+            float p = Academy.Instance.EnvironmentParameters.GetWithDefault(
+                "use_gpu", useGpuLidar ? 1f : 0f);
+            useGpuLidar = p > 0.5f;
+        }
+
+        if (useGpuLidar && StartGpuBackend())
+        {
+            Debug.Log("[PointCloudPublisher] LiDAR backend: GPU (RGL)  " +
+                      $"{gpu_sensor_3d.NumMeasurementsPerScan_h}x{gpu_sensor_3d.NumMeasurementsPerScan_v} beams");
+            return;
+        }
+
+        Debug.Log("[PointCloudPublisher] LiDAR backend: CPU (Physics.Raycast)");
 
         laser_sensor_3d = new LaserSensor3D(
             laser_sensor_link,
@@ -108,8 +160,84 @@ public class PointCloudPublisher : MonoBehaviour
         m_LastPublishTimeSeconds = Time.timeAsDouble - PublishPeriodSeconds;
     }
 
+    /// <summary>
+    /// Bring up the RGL backend. Returns false (with the reason logged) if anything is
+    /// missing, so Start() can fall back to the CPU sensor rather than publishing nothing —
+    /// a silent dead topic is much harder to diagnose than a slow one.
+    /// </summary>
+    bool StartGpuBackend()
+    {
+        if (laser_sensor_link == null)
+        {
+            Debug.LogError("[PointCloudPublisher] use_gpu requested but laser_sensor_link is unassigned.");
+            return false;
+        }
+
+        try
+        {
+            gpu_sensor_3d = new GpuLaserSensor3D(
+                laser_sensor_link,
+                RangeMetersMin, RangeMetersMax,
+                fov_horizontal, fov_vertical,
+                angularResolution_vertical, angularResolution_horizontal,
+                publishMaxRangeOnNoHit, frameIdOverride,
+                Mathf.Max(1, Mathf.RoundToInt((float)m_PublishRateHz)));
+        }
+        catch (System.Exception e)
+        {
+            // Typically a missing RGL SceneManager in the scene, or the native library failing
+            // to load (no CUDA-capable GPU / driver). Either way the CPU path still works.
+            Debug.LogError($"[PointCloudPublisher] RGL backend failed to start ({e.GetType().Name}: " +
+                           $"{e.Message}) — falling back to the CPU sensor.");
+            gpu_sensor_3d = null;
+            return false;
+        }
+
+        // RGL captures on its own FixedUpdate cadence; publish off its callback rather than
+        // polling in Update, so a scan is sent exactly once and never re-sent or missed.
+        gpu_sensor_3d.AddOnNewData(PublishGpuScan);
+        return true;
+    }
+
+    void PublishGpuScan()
+    {
+        var msg = gpu_sensor_3d.getScanMsg();
+        if (msg == null) return;                 // no scan produced yet
+
+        ros.Publish(point_cloud_topic, msg);
+        ros.Publish(pose_topic, BuildPoseMsg());
+        m_LastPublishTimeSeconds = Time.timeAsDouble;
+    }
+
+    /// <summary>Sensor-link pose. Shared: the controller world-places every LiDAR-frame
+    /// detection with it, so both backends must publish the same thing alongside the cloud.</summary>
+    PoseMsg BuildPoseMsg()
+    {
+        var t = laser_sensor_link.transform;
+        return new PoseMsg
+        {
+            position = new PointMsg(t.position.x, t.position.y, t.position.z),
+            orientation = new QuaternionMsg(t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w),
+        };
+    }
+
+    void OnDestroy()
+    {
+        if (gpu_sensor_3d != null)
+        {
+            gpu_sensor_3d.RemoveOnNewData(PublishGpuScan);
+            gpu_sensor_3d.Dispose();
+        }
+    }
+
     void Update()
     {
+        if (!backendReady)
+            EnsureBackend();
+
+        if (gpu_sensor_3d != null)
+            return;                              // GPU path publishes from RGL's callback
+
         if (!ShouldPublishMessage)
             return;
 
@@ -137,23 +265,8 @@ public class PointCloudPublisher : MonoBehaviour
 
         PointCloud2Msg point_cloud_msg = laser_sensor_3d.getScanMsg();
 
-        PoseMsg pose_msg = new PoseMsg
-        {
-            position = new PointMsg(
-                laser_sensor_link.transform.position.x,
-                laser_sensor_link.transform.position.y,
-                laser_sensor_link.transform.position.z
-            ),
-            orientation = new QuaternionMsg(
-                laser_sensor_link.transform.rotation.x,
-                laser_sensor_link.transform.rotation.y,
-                laser_sensor_link.transform.rotation.z,
-                laser_sensor_link.transform.rotation.w
-            ),
-        };
-
         ros.Publish(point_cloud_topic, point_cloud_msg);
-        ros.Publish(pose_topic, pose_msg);
+        ros.Publish(pose_topic, BuildPoseMsg());
 
         m_LastPublishTimeSeconds = Time.timeAsDouble;
     }

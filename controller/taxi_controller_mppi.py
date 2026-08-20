@@ -1618,7 +1618,7 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         occlusion_viz=False, save_traj=None, show_occlusion_plot=True, plot_solve_t=None,
         rviz_viz=False, rviz_rollouts=40, plot_rollouts=0,
         traj_video=False, video_fps=10, video_stride=1,
-        detector=False, detector_topic="/detections"):
+        detector=False, detector_topic="/detections", use_gpu_lidar=False):
     global DETECTION_RANGE, UNCERTAINTY, N_SCEN, W_INFO
     global D_INFL, D_SAFE, INFO_RANGE, LIDAR_COSTMAP, VISIBILITY_COST, STATIC_AVOID
     global OCCLUSION_AWARE, OCC_TRACKER, OCC_SEGS_NOW, OCC_PUB
@@ -1771,12 +1771,23 @@ def run(unity_exec_path=None, port=5004, run_sysid=True,
         _do = DynamicObstacles()
         dyn_obs = _do if _do.start() else None
 
+    # Side channel for Unity-side switches. PointCloudPublisher defers its backend choice to
+    # its first Update, which is after this reset(), so the value below is guaranteed to have
+    # landed before the sensor is built.
+    from mlagents_envs.side_channel.environment_parameters_channel import (
+        EnvironmentParametersChannel)
+    env_params = EnvironmentParametersChannel()
+
     env = UnityEnvironment(
         file_name=unity_exec_path,
         base_port=port,
         seed=42,
         no_graphics=unity_exec_path is not None,  # headless when running a build
+        side_channels=[env_params],
     )
+    env_params.set_float_parameter("use_gpu", 1.0 if use_gpu_lidar else 0.0)
+    print(f"[Controller] LiDAR backend: {'GPU (RGL)' if use_gpu_lidar else 'CPU (Physics.Raycast)'}"
+          " — requested; Unity logs which one actually came up.")
     env.reset()
 
     behavior_name = list(env.behavior_specs.keys())[0]
@@ -2126,6 +2137,12 @@ if __name__ == "__main__":
                         "rollouts of the plotted solve, coloured by cost. Needs "
                         "--save-traj. 0 = off. Costs N*horizon*2 float32 per solve of "
                         "memory, so keep it in the low hundreds.")
+    p.add_argument("--use-gpu-lidar", action="store_true",
+                   help="Raycast the LiDAR on the GPU in Unity (Robotec GPU Lidar) instead "
+                        "of Physics.Raycast. Pushed to Unity as the 'use_gpu' environment "
+                        "parameter; the published cloud is byte-identical either way, so "
+                        "nothing downstream changes. Unity logs which backend came up and "
+                        "falls back to the CPU sensor if RGL cannot start.")
     p.add_argument("--traj-video", action="store_true",
                    help="Also write traj.mp4 (traj.gif without ffmpeg) plus "
                         "traj_noring.gif, the same replay with the LiDAR range ring left "
@@ -2176,4 +2193,5 @@ if __name__ == "__main__":
         rviz_viz=args.rviz_viz,
         rviz_rollouts=args.rviz_rollouts,
         detector=args.detector,
-        detector_topic=args.detector_topic)
+        detector_topic=args.detector_topic,
+        use_gpu_lidar=args.use_gpu_lidar)

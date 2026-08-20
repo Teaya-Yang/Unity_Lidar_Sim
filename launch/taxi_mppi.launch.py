@@ -22,6 +22,7 @@ Common overrides:
     ros2 launch launch/taxi_mppi.launch.py controller:=false      # bridge + RViz only
     ros2 launch launch/taxi_mppi.launch.py dynamic_obstacles:=true rviz_rollouts:=100
     ros2 launch launch/taxi_mppi.launch.py save_traj:=out/run1
+    ros2 launch launch/taxi_mppi.launch.py use_gpu:=true        # GPU (RGL) lidar
 """
 
 import os
@@ -59,6 +60,8 @@ def _controller(context, *_a, **_kw):
         cmd.append("--occlusion-aware")
     if cfg("dynamic_obstacles").lower() == "true":
         cmd.append("--dynamic-obstacles")
+    if cfg("use_gpu").lower() == "true":
+        cmd.append("--use-gpu-lidar")
     if cfg("traj_video").lower() == "true":
         cmd += ["--traj-video",
                 "--video-fps", cfg("video_fps"),
@@ -94,6 +97,12 @@ def generate_launch_description():
         DeclareLaunchArgument("lidar_topic", default_value="/point_cloud"),
         DeclareLaunchArgument("occlusion_aware", default_value="false"),
         DeclareLaunchArgument("dynamic_obstacles", default_value="false"),
+        DeclareLaunchArgument("use_gpu", default_value="false",
+                             description="Raycast the LiDAR on the GPU in Unity (Robotec "
+                                         "GPU Lidar) instead of Physics.Raycast. Reaches "
+                                         "Unity as the 'use_gpu' ML-Agents environment "
+                                         "parameter, so it works in the Editor too. The "
+                                         "published cloud is identical either way."),
         DeclareLaunchArgument("rviz_rollouts", default_value="100",
                              description="Sampled rollouts drawn per solve (0 = plan only)."),
         DeclareLaunchArgument("save_traj", default_value="",
