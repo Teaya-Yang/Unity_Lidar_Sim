@@ -70,3 +70,8 @@ Recordings/
 # vendored upstream: mmdetection3d
 third_party/
 detector/checkpoints/
+
+# patchelf backups of native plugins — 46 MB binaries, never belong in git.
+# Keep them outside the repo (see ~/rgl-backup/README.txt).
+*.orig-rpath-backup
+*.orig-rpath-backup.meta
